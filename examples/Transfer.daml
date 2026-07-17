@@ -1,0 +1,27 @@
+module Transfer where
+
+-- Depends on the Asset template (see Asset.daml).
+
+template TransferProposal
+  with
+    from : Party
+    to : Party
+    amount : Decimal
+  where
+    signatory from
+    observer to
+
+    choice Accept : ContractId Asset
+      controller to
+      do
+        create Asset with issuer = from, owner = to, amount = amount
+
+    choice Reject : ()
+      controller to
+      do
+        return ()
+
+    choice Withdraw : ()
+      controller from
+      do
+        return ()

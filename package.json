@@ -1,0 +1,11 @@
+{
+  "name": "daml-access-graph",
+  "version": "0.1.0",
+  "description": "Prototype visualizer of the access structure of Daml templates.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "serve": "python3 -m http.server 8000"
+  },
+  "license": "MIT"
+}

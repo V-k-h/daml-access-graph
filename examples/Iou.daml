@@ -1,0 +1,36 @@
+module Iou where
+
+template Iou
+  with
+    issuer : Party
+    owner : Party
+    currency : Text
+    amount : Decimal
+  where
+    signatory issuer, owner
+    observer owner
+
+    choice Transfer : ContractId Iou
+      with newOwner : Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+    choice Settle : ()
+      controller issuer
+      do
+        archive self
+
+template IouProposal
+  with
+    proposer : Party
+    receiver : Party
+  where
+    signatory proposer
+    observer receiver
+
+    nonconsuming choice CreateIou : ContractId Iou
+      with currency : Text, amount : Decimal
+      controller receiver
+      do
+        create Iou with issuer = proposer, owner = receiver, currency, amount

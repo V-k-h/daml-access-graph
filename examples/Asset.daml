@@ -1,0 +1,29 @@
+module Asset where
+
+template Asset
+  with
+    issuer : Party
+    owner : Party
+    amount : Decimal
+  where
+    signatory issuer
+    observer owner
+
+    key (issuer, owner) : (Party, Party)
+    maintainer key._1
+
+    choice Give : ContractId Asset
+      with newOwner : Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+    nonconsuming choice Peek : Decimal
+      controller issuer
+      do
+        return amount
+
+    choice Burn : ()
+      controller issuer, owner
+      do
+        return ()

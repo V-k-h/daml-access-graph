@@ -1,0 +1,78 @@
+daml-lf 2.1
+
+package 9e1a0d3f... (Asset-1.0.0)
+
+module Asset where
+
+  record @serializable Asset = { issuer: Party, owner: Party, amount: (Numeric 10) };
+
+  record @serializable Give = { newOwner: Party };
+
+  record @serializable Peek = {  };
+
+  variant @serializable Void = ;
+
+  template (this: Asset) = {
+    precondition True;
+    signatories
+      (\ (this: Asset) ->
+         Cons @Party [Asset:Asset {issuer} this] (Nil @Party));
+    observers
+      (\ (this: Asset) ->
+         Cons @Party [Asset:Asset {owner} this] (Nil @Party));
+    agreement "";
+    choice Consuming Archive (self) (arg: DA.Internal.Template:Archive):
+        Unit
+      , controllers
+          (\ (this: Asset) (arg: DA.Internal.Template:Archive) ->
+             Cons @Party [Asset:Asset {issuer} this] (Nil @Party))
+      , observers (Nil @Party)
+      to upure @Unit ();
+    choice Consuming Give (self) (arg: Asset:Give):
+        (ContractId Asset:Asset)
+      , controllers
+          (\ (this: Asset) (arg: Asset:Give) ->
+             Cons @Party [Asset:Asset {owner} this] (Nil @Party))
+      , observers (Nil @Party)
+      to ubind
+           (x: ContractId Asset:Asset) <-
+             create @Asset:Asset
+               (Asset:Asset { issuer = (Asset:Asset {issuer} this),
+                              owner = (Asset:Give {newOwner} arg),
+                              amount = (Asset:Asset {amount} this) })
+         in upure @(ContractId Asset:Asset) x;
+    choice NonConsuming Peek (self) (arg: Asset:Peek):
+        (Numeric 10)
+      , controllers
+          (\ (this: Asset) (arg: Asset:Peek) ->
+             Cons @Party [Asset:Asset {issuer} this] (Nil @Party))
+      , observers (Nil @Party)
+      to upure @(Numeric 10) (Asset:Asset {amount} this);
+  };
+
+module Transfer where
+
+  record @serializable TransferProposal = { from: Party, to: Party, amount: (Numeric 10) };
+
+  record @serializable Accept = {  };
+
+  template (this: TransferProposal) = {
+    precondition True;
+    signatories
+      (\ (this: TransferProposal) ->
+         Cons @Party [Transfer:TransferProposal {from} this] (Nil @Party));
+    observers
+      (\ (this: TransferProposal) ->
+         Cons @Party [Transfer:TransferProposal {to} this] (Nil @Party));
+    agreement "";
+    choice Consuming Accept (self) (arg: Transfer:Accept):
+        (ContractId Asset:Asset)
+      , controllers
+          (\ (this: TransferProposal) (arg: Transfer:Accept) ->
+             Cons @Party [Transfer:TransferProposal {to} this] (Nil @Party))
+      , observers (Nil @Party)
+      to create @Asset:Asset
+           (Asset:Asset { issuer = (Transfer:TransferProposal {from} this),
+                          owner = (Transfer:TransferProposal {to} this),
+                          amount = (Transfer:TransferProposal {amount} this) });
+  };
