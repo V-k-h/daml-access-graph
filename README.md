@@ -225,6 +225,12 @@ node backend/extract-dar.js --lf-file dump.lf --analyze
 If the SDK is not installed, the CLI exits with an actionable message rather
 than failing obscurely.
 
+**View backend output in the browser:** click **Load graph JSON** in the app
+and pick a file the backend wrote (e.g. `graph.json`, or the bundled
+[`examples/sample-graph.daml-lf.json`](examples/sample-graph.daml-lf.json)).
+The same visualizer renders it — no Daml is re-parsed — and if the file was
+produced with `--analyze`, its findings show in the Static analysis panel.
+
 > **Honest caveat:** the *textual* output of `damlc inspect` is not a stable
 > public API and varies across Daml-LF versions; `backend/lf-parser.js` targets
 > the Daml-LF 2.x style. If it recovers nothing from non-empty input it emits a

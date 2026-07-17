@@ -22,6 +22,8 @@
           <label for="examples">Example:</label>
           <select id="examples"></select>
           <button id="analyze" type="button">Analyze ▶</button>
+          <button id="load-json" type="button" class="btn-secondary" title="Load a normalized graph JSON produced by the Daml-LF backend (backend/extract-dar.js)">Load graph JSON</button>
+          <input id="json-file" type="file" accept=".json,application/json" hidden />
         </div>
         <textarea
           id="source"

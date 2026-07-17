@@ -18,6 +18,8 @@ const els = {
   findings: document.getElementById('findings'),
   stats: document.getElementById('stats'),
   legend: document.getElementById('legend'),
+  loadJson: document.getElementById('load-json'),
+  jsonFile: document.getElementById('json-file'),
 };
 
 // Small built-in examples so the app is usable without loading files.
@@ -68,16 +70,52 @@ template TransferProposal
 `,
 };
 
+// Parse-and-render the Daml source in the editor.
 function run() {
   const src = els.source.value;
   const parsed = parseDaml(src);
   const graph = buildGraph(parsed);
+  showGraph(graph, { diagnostics: parsed.diagnostics });
+}
 
+// Render an already-built graph (from source, or loaded JSON).
+function showGraph(graph, { diagnostics, findings } = {}) {
   renderGraph(els.svg, graph);
-  renderDiagnostics(parsed.diagnostics);
-  renderFindings(analyzeAll(graph).all);
-  renderStats(parsed, graph);
+  renderDiagnostics(diagnostics || []);
+  // Prefer analysis embedded by `extract-dar.js --analyze`; otherwise compute.
+  renderFindings(findings || analyzeAll(graph).all);
+  renderStats(graph);
   els.json.textContent = JSON.stringify(graph, null, 2);
+}
+
+// Validate + render a normalized graph JSON (e.g. from the Daml-LF backend).
+function loadGraphJson(text, fileName) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    renderDiagnostics([{ severity: 'error', message: `Not valid JSON: ${e.message}` }]);
+    return;
+  }
+  const graph = data && data.nodes && data.edges ? data : null;
+  if (!graph || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) {
+    renderDiagnostics([
+      { severity: 'error', message: 'JSON does not look like a normalized graph (missing `nodes` / `edges` arrays).' },
+    ]);
+    return;
+  }
+  graph.meta = graph.meta || {};
+  // `--analyze` output nests the graph under top-level keys plus `analysis`.
+  const embedded = data.analysis && Array.isArray(data.analysis.all) ? data.analysis.all : null;
+  showGraph(graph, {
+    diagnostics: [
+      {
+        severity: 'info',
+        message: `Loaded ${fileName || 'graph JSON'} (source: ${graph.meta.source || 'unknown'}) — visualization only, no Daml was parsed.`,
+      },
+    ],
+    findings: embedded,
+  });
 }
 
 function renderFindings(findings) {
@@ -127,12 +165,13 @@ function renderDiagnostics(diags) {
     });
 }
 
-function renderStats(parsed, graph) {
-  const choiceCount = parsed.templates.reduce((n, t) => n + t.choices.length, 0);
+function renderStats(graph) {
+  const templates = graph.nodes.filter((n) => n.kind === 'template' && !(n.meta && n.meta.external)).length;
+  const choices = graph.nodes.filter((n) => n.kind === 'choice').length;
+  const src = graph.meta && graph.meta.source ? ` [${graph.meta.source}]` : '';
   els.stats.textContent =
-    `module ${parsed.module || '(none)'} · ` +
-    `${parsed.templates.length} templates · ` +
-    `${choiceCount} choices · ` +
+    `module ${(graph.meta && graph.meta.module) || '(none)'}${src} · ` +
+    `${templates} templates · ${choices} choices · ` +
     `${graph.nodes.length} nodes · ${graph.edges.length} edges`;
 }
 
@@ -175,6 +214,15 @@ function initExamples() {
 }
 
 els.analyze.addEventListener('click', run);
+els.loadJson.addEventListener('click', () => els.jsonFile.click());
+els.jsonFile.addEventListener('change', (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => loadGraphJson(String(reader.result), file.name);
+  reader.readAsText(file);
+  els.jsonFile.value = ''; // allow re-loading the same file
+});
 buildLegend();
 initExamples();
 els.source.value = EXAMPLES.Asset;

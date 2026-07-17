@@ -1,0 +1,312 @@
+{
+  "meta": {
+    "module": "Asset",
+    "source": "daml-lf",
+    "warnings": []
+  },
+  "nodes": [
+    {
+      "id": "tpl:Asset",
+      "kind": "template",
+      "label": "Asset",
+      "meta": {
+        "external": false,
+        "fields": [
+          {
+            "name": "issuer",
+            "type": "Party",
+            "isParty": true
+          },
+          {
+            "name": "owner",
+            "type": "Party",
+            "isParty": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "party:Asset.issuer",
+      "kind": "party",
+      "label": "issuer",
+      "template": "Asset"
+    },
+    {
+      "id": "party:Asset.owner",
+      "kind": "party",
+      "label": "owner",
+      "template": "Asset"
+    },
+    {
+      "id": "choice:Asset.Archive",
+      "kind": "choice",
+      "label": "Archive",
+      "template": "Asset",
+      "meta": {
+        "consuming": true
+      }
+    },
+    {
+      "id": "choice:Asset.Give",
+      "kind": "choice",
+      "label": "Give",
+      "template": "Asset",
+      "meta": {
+        "consuming": true
+      }
+    },
+    {
+      "id": "choice:Asset.Peek",
+      "kind": "choice",
+      "label": "Peek",
+      "template": "Asset",
+      "meta": {
+        "consuming": false
+      }
+    },
+    {
+      "id": "tpl:TransferProposal",
+      "kind": "template",
+      "label": "TransferProposal",
+      "meta": {
+        "external": false,
+        "fields": [
+          {
+            "name": "from",
+            "type": "Party",
+            "isParty": true
+          },
+          {
+            "name": "to",
+            "type": "Party",
+            "isParty": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "party:TransferProposal.from",
+      "kind": "party",
+      "label": "from",
+      "template": "TransferProposal"
+    },
+    {
+      "id": "party:TransferProposal.to",
+      "kind": "party",
+      "label": "to",
+      "template": "TransferProposal"
+    },
+    {
+      "id": "choice:TransferProposal.Accept",
+      "kind": "choice",
+      "label": "Accept",
+      "template": "TransferProposal",
+      "meta": {
+        "consuming": true
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e0",
+      "source": "tpl:Asset",
+      "target": "party:Asset.issuer",
+      "kind": "signatory",
+      "label": "signatory"
+    },
+    {
+      "id": "e1",
+      "source": "tpl:Asset",
+      "target": "party:Asset.owner",
+      "kind": "observer",
+      "label": "observer"
+    },
+    {
+      "id": "e2",
+      "source": "tpl:Asset",
+      "target": "choice:Asset.Archive",
+      "kind": "declares",
+      "label": "declares"
+    },
+    {
+      "id": "e3",
+      "source": "choice:Asset.Archive",
+      "target": "party:Asset.issuer",
+      "kind": "controller",
+      "label": "controller"
+    },
+    {
+      "id": "e4",
+      "source": "tpl:Asset",
+      "target": "choice:Asset.Give",
+      "kind": "declares",
+      "label": "declares"
+    },
+    {
+      "id": "e5",
+      "source": "choice:Asset.Give",
+      "target": "party:Asset.owner",
+      "kind": "controller",
+      "label": "controller"
+    },
+    {
+      "id": "e6",
+      "source": "choice:Asset.Give",
+      "target": "tpl:Asset",
+      "kind": "create",
+      "label": "create"
+    },
+    {
+      "id": "e7",
+      "source": "tpl:Asset",
+      "target": "choice:Asset.Peek",
+      "kind": "declares",
+      "label": "declares"
+    },
+    {
+      "id": "e8",
+      "source": "choice:Asset.Peek",
+      "target": "party:Asset.issuer",
+      "kind": "controller",
+      "label": "controller"
+    },
+    {
+      "id": "e9",
+      "source": "tpl:TransferProposal",
+      "target": "party:TransferProposal.from",
+      "kind": "signatory",
+      "label": "signatory"
+    },
+    {
+      "id": "e10",
+      "source": "tpl:TransferProposal",
+      "target": "party:TransferProposal.to",
+      "kind": "observer",
+      "label": "observer"
+    },
+    {
+      "id": "e11",
+      "source": "tpl:TransferProposal",
+      "target": "choice:TransferProposal.Accept",
+      "kind": "declares",
+      "label": "declares"
+    },
+    {
+      "id": "e12",
+      "source": "choice:TransferProposal.Accept",
+      "target": "party:TransferProposal.to",
+      "kind": "controller",
+      "label": "controller"
+    },
+    {
+      "id": "e13",
+      "source": "choice:TransferProposal.Accept",
+      "target": "tpl:Asset",
+      "kind": "create",
+      "label": "create"
+    }
+  ],
+  "analysis": {
+    "authorization": [
+      {
+        "category": "authorization",
+        "severity": "info",
+        "code": "nonsignatory-consuming",
+        "message": "Consuming choice Asset.Give lets non-signatory party field(s) [owner] archive/replace the contract.",
+        "subjects": [
+          "choice:Asset.Give"
+        ]
+      },
+      {
+        "category": "authorization",
+        "severity": "info",
+        "code": "nonsignatory-consuming",
+        "message": "Consuming choice TransferProposal.Accept lets non-signatory party field(s) [to] archive/replace the contract.",
+        "subjects": [
+          "choice:TransferProposal.Accept"
+        ]
+      },
+      {
+        "category": "authorization",
+        "severity": "warning",
+        "code": "create-authority-gap",
+        "message": "TransferProposal.Accept creates Asset, which requires signatories [issuer]. Acting authority here is [from, to]. Field names differ — verify a party-propagation path supplies the missing authority (identity not provable from names).",
+        "subjects": [
+          "choice:TransferProposal.Accept",
+          "tpl:Asset"
+        ]
+      }
+    ],
+    "visibility": [],
+    "informationFlow": [
+      {
+        "category": "information-flow",
+        "severity": "info",
+        "code": "cross-party-flow",
+        "message": "TransferProposal.Accept (acting: [from, to]) creates Asset (signed by: [issuer]) — authority crosses a party boundary.",
+        "subjects": [
+          "choice:TransferProposal.Accept",
+          "tpl:Asset"
+        ]
+      },
+      {
+        "category": "information-flow",
+        "severity": "info",
+        "code": "terminal-template",
+        "message": "Asset performs no create/exercise on other templates — a lifecycle leaf.",
+        "subjects": [
+          "tpl:Asset"
+        ]
+      }
+    ],
+    "all": [
+      {
+        "category": "authorization",
+        "severity": "info",
+        "code": "nonsignatory-consuming",
+        "message": "Consuming choice Asset.Give lets non-signatory party field(s) [owner] archive/replace the contract.",
+        "subjects": [
+          "choice:Asset.Give"
+        ]
+      },
+      {
+        "category": "authorization",
+        "severity": "info",
+        "code": "nonsignatory-consuming",
+        "message": "Consuming choice TransferProposal.Accept lets non-signatory party field(s) [to] archive/replace the contract.",
+        "subjects": [
+          "choice:TransferProposal.Accept"
+        ]
+      },
+      {
+        "category": "authorization",
+        "severity": "warning",
+        "code": "create-authority-gap",
+        "message": "TransferProposal.Accept creates Asset, which requires signatories [issuer]. Acting authority here is [from, to]. Field names differ — verify a party-propagation path supplies the missing authority (identity not provable from names).",
+        "subjects": [
+          "choice:TransferProposal.Accept",
+          "tpl:Asset"
+        ]
+      },
+      {
+        "category": "information-flow",
+        "severity": "info",
+        "code": "cross-party-flow",
+        "message": "TransferProposal.Accept (acting: [from, to]) creates Asset (signed by: [issuer]) — authority crosses a party boundary.",
+        "subjects": [
+          "choice:TransferProposal.Accept",
+          "tpl:Asset"
+        ]
+      },
+      {
+        "category": "information-flow",
+        "severity": "info",
+        "code": "terminal-template",
+        "message": "Asset performs no create/exercise on other templates — a lifecycle leaf.",
+        "subjects": [
+          "tpl:Asset"
+        ]
+      }
+    ]
+  }
+}

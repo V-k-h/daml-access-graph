@@ -61,6 +61,7 @@ select, button {
 }
 button { background: var(--accent); border-color: var(--accent); font-weight: 600; }
 button:hover { filter: brightness(1.1); }
+.btn-secondary { background: var(--panel); border-color: var(--border); font-weight: 500; }
 
 #source {
   flex: 1;
