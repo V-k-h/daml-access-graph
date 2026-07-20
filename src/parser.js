@@ -111,23 +111,32 @@ function splitTopLevel(region) {
   return parts;
 }
 
-/** Pull identifier-ish tokens (party candidates) out of an expression. */
-function extractIdentifiers(expr) {
+/**
+ * Extract party references from a signatory / observer / controller expression.
+ *
+ * Splits on TOP-LEVEL commas (paren/bracket-aware) so `registry, owner` yields
+ * two refs, and keeps dotted record projections intact — `spec.transferLeg.sender`
+ * is ONE party, not three. A leading `[ … ]` list wrapper is unwrapped so
+ * `observer [alice, bob]` reads as two parties.
+ */
+function partyRefs(expr) {
   if (!expr) return [];
-  // Drop list/tuple/paren syntax noise, keep dotted paths as their head.
-  const tokens = expr.match(/[A-Za-z_][A-Za-z0-9_']*/g) || [];
+  // unwrap a single surrounding list literal: `[a, b]` -> `a, b`
+  let e = expr.trim().replace(/^\[([\s\S]*)\]$/, '$1');
   const keywords = new Set([
     'do', 'let', 'in', 'if', 'then', 'else', 'with', 'this',
     'return', 'pure', 'map', 'fmap', 'fromList', 'toList',
   ]);
   const seen = new Set();
   const out = [];
-  for (const t of tokens) {
-    if (keywords.has(t)) continue;
-    // Skip obviously type-level / constructor-only leading caps like `Set`, `Some`.
-    if (seen.has(t)) continue;
-    seen.add(t);
-    out.push(t);
+  for (const part of splitTopLevel(e)) {
+    // first identifier / dotted path in the segment is the party reference
+    const m = part.trim().match(/[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*/);
+    if (!m) continue;
+    const ref = m[0];
+    if (keywords.has(ref) || seen.has(ref)) continue;
+    seen.add(ref);
+    out.push(ref);
   }
   return out;
 }
@@ -282,9 +291,9 @@ function parseTemplate(name, body, baseLine, diagnostics, referenced) {
   // --- signatory / observer (may span the rest of a line after the keyword) ---
   for (const line of body) {
     const sig = line.match(/^\s*signatory\s+(.+?)\s*$/);
-    if (sig) signatories.push(...extractIdentifiers(sig[1]));
+    if (sig) signatories.push(...partyRefs(sig[1]));
     const obs = line.match(/^\s*observer\s+(.+?)\s*$/);
-    if (obs) observers.push(...extractIdentifiers(obs[1]));
+    if (obs) observers.push(...partyRefs(obs[1]));
   }
   signatories = [...new Set(signatories)];
   observers = [...new Set(observers)];
@@ -333,7 +342,7 @@ function parseChoices(templateName, body, baseLine, diagnostics, referenced) {
     let controllers = [];
     for (const line of cbody) {
       const cm = line.match(/^\s*controller\s+(.+?)\s*$/);
-      if (cm) controllers.push(...extractIdentifiers(cm[1]));
+      if (cm) controllers.push(...partyRefs(cm[1]));
     }
     controllers = [...new Set(controllers)];
     if (controllers.length === 0) {

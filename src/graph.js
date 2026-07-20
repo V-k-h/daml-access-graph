@@ -69,19 +69,17 @@ export function buildGraph(parsed, options = {}) {
       addNode({ id: partyId(t.name, pf), kind: 'party', label: pf, template: t.name });
     }
 
-    // signatory / observer edges (only when the referenced id is a party field)
-    for (const s of t.signatories) {
-      if (t.partyFields.includes(s)) {
-        addNode({ id: partyId(t.name, s), kind: 'party', label: s, template: t.name });
-        addEdge(tplId(t.name), partyId(t.name, s), 'signatory');
-      }
-    }
-    for (const o of t.observers) {
-      if (t.partyFields.includes(o)) {
-        addNode({ id: partyId(t.name, o), kind: 'party', label: o, template: t.name });
-        addEdge(tplId(t.name), partyId(t.name, o), 'observer');
-      }
-    }
+    // signatory / observer edges. A ref is either a plain party field, or a
+    // record projection like `spec.transferLeg.sender` (derived) — either way
+    // we draw a node so the relationship is visible, tagging projections.
+    const addPartyRef = (ref, kind) => {
+      const id = partyId(t.name, ref);
+      const derived = !t.partyFields.includes(ref);
+      addNode({ id, kind: 'party', label: ref, template: t.name, ...(derived ? { meta: { derived: true } } : {}) });
+      addEdge(tplId(t.name), id, kind);
+    };
+    for (const s of t.signatories) addPartyRef(s, 'signatory');
+    for (const o of t.observers) addPartyRef(o, 'observer');
 
     // choices
     for (const ch of t.choices) {

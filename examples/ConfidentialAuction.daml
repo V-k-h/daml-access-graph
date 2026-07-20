@@ -1,0 +1,561 @@
+-- | From Solidity to Daml: a Confidential Auction on Canton.
+--
+-- The Solidity version (../../solidity) needs a commit phase, a reveal phase,
+-- hashing, deposits, and a forfeiture mechanism. All of that is scaffolding to
+-- work around one fact: on a public EVM, all state is visible to everyone.
+--
+-- On Canton a contract is shared only with its @signatory@s and @observer@s, so
+-- a `Bid` signed by the auctioneer and one bidder is invisible to every other
+-- bidder. Confidentiality is a property of the ledger, so the commit/reveal
+-- machinery disappears.
+--
+-- This version settles against the real Canton Network Token Standard
+-- (CIP-0056): bids lock funds held as the standard `Holding` interface, and
+-- settlement is an atomic delivery-versus-payment driven through the standard
+-- `Allocation` interface. We ship a minimal registry (`AuctionCoin` /
+-- `CoinAllocation`) that *implements* those interfaces so the sample is
+-- self-contained; on a real network you swap it for the Amulet (Canton Coin)
+-- registry. The registry (token issuer) is a SEPARATE party from the auctioneer
+-- (auction operator and settlement executor): only the registry mints coins, and the
+-- auctioneer moves funds only through registry-authorized coin choices (`LockForBid`
+-- to lock a bid's backing, `TransferTo` to forward proceeds) and the standard
+-- `Allocation` choices, never by minting. So no one party can both issue money and
+-- run the auction, the same separation the Amulet registry gives you in production.
+--
+-- Privacy of the money leg: every bid is allocated to the auctioneer (the
+-- settlement executor), never to the beneficiary, so the seller never learns a
+-- losing bid. At settlement the winning allocation is executed and its proceeds
+-- forwarded to the beneficiary; losing allocations are cancelled (refunded), all
+-- in one transaction.
+--
+-- Targets Daml 3.x / Daml-LF 2.1. Canton has no *unique* contract keys, and they are
+-- not planned (Canton 3.5 added non-unique keys, but those can't enforce a uniqueness
+-- constraint), so one-bid-per-bidder is enforced on-ledger with a single-use
+-- `BidRight` rather than a key, and the auctioneer discovers bid `ContractId`s
+-- off-ledger (via PQS) and passes them to `Settle`.
+module ConfidentialAuction where
+
+import DA.List (sortOn, dedup)
+
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.MetadataV1
+
+-- Reading this as a Solidity developer? The rough Rosetta Stone:
+--
+--   template T          a contract (the "class"); each created instance has a
+--                       `ContractId`, the analogue of a deployed contract address.
+--   ContractId T        a typed handle to one on-ledger instance of T (like an
+--                       address you can only use where the type fits).
+--   signatory p         the party whose authority the contract carries and who is
+--                       bound by it: like the required msg.sender(s) at creation.
+--   observer p          who is allowed to SEE the contract. A party that is neither
+--                       signatory nor observer does not hold it on their node at all,
+--                       and that native privacy is what replaces commit/reveal.
+--   choice (consuming)  a state-changing external function; exercising it ARCHIVES
+--                       the contract. There is no in-place storage edit: you archive
+--                       (delete) and create (re-deploy) instead of mutating a field.
+--   nonconsuming choice a choice that does not archive the contract, so it can be
+--                       exercised repeatedly (IssueBidRight issues many rights from
+--                       the one roster; FetchTerms can be re-read).
+--   controller p        who may exercise a choice: authorization is part of the type,
+--                       not a require(msg.sender == p) you have to remember to write.
+--   archive / create    delete / deploy.
+
+-- | The instrument this sample issues. On a real network this would be Canton
+-- Coin, administered by the Amulet registry rather than the auctioneer.
+unitId : Party -> InstrumentId
+unitId admin = InstrumentId with admin; id = "CC"
+
+-- | The token-standard choices take an `ExtraArgs` carrying off-ledger context.
+-- Our registry needs none, so we pass an empty one.
+noExtraArgs : ExtraArgs
+noExtraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+-- | Archive an allocation's backing holding and return its value to the sender
+-- as a fresh, unlocked holding. Shared by the cancel and withdraw paths.
+releaseToSender : Party -> AllocationSpecification -> ContractId AuctionCoin -> Update (ContractId Holding)
+releaseToSender registry spec backing = do
+  archive backing
+  refund <- create AuctionCoin with
+    registry
+    owner = spec.transferLeg.sender
+    amount = spec.transferLeg.amount
+    locked = False
+    lockObservers = []
+  pure (toInterfaceContractId @Holding refund)
+
+-- | A fungible holding that implements the CIP-0056 `Holding` interface, issued by a
+-- `registry` party DISTINCT from the auctioneer. The registry is the sole signatory,
+-- so only it can mint coins; the auctioneer operates the auction and executes
+-- settlement but can never issue or move funds except through the registry-authorized
+-- coin choices below (`LockForBid`, `TransferTo`) and the standard `Allocation`. On a
+-- real network the registry is Canton Coin's; here it is a self-contained stub, but
+-- issuance and settlement authority are genuinely split across two parties, so no one
+-- party can both mint money and run the auction.
+template AuctionCoin
+  with
+    registry : Party
+    owner : Party
+    amount : Decimal
+    locked : Bool
+    lockObservers : [Party]     -- extra observers (the settlement executor) so it can see a locked backing
+  where
+    signatory registry          -- the registry authorizes and is bound, like msg.sender
+    observer owner, lockObservers  -- the owner, plus the executor that must settle a locked backing
+    ensure amount > 0.0         -- like require(amount > 0) baked into the type
+
+    interface instance Holding for AuctionCoin where
+      view = HoldingView with
+        owner
+        instrumentId = unitId registry
+        amount
+        lock =
+          if locked
+            then Some Lock with
+              -- A13: name BOTH allocation stakeholders, not the registry alone:
+              -- the registry enforces the lock and the owner is the sender who
+              -- controls Allocation_Withdraw, so lock-aware tooling (wallets, PQS)
+              -- reads the correct unlock set. A production lock would also set
+              -- `expiresAt = Some settleBy`; AuctionCoin does not carry the
+              -- deadline, so it stays None here (a deliberate stub simplification).
+              holders = [registry, owner]
+              expiresAt = None
+              expiresAfter = None
+              context = Some "backing an auction bid allocation"
+            else None
+        meta = emptyMetadata
+
+    -- | The owner locks (part of) this coin to back a bid. This is the registry-
+    -- authorized mint path: the body carries the registry's authority (the coin's
+    -- signatory) plus the owner's, so it can create the locked backing holding, any
+    -- change, and the `CoinAllocation` (signed by registry + sender). `PlaceBid`, on
+    -- the auctioneer-signed `BidRight`, has no registry authority of its own, so it
+    -- drives the lock through here. The terms are passed in (this choice cannot fetch
+    -- the auctioneer-signed `AuctionTerms`); `PlaceBid` reads and validates them first.
+    choice LockForBid : ContractId Allocation
+      with
+        bidAmount : Decimal
+        auctioneer : Party
+        auctionId : Text
+        item : Text
+        settleBy : Time
+        tally : ContractId AuctionTally
+      controller owner
+      do
+        assertMsg "coin is already locked" (not locked)
+        assertMsg "bid must be positive" (bidAmount > 0.0)
+        assertMsg "coin does not cover the bid" (amount >= bidAmount)
+        -- Return any change to the owner as a fresh, unlocked holding.
+        if amount > bidAmount
+          then do
+            _ <- create AuctionCoin with registry, owner, amount = amount - bidAmount, locked = False, lockObservers = []
+            pure ()
+          else pure ()
+        -- The locked backing names the executor (auctioneer) in lockObservers so the
+        -- settlement transaction can see it, even though the auctioneer is not the issuer.
+        backing <- create AuctionCoin with registry, owner, amount = bidAmount, locked = True, lockObservers = [auctioneer]
+        now <- getTime
+        -- `allocateBefore` / `settleBefore` are SHOULD-enforced deadlines a real
+        -- registry honors; our `CoinAllocation` ignores them and the auction gates on
+        -- `settleBy`. (Note `Settle`'s `now <= settleBy` is inclusive while
+        -- `settleBefore` is exclusive; align them when porting to a deadline-enforcing
+        -- registry.) The leg's instrument is this coin's, minted by the registry.
+        let spec = AllocationSpecification with
+              settlement = SettlementInfo with
+                executor = auctioneer
+                settlementRef = Reference with id = auctionId; cid = None
+                requestedAt = now
+                allocateBefore = settleBy
+                settleBefore = settleBy
+                meta = emptyMetadata
+              transferLegId = item
+              transferLeg = TransferLeg with
+                sender = owner
+                receiver = auctioneer
+                amount = bidAmount
+                instrumentId = unitId registry
+                meta = emptyMetadata
+        allocCid <- create CoinAllocation with registry; spec; backing
+        -- Bump the registry-signed bid counter, atomically with creating this bid's
+        -- allocation. This runs with the registry's authority (the coin's signatory),
+        -- so the count is as unforgeable as the coins are; `Settle` checks it for
+        -- completeness so the auctioneer cannot omit a higher bid.
+        td <- fetch tally
+        assertMsg "tally does not match this auction"
+          (td.registry == registry && td.auctioneer == auctioneer && td.auctionId == auctionId)
+        archive tally
+        _ <- create AuctionTally with registry, auctioneer, auctionId, count = td.count + 1
+        pure (toInterfaceContractId @Allocation allocCid)
+
+    -- | The owner hands an unlocked holding to a new owner. The registry's authority
+    -- (the coin's signatory) flows through this choice, so `AwardToBeneficiary` can
+    -- forward the executed proceeds to the beneficiary without the auctioneer being
+    -- the issuer: it exercises this on the coin it received rather than re-minting.
+    choice TransferTo : ContractId AuctionCoin
+      with
+        newOwner : Party
+      controller owner
+      do
+        assertMsg "cannot transfer a locked holding" (not locked)
+        create this with owner = newOwner
+
+-- | A reservation of one bidder's funds to a settlement leg, implementing the
+-- CIP-0056 `Allocation` interface (the standard's atomic-DvP primitive). The
+-- three interface choices delegate to the methods below: executing pays the
+-- receiver, cancelling and withdrawing refund the sender.
+template CoinAllocation
+  with
+    registry : Party
+    spec : AllocationSpecification
+    backing : ContractId AuctionCoin
+  where
+    signatory registry, spec.transferLeg.sender
+    -- The executor and receiver must SEE the allocation to settle it (they are not
+    -- signatories). The standard's choices are jointly controlled by all three, and
+    -- with a registry distinct from the auctioneer this visibility is what lets the
+    -- auctioneer drive `Allocation_ExecuteTransfer` / `Allocation_Cancel` at all.
+    observer spec.settlement.executor, spec.transferLeg.receiver
+    ensure spec.transferLeg.amount > 0.0
+
+    interface instance Allocation for CoinAllocation where
+      view = AllocationView with
+        allocation = spec
+        holdingCids = [toInterfaceContractId @Holding backing]
+        meta = emptyMetadata
+
+      allocation_executeTransferImpl _self _arg = do
+        archive backing
+        paid <- create AuctionCoin with
+          registry
+          owner = spec.transferLeg.receiver
+          amount = spec.transferLeg.amount
+          locked = False
+          lockObservers = []
+        pure Allocation_ExecuteTransferResult with
+          senderHoldingCids = []
+          receiverHoldingCids = [toInterfaceContractId @Holding paid]
+          meta = emptyMetadata
+
+      allocation_cancelImpl _self _arg = do
+        refund <- releaseToSender registry spec backing
+        pure Allocation_CancelResult with senderHoldingCids = [refund]; meta = emptyMetadata
+
+      allocation_withdrawImpl _self _arg = do
+        refund <- releaseToSender registry spec backing
+        pure Allocation_WithdrawResult with senderHoldingCids = [refund]; meta = emptyMetadata
+
+-- | A single-use right to bid: the bidder's PRIVATE invitation. Signed by the
+-- auctioneer, observed only by that one bidder, so no bidder can see who else was
+-- invited (the A15 roster never touches a contract a bidder holds). `PlaceBid` lives
+-- here, not on the auction, and consumes the right, so it is good for exactly one
+-- bid. One bid *per bidder* then holds as long as the auctioneer issues one right
+-- each: `IssueBidRight` does not enforce that on-ledger (Canton has no unique keys),
+-- so the per-bidder property rests on the auctioneer, and `Settle` re-checks it.
+template BidRight
+  with
+    auctioneer : Party
+    auctionId : Text
+    bidder : Party
+  where
+    signatory auctioneer
+    observer bidder
+
+    -- | The bidder spends this right to place a sealed bid. The auction's live terms
+    -- (is bidding open, item, beneficiary, deadline) are read from a disclosed
+    -- `AuctionTerms`: it carries no roster, so the bidder reads what they need to bid
+    -- without ever witnessing a contract that names the other invitees. Authority
+    -- closes as before: this right is auctioneer-signed and bidder-controlled, exactly
+    -- the two signatures the `Bid` and its `Allocation` need.
+    choice PlaceBid : ContractId Bid
+      with
+        terms : ContractId AuctionTerms
+        amount : Decimal
+        funds : ContractId AuctionCoin
+        tally : ContractId AuctionTally
+      controller bidder
+      do
+        t <- fetch terms
+        assertMsg "bid right does not match these auction terms"
+          (t.auctioneer == auctioneer && t.auctionId == auctionId)
+        assertMsg "bidding is closed" t.biddingOpen
+        assertMsg "bid must be positive" (amount > 0.0)
+
+        -- Validate the funding coin, then lock it through a choice ON the coin, which
+        -- carries the registry's authority. PlaceBid runs on the auctioneer-signed
+        -- BidRight and so has no registry authority of its own; `LockForBid` mints the
+        -- locked backing holding (plus any change) and the standard `CoinAllocation`.
+        coin <- fetch funds
+        assertMsg "funds must be the bidder's own coin" (coin.owner == bidder)
+        assertMsg "funds must be issued by this auction's registry" (coin.registry == t.registry)
+        -- A14: a multi-instrument registry would also assert the holding's instrument
+        -- matches this auction's; AuctionCoin has no instrumentId field (single
+        -- instrument), so that check is structurally absent here.
+        allocation <- exercise funds LockForBid with
+          bidAmount = amount, auctioneer, auctionId, item = t.item, settleBy = t.settleBy, tally
+        create Bid with
+          auctioneer, auctionId, item = t.item, bidder, beneficiary = t.beneficiary, amount, settleBy = t.settleBy
+          allocation
+
+-- | A registry-signed bid counter, one per auction, incremented (inside the
+-- registry-authorized `LockForBid`) exactly once per bid, so `count` is the true
+-- number of bids placed. The registry signs it and the auctioneer only observes it,
+-- so the auctioneer can neither forge nor reset it. `Settle` requires the bids it is
+-- handed to number exactly `count`; combined with the per-bidder and invited checks,
+-- that means the supplied set must be ALL live bids, so the auctioneer cannot crown a
+-- winner while silently omitting a higher bid (winner-correctness). The worst it can
+-- still do is stall: refuse to settle (or refund/remove a bid so the count no longer
+-- matches), after which bidders reclaim past the deadline. It names no bidder, so it
+-- leaks no roster, though a bidder placing a bid does briefly witness the running
+-- `count`, and every bid contends on this one contract (the price of an on-ledger
+-- completeness proof). Trust for the count rests on the neutral registry, not the
+-- interested auctioneer; a fully trustless count is impossible while bids stay private
+-- (a bidder-signed counter would leak the roster), which is the same privacy-versus-
+-- verifiability tradeoff the EVM commit/reveal side makes the other way.
+template AuctionTally
+  with
+    registry : Party
+    auctioneer : Party
+    auctionId : Text
+    count : Int
+  where
+    signatory registry
+    observer auctioneer
+
+-- | The public terms of the auction, signed by the auctioneer alone. It carries NO
+-- roster and no bidder observes it, so the participant set never leaks. Bidders reach
+-- it only by explicit disclosure (the auctioneer hands it over for `PlaceBid` and
+-- `FetchTerms`); the invited roster lives privately on `AuctionRoster`. This split is
+-- the A15 fix: a single shared contract observed by every bidder would expose its
+-- observer set, so the roster cannot live on anything a bidder sees.
+template AuctionTerms
+  with
+    auctioneer : Party
+    registry : Party          -- the token issuer, distinct from the auctioneer
+    auctionId : Text
+    item : Text
+    beneficiary : Party
+    settleBy : Time
+    biddingOpen : Bool
+  where
+    signatory auctioneer
+    ensure auctionId /= ""
+
+    -- | Read-only: the public terms (item and deadline). A party who is not a
+    -- stakeholder can call this against a disclosed copy, learning only these public
+    -- terms, never the roster.
+    nonconsuming choice FetchTerms : (Text, Time)
+      with
+        viewer : Party
+      controller viewer
+      do pure (item, settleBy)
+
+    -- | The auctioneer closes bidding; the reissued terms reject late bids.
+    choice CloseBidding : ContractId AuctionTerms
+      controller auctioneer
+      do create this with biddingOpen = False
+
+    -- | Settle the auction as an atomic DvP. The auctioneer gathers the bid contract
+    -- ids off-ledger (via PQS in production) and passes them in, together with the
+    -- private `AuctionRoster` it alone holds. In one transaction the winning
+    -- allocation pays the beneficiary, every losing allocation is cancelled
+    -- (refunded), and the result is recorded: either all of that happens or none of it.
+    --
+    -- LIVENESS: settlement depends on the auctioneer including every bid in `bidCids`
+    -- and running `Settle` before `settleBy`. If it omits a bid or never settles in
+    -- time, that bid cannot be settled here (this choice requires `now <= settleBy`).
+    -- The bidder is not stuck, though: once `now > settleBy` they call
+    -- `Bid.ReclaimAfterDeadline` to withdraw their own funds without the auctioneer.
+    -- The two windows are disjoint, so a bid is never both settle-eligible and
+    -- reclaimable, and reclaim archives the `Bid`, so it can never dangle into a
+    -- later `Settle`. (Winner-correctness below is a separate, still-open matter.)
+    --
+    -- WINNER-CORRECTNESS: a `bidCids` list on its own proves nothing about
+    -- completeness, so the registry-signed `AuctionTally` closes the gap. It counts
+    -- every bid (incremented under the registry's authority in `LockForBid`, so the
+    -- auctioneer can neither forge nor reset it), and `Settle` requires the validated,
+    -- distinct, invited bids to number exactly that count. So the supplied set must be
+    -- ALL live bids: the auctioneer cannot crown a winner over an omitted higher bid,
+    -- cannot pad the set (it can't forge a `Bid`), and cannot shrink the count. The
+    -- residual is a STALL, not a wrong winner: an auctioneer that refunds/removes a bid,
+    -- or never settles, makes the count not match (or lets the deadline pass), after
+    -- which bidders reclaim via `ReclaimAfterDeadline`. A fully trustless count is
+    -- impossible while bids stay private (a bidder-signed counter would leak the roster),
+    -- so the count's trust rests on the neutral registry, not the interested auctioneer.
+    choice Settle : ContractId AuctionResult
+      with
+        bidCids : [ContractId Bid]
+        roster : ContractId AuctionRoster
+        tally : ContractId AuctionTally
+      controller auctioneer
+      do
+        assertMsg "close bidding before settling" (not biddingOpen)
+        now <- getTime
+        assertMsg "the settlement window has passed" (now <= settleBy)
+        r <- fetch roster
+        assertMsg "roster does not match these auction terms"
+          (r.auctioneer == auctioneer && r.auctionId == auctionId)
+
+        -- De-duplicate the caller's list so a repeated id can't double-spend a bid.
+        let uniqueCids =
+              foldl (\seen c -> if c `elem` seen then seen else seen <> [c]) [] bidCids
+
+        bids <- forA uniqueCids \cid -> do
+          bid <- fetch cid
+          assertMsg "bid does not belong to this auction"
+            (bid.auctioneer == auctioneer && bid.auctionId == auctionId && bid.item == item)
+          assertMsg "settled bid must come from an invited bidder"
+            (bid.bidder `elem` r.invited)
+          pure (cid, bid)
+
+        -- A8: the ContractId de-dup above stops one bid being counted twice, but
+        -- the single-use BidRight only bounds bids per *right*, not per bidder
+        -- (IssueBidRight does not stop the auctioneer minting a second right for
+        -- the same party). Enforce one settled bid per bidder here so a stray
+        -- second right cannot corrupt the outcome.
+        let settledBidders = map (\(_, bid) -> bid.bidder) bids
+        assertMsg "at most one bid per bidder may be settled"
+          (length (dedup settledBidders) == length settledBidders)
+
+        -- Completeness: the validated, distinct, invited bids must number exactly the
+        -- registry's tally, so the supplied set is provably ALL live bids and no higher
+        -- bid was omitted. The auctioneer cannot pad (no forged Bid) or shrink the count
+        -- (registry-signed), so the only failure mode is a stall (then bidders reclaim).
+        td <- fetch tally
+        assertMsg "tally does not match this auction"
+          (td.registry == registry && td.auctioneer == auctioneer && td.auctionId == auctionId)
+        assertMsg "incomplete bid set: must settle every bid placed"
+          (length bids == td.count)
+
+        -- Highest bid wins. `sortOn` is stable, so on a tie the earliest bid in
+        -- the (deduplicated, input-ordered) list keeps the lead.
+        case sortOn (\(_, bid) -> negate bid.amount) bids of
+          [] -> abort "cannot settle an auction with no bids"
+          ((winCid, winBid) :: losers) -> do
+            -- DvP: execute the winner's allocation, refund the losers, atomically.
+            -- A12: the recorded winningAmount is what AwardToBeneficiary actually
+            -- forwarded (it asserts that equals the bid), not an unchecked copy of
+            -- the bid amount, so AuctionResult cannot certify a payment that did
+            -- not fully occur.
+            paid <- exercise winCid AwardToBeneficiary
+            _ <- forA losers \(cid, _) -> exercise cid Refund
+            create AuctionResult with
+              auctioneer
+              item
+              winner = winBid.bidder
+              winningAmount = paid
+              bidCount = td.count
+
+-- | The invited roster, signed by the auctioneer alone and observed by no bidder, so
+-- the participant set stays private to the auctioneer. `IssueBidRight` mints each
+-- invited bidder their own private `BidRight`; `Settle` takes this contract to confirm
+-- every settled bid came from an invited party.
+template AuctionRoster
+  with
+    auctioneer : Party
+    auctionId : Text
+    invited : [Party]
+  where
+    signatory auctioneer
+
+    -- | Issue one invited bidder their single-use right to bid.
+    nonconsuming choice IssueBidRight : ContractId BidRight
+      with
+        bidder : Party
+      controller auctioneer
+      do
+        assertMsg "rights can only be issued to invited bidders" (bidder `elem` invited)
+        create BidRight with auctioneer, auctionId, bidder
+
+-- | A single sealed bid, co-signed by the auctioneer and the bidder and nobody
+-- else: no other party can fetch it, query it, or learn that it exists. It
+-- carries the bidder's locked funds as a token-standard `Allocation`.
+--
+-- Co-signing is also what lets settlement work without the bidder being online:
+-- the auctioneer exercises `AwardToBeneficiary` / `Refund` (controller = the
+-- auctioneer), and because the bidder signed this `Bid`, the bidder's authority
+-- is present in the choice body, which is exactly what the standard `Allocation`
+-- choices require.
+template Bid
+  with
+    auctioneer : Party
+    auctionId : Text
+    item : Text
+    bidder : Party
+    beneficiary : Party
+    amount : Decimal
+    settleBy : Time          -- copied from the Auction so the bidder can reclaim past it
+    allocation : ContractId Allocation
+  where
+    signatory auctioneer, bidder
+    ensure amount > 0.0
+
+    -- | Winner: execute the allocation (proceeds reach the auctioneer/executor)
+    -- and forward them to the beneficiary, in one transaction. Returns the amount
+    -- actually forwarded so the caller can record an outcome derived from the real
+    -- transfer rather than an assumed one.
+    choice AwardToBeneficiary : Decimal
+      controller auctioneer
+      do
+        -- Executing the allocation is interface-level: the proceeds land with the
+        -- receiver (the auctioneer/executor). The forward to the beneficiary is then
+        -- done through the coin's own `TransferTo` choice, which carries the registry's
+        -- authority, so the auctioneer never has to be the issuer to move the funds on.
+        res <- exercise allocation Allocation_ExecuteTransfer with extraArgs = noExtraArgs
+        -- A11: the bundled registry returns no sender change, but a conforming one
+        -- may. Don't silently drop it: assert it is empty so a future port is
+        -- forced to route `senderHoldingCids` instead of orphaning them.
+        assertMsg "unexpected sender change from execute; a port must forward it"
+          (null res.senderHoldingCids)
+        -- A10/A12: forward every executed receiver holding to the beneficiary and total
+        -- what actually moved. Summing the real holdings (rather than assuming exactly
+        -- one of the bid amount) means an empty/short result cannot masquerade as full
+        -- payment.
+        forwarded <- forA res.receiverHoldingCids \hc -> do
+          let coinCid = fromInterfaceContractId @AuctionCoin hc
+          c <- fetch coinCid
+          _ <- exercise coinCid TransferTo with newOwner = beneficiary
+          pure c.amount
+        let total = sum forwarded
+        assertMsg "executed proceeds must equal the winning bid amount" (total == amount)
+        pure total
+
+    -- | Loser: cancel the allocation, refunding the bidder's locked funds.
+    choice Refund : ()
+      controller auctioneer
+      do
+        _ <- exercise allocation Allocation_Cancel with extraArgs = noExtraArgs
+        pure ()
+
+    -- | Liveness: once the settlement window has closed, the bidder can reclaim
+    -- their own locked funds WITHOUT the auctioneer. `Settle` requires
+    -- `now <= settleBy` and this requires `now > settleBy`, so the windows are
+    -- disjoint: a bid is never both settle-eligible and reclaimable, and `Settle`
+    -- needs no change. The refund needs no one else's authority: `Allocation_Withdraw`
+    -- is sender-controlled and the bidder is the sender, while the registry authority
+    -- to mint the refund coin comes from the allocation's own signatory set. Archiving
+    -- the `Bid` (this choice is consuming) stops a reclaimed bid dangling into a later
+    -- `Settle`. This is the deadline-gated reclaim the LIVENESS CAVEAT above prescribes.
+    choice ReclaimAfterDeadline : ContractId Holding
+      controller bidder
+      do
+        now <- getTime
+        assertMsg "can only reclaim after the settlement deadline has passed"
+          (now > settleBy)
+        res <- exercise allocation Allocation_Withdraw with extraArgs = noExtraArgs
+        case res.senderHoldingCids of
+          [refund] -> pure refund
+          _ -> abort "withdraw must return exactly one refund holding"
+
+-- | The outcome, disclosed only to the auctioneer and the winning bidder.
+-- Losing bidders never learn the winning amount.
+template AuctionResult
+  with
+    auctioneer : Party
+    item : Text
+    winner : Party
+    winningAmount : Decimal
+    bidCount : Int          -- how many bids the (completeness-checked) settlement covered
+  where
+    signatory auctioneer
+    observer winner

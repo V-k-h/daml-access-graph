@@ -125,6 +125,33 @@ template T with p : Party where
   assert.equal(ex.target, null);
 });
 
+test('dotted record projections stay one party, comma-separated split into many', () => {
+  const src = `module A where
+template CoinAllocation with registry : Party, spec : AllocationSpecification where
+  signatory registry, spec.transferLeg.sender
+  observer spec.settlement.executor, spec.transferLeg.receiver
+`;
+  const t = parseDaml(src).templates[0];
+  // NOT split on the dots — projection is a single party reference
+  assert.deepEqual(t.signatories, ['registry', 'spec.transferLeg.sender']);
+  assert.deepEqual(t.observers, ['spec.settlement.executor', 'spec.transferLeg.receiver']);
+
+  const g = buildGraph(parseDaml(src));
+  // projected refs become derived party nodes with signatory/observer edges
+  assert.ok(g.nodes.some((n) => n.kind === 'party' && n.label === 'spec.transferLeg.sender' && n.meta && n.meta.derived));
+  assert.ok(g.edges.some((e) => e.kind === 'signatory' && e.target === 'party:CoinAllocation.spec.transferLeg.sender'));
+});
+
+test('list-literal observers unwrap into multiple parties', () => {
+  const src = `module A where
+template T with a : Party, b : Party where
+  signatory a
+  observer [a, b]
+`;
+  const t = parseDaml(src).templates[0];
+  assert.deepEqual(t.observers, ['a', 'b']);
+});
+
 test('honestly flags legacy controller-can syntax', () => {
   const src = `module A where
 template T with p : Party where

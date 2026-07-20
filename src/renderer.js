@@ -95,13 +95,16 @@ export function renderGraph(svg, graph) {
     const g = el('g', { class: `node node-${n.kind}`, 'data-id': n.id });
     const external = n.meta && n.meta.external;
     const nonconsuming = n.kind === 'choice' && n.meta && n.meta.consuming === false;
+    // party derived from a projection (e.g. spec.transferLeg.sender) or a
+    // choice argument rather than a plain template field
+    const derivedParty = n.kind === 'party' && n.meta && (n.meta.derived || n.meta.fromArg);
 
     const circle = el('circle', {
       r: String(style.r),
       fill: external ? '#e2e8f0' : style.fill,
       stroke: style.stroke,
       'stroke-width': external ? '1.5' : '2',
-      'stroke-dasharray': external ? '4 2' : nonconsuming ? '3 2' : '0',
+      'stroke-dasharray': external ? '4 2' : nonconsuming || derivedParty ? '3 2' : '0',
     });
     const label = el('text', {
       'text-anchor': 'middle',
@@ -131,7 +134,10 @@ function nodeTooltip(n) {
     return `choice ${n.template}.${n.label} (${n.meta && n.meta.consuming === false ? 'nonconsuming' : 'consuming'})`;
   }
   if (n.kind === 'party') {
-    return `party ${n.template}.${n.label}${n.meta && n.meta.fromArg ? ' (from choice argument)' : ''}`;
+    let note = '';
+    if (n.meta && n.meta.fromArg) note = ' (from choice argument)';
+    else if (n.meta && n.meta.derived) note = ' (projected expression)';
+    return `party ${n.template}.${n.label}${note}`;
   }
   return n.label;
 }

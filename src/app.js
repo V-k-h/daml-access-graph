@@ -20,6 +20,8 @@ const els = {
   legend: document.getElementById('legend'),
   loadJson: document.getElementById('load-json'),
   jsonFile: document.getElementById('json-file'),
+  loadDaml: document.getElementById('load-daml'),
+  damlFile: document.getElementById('daml-file'),
 };
 
 // Small built-in examples so the app is usable without loading files.
@@ -214,6 +216,19 @@ function initExamples() {
 }
 
 els.analyze.addEventListener('click', run);
+els.loadDaml.addEventListener('click', () => els.damlFile.click());
+els.damlFile.addEventListener('change', (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    els.source.value = String(reader.result);
+    els.examples.value = '';
+    run();
+  };
+  reader.readAsText(file);
+  els.damlFile.value = ''; // allow re-loading the same file
+});
 els.loadJson.addEventListener('click', () => els.jsonFile.click());
 els.jsonFile.addEventListener('change', (e) => {
   const file = e.target.files && e.target.files[0];
