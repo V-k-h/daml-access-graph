@@ -15,10 +15,61 @@ only, no mathlib, no sorry; axioms of the main theorems: `propext` and
 |---|---|---|
 | Daml source -> DAR (compiled LF) | `damlc` | **Trusted.** The compiler is the root of trust for what the package means. Formalizing Daml-LF semantics and verifying compilation is out of scope and stated future work. |
 | DAR -> protobuf messages | `backend/protobuf.js` (reader), zip/DALF extraction | **Tested** (JS test suite). A misread here produces a wrong IR, which the theorem cannot detect: the theorem starts at the IR. |
-| protobuf -> IR guarded transitions | `backend/lfir.js` (translator) | **Tested**, and hardened by design: translation is total, everything outside the fragment becomes an explicit `unsupported` node, and the property builders refuse transitions whose relevant positions contain one. The claim "this LF expression denotes this IR term" is the UNTRUSTED arrow; the Lean type `Formal.Term` deliberately has no `unsupported` constructor, so the theorem quantifies exactly over terms the emitter accepts. |
+| protobuf -> IR guarded transitions | `backend/lfir.js` (translator) | **Machine-checked for the MiniLF fragment** (`Formal.translate_correct`), **tested elsewhere.** Lean models the post-inlining expression fragment (`Formal/MiniLF.lean`), gives it its own semantics (`evalLF`), mirrors the JS translation (`Formal/Translate.lean`), and proves `eval env (translate e) = evalLF env e`. Outside that fragment the claim "this LF expression denotes this IR term" remains untrusted JS; the residue is enumerated below. Hardened by design throughout: translation is total, anything outside the fragment becomes an explicit `unsupported` node, and the property builders refuse transitions whose relevant positions contain one. |
 | IR -> SMT-LIB script | `backend/smt.js` (`buildQuery`, `termToSmt`) mirrored by `Formal.vcgen` | **Machine-checked at the VC level** (see below), **tested at the syntax level**. Lean proves: validity of the VC formula implies the conservation property, and conversely (`Formal.vcgen_iff`), plus guard-drop monotonicity (`Formal.drop_guard_sound`, `Formal.drop_guards_sound`, `Formal.vcgen_dropped_guards_sound`). What Lean does NOT check: that the printed SMT-LIB text is the term (printer is trivial and tested), nor `inferSorts` (the indexed Lean type makes ill-sorted terms unrepresentable instead). |
 | SMT-LIB script -> unsat/sat | `cvc5` | **Trusted.** An `unsat` verdict is taken to mean the asserted set {guards, not goal} has no model, i.e. the single VC formula is valid. (cvc5 can emit proofs; checking them is future work.) |
 | unsat -> "property PROVED" report | report layer | **Machine-checked meaning:** `Formal.vcgen_sound` says a valid VC entails `Conserves`; `Formal.vcgen_dropped_guards_sound` says this survives dropped guards. The report's English sentence is backed by these theorems given the trusted/tested arrows above. |
+
+## The MiniLF fragment: what moved, and what did not
+
+`Formal/EndToEnd.lean` composes translation correctness with VC soundness:
+
+    minilf_vcgen_sound : (forall env, eval env (vcgen (translateTransition t)) = true)
+                         -> ConservesLF t
+
+`ConservesLF` is stated entirely in **source-fragment semantics** (`evalLF`
+over MiniLF expressions), not in IR semantics. So for a transition whose
+expressions lie in MiniLF, a cvc5 `unsat` now entails a property about the
+MiniLF-level meaning of the choice, with the LF-to-IR step no longer taken on
+trust. `minilf_vcgen_iff` gives the converse for the same fragment.
+
+This is one arrow, not the whole chain. MiniLF is the fragment `lfir.js`
+reaches on its happy path AFTER its own JS-side work; that work is what
+remains untrusted.
+
+### Untrusted residue of `lfir.js` (enumerated, not glossed)
+
+Everything below happens in JavaScript before or around the fragment the Lean
+theorem covers. A bug in any of it can still produce a proof about the wrong
+formula, and no theorem here would notice:
+
+1. **Cross-package beta reduction and inlining** - `betaReduce`, type-layer
+   unwrapping, over-application, following `ValueId` references into
+   dependency DALFs and swapping the interning context per package. MiniLF is
+   the POST-inlining fragment; the inliner is the largest untrusted component.
+2. **Record chasing** - `ctx.rawEnv`, `recordFields`, `RecUpd` peeling to a
+   call-site `RecCon`. MiniLF bakes only the OUTCOME (a `proj` root) into its
+   syntax; how the translator decided that outcome is untrusted.
+3. **`ensure` conjunct decomposition** - `guardConjuncts`, the
+   `ite(c, a, False|abort) -> c AND a` rewrite, and per-conjunct dropping.
+   The DROP is covered by `vcgen_dropped_guards_sound`; the DECOMPOSITION is
+   not.
+4. **Interface dispatch** - resolving `interface instance` method bodies,
+   `call_interface`, matching interface choices to instance methods.
+5. **Effect collection** - `collectEffects` deciding which `create`s a choice
+   performs, and the path conditions attached to them. The theorem takes the
+   transition's create list as given; that the list is complete and correct
+   for the compiled choice is untrusted. This is why `amountConservation`
+   attaches a note when the body had untranslated parts: effects beyond the
+   recovered creates may exist.
+6. **Symbol naming** - that `proj this "amount"` and the JS `symbol()` produce
+   the same string `this.amount`. Lean fixes a naming convention; that the JS
+   agrees with it is convention, checked by tests, not by proof.
+7. **Sort inference** - `inferSorts`. The indexed Lean types make ill-sorted
+   terms unrepresentable rather than proving the JS inference correct.
+8. Everything listed as deliberately excluded in `Formal/MiniLF.lean`:
+   rounding builtins, `div`/`mod`, Text and the String sort, Bool equality,
+   Optional case analysis, abort/throw.
 
 ## What the Lean theorems say, exactly
 
