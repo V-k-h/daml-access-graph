@@ -25,6 +25,14 @@
 // sampled points PROVE the two semantics identical - it makes a mismatch of
 // the kind emitters actually have (systematic, not adversarial) very loud.
 //
+// UNINTERPRETED FUNCTIONS: a `uf` term has no fixed meaning, so there is
+// nothing to check until one is chosen. Each case that contains a uf comes
+// with an INTERPRETATION - a concrete function per symbol - which the
+// evaluator applies directly and the query PINS by asserting the symbol's
+// value at the points the case actually reaches. Both sides then speak about
+// the same function, and a disagreement is again an emitter/evaluator bug
+// (wrong application syntax, wrong argument order, a missing declare-fun).
+//
 // DIVISION BY ZERO: SMT-LIB makes x/0 (and div/mod by 0) an unspecified
 // value, so no concrete expectation is checkable there. The evaluator returns
 // a distinguished undef marker on such paths and those cases are SKIPPED, not
@@ -131,7 +139,9 @@ const smtSym = (name) => `|${name.replace(/[|\\]/g, '_')}|`;
  */
 function valueToSmt(v, sort) {
   if (typeof v === 'boolean') return v ? 'true' : 'false';
-  if (!isRat(v)) throw new Error('valueToSmt: not a boolean or rational');
+  // SMT-LIB escapes a double quote by doubling it, exactly as smt.js does.
+  if (typeof v === 'string') return `"${v.replace(/"/g, '""')}"`;
+  if (!isRat(v)) throw new Error('valueToSmt: not a boolean, string or rational');
   const neg = v.p < 0n;
   const p = neg ? -v.p : v.p;
   let core;
@@ -173,6 +183,33 @@ const INT_LITERALS = [
   '9007199254740993', '-123456789123456789', '288230376151711744',
 ];
 
+// Uninterpreted symbols the generator may apply. Their interpretations are
+// fixed here (see UF_INTERP) so the evaluator and the solver can be pinned to
+// the same function; the point of the check is the APPLICATION MACHINERY -
+// declaration, arity, argument order, rendering - not the functions chosen.
+// Only Real-mode numeric arguments are generated: div/mod force Int-sorted
+// variables, and a symbol declared over Real would not be well sorted there.
+const UF_NUM = [
+  { name: 'uf.n1', arity: 1, sort: 'Real' },
+  { name: 'uf.n2', arity: 2, sort: 'Real' },
+];
+const UF_BOOL = [
+  { name: 'uf.b1', arity: 1, sort: 'Bool' },
+  { name: 'uf.b2', arity: 2, sort: 'Bool' },
+];
+
+/** Concrete meanings, shared by the evaluator and the pinned query. */
+const UF_INTERP = {
+  // 3a - 1
+  'uf.n1': (a) => ratSub(ratMul(ratFromInt(3), a), ratFromInt(1)),
+  // a - 2b
+  'uf.n2': (a, b) => ratSub(a, ratMul(ratFromInt(2), b)),
+  // a > 1
+  'uf.b1': (a) => ratCmp(a, ratFromInt(1)) > 0,
+  // a <= b (ORDER MATTERS: a swapped-argument emitter must fail here)
+  'uf.b2': (a, b) => ratCmp(a, b) <= 0,
+};
+
 function genNum(rnd, depth, mode) {
   const lit = () => T.num(pick(rnd, mode === 'Int' ? INT_LITERALS : REAL_LITERALS));
   const vr = () => T.varRef(pick(rnd, NUM_VARS), mode === 'Int' ? 'Int' : 'Real');
@@ -190,9 +227,13 @@ function genNum(rnd, depth, mode) {
     return T.app('-', [genNum(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode)]);
   }
   if (roll < 0.75) return T.app('*', [genNum(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode)]);
-  if (roll < 0.9) {
+  if (roll < 0.85) {
     const op = mode === 'Int' ? (chance(rnd, 0.5) ? 'div' : 'mod') : '/';
     return T.app(op, [genNum(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode)]);
+  }
+  if (roll < 0.92 && mode !== 'Int') {
+    const u = pick(rnd, UF_NUM);
+    return T.uf(u.name, Array.from({ length: u.arity }, () => genNum(rnd, depth - 1, mode)), u.sort);
   }
   return T.ite(genBool(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode));
 }
@@ -213,11 +254,15 @@ function genBool(rnd, depth, mode) {
     const op = pick(rnd, ['<', '<=', '>', '>=']);
     return T.app(op, [genNum(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode)]);
   }
-  if (roll < 0.92) {
+  if (roll < 0.88) {
     // polymorphic equality: numeric or boolean operands
     return chance(rnd, 0.7)
       ? T.app('=', [genNum(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode)])
       : T.app('=', [genBool(rnd, depth - 1, mode), genBool(rnd, depth - 1, mode)]);
+  }
+  if (roll < 0.94 && mode !== 'Int') {
+    const u = pick(rnd, UF_BOOL);
+    return T.uf(u.name, Array.from({ length: u.arity }, () => genNum(rnd, depth - 1, mode)), u.sort);
   }
   return T.ite(genBool(rnd, depth - 1, mode), genBool(rnd, depth - 1, mode), genBool(rnd, depth - 1, mode));
 }
@@ -250,9 +295,29 @@ function randomEnv(rnd, mode) {
 function varsOf(term, out = new Set()) {
   if (!term || typeof term !== 'object') return out;
   if (term.k === 'var') out.add(term.name);
-  else if (term.k === 'app') term.args.forEach((a) => varsOf(a, out));
+  else if (term.k === 'app' || term.k === 'uf') term.args.forEach((a) => varsOf(a, out));
   else if (term.k === 'ite') [term.c, term.a, term.b].forEach((a) => varsOf(a, out));
   return out;
+}
+
+/** Every uninterpreted application in a term, innermost first. */
+function ufAppsOf(term, out = []) {
+  if (!term || typeof term !== 'object') return out;
+  if (term.k === 'uf') {
+    term.args.forEach((a) => ufAppsOf(a, out));
+    out.push(term);
+  } else if (term.k === 'app') term.args.forEach((a) => ufAppsOf(a, out));
+  else if (term.k === 'ite') [term.c, term.a, term.b].forEach((a) => ufAppsOf(a, out));
+  return out;
+}
+
+/** The uf symbols a term applies, with their signature. */
+function ufSigsOf(term) {
+  const sigs = new Map();
+  for (const u of ufAppsOf(term)) {
+    if (!sigs.has(u.name)) sigs.set(u.name, { args: u.args.length, ret: u.sort });
+  }
+  return sigs;
 }
 
 // ------------------------------------------------------------ query building
@@ -270,7 +335,33 @@ function caseLines(c) {
     lines.push(`(declare-const ${smtSym(name)} ${sort})`);
     lines.push(`(assert (= ${smtSym(name)} ${valueToSmt(value, sort)}))`);
   }
-  const expectedSort = typeof c.expected === 'boolean' ? 'Bool' : c.mode === 'Int' ? 'Int' : 'Real';
+  const numSort = c.mode === 'Int' ? 'Int' : 'Real';
+  // Uninterpreted symbols are declared and then PINNED at exactly the argument
+  // points this case reaches, by evaluating the interpretation there. Pinning
+  // pointwise rather than defining the function keeps the emitted term under
+  // test - the query still has to apply the symbol the same way the evaluator
+  // did, to the same arguments, in the same order.
+  for (const [name, sig] of ufSigsOf(c.term)) {
+    const resolved = c.ufSorts && c.ufSorts.get(name);
+    const argSorts = resolved ? resolved.args : Array(sig.args).fill(numSort);
+    lines.push(
+      `(declare-fun ${smtSym(name)} (${argSorts.join(' ')}) ${resolved ? resolved.ret : sig.ret})`
+    );
+  }
+  const interp = c.interp || UF_INTERP;
+  for (const u of ufAppsOf(c.term)) {
+    const argVals = u.args.map((a) => evalTerm(a, c.env, interp));
+    if (argVals.some(isUndef)) continue; // unspecified point: nothing to pin
+    const out = interp[u.name](...argVals);
+    const applied = `(${smtSym(u.name)} ${argVals
+      .map((v, i) => valueToSmt(v, (c.ufSorts && c.ufSorts.get(u.name).args[i]) || numSort))
+      .join(' ')})`;
+    lines.push(
+      `(assert (= ${applied} ${valueToSmt(out, u.sort || c.ufSorts.get(u.name).ret)}))`
+    );
+  }
+  const expectedSort =
+    typeof c.expected === 'boolean' ? 'Bool' : typeof c.expected === 'string' ? 'String' : numSort;
   lines.push(`(assert (not (= ${termToSmt(c.term)} ${valueToSmt(c.expected, expectedSort)})))`);
   return lines;
 }
@@ -525,7 +616,7 @@ test('differential: evalTerm agrees with termToSmt through cvc5 on 500+ generate
     // depth 4 below the root keeps terms at depth <= 5
     const term = rootBool ? genBool(rnd, 4, mode) : genNum(rnd, 4, mode);
     const env = randomEnv(rnd, mode);
-    const expected = evalTerm(term, env);
+    const expected = evalTerm(term, env, UF_INTERP);
     if (isUndef(expected)) {
       // division by zero on the needed path: SMT calls the value unspecified,
       // so there is no concrete expectation to check - skip, never assert
@@ -539,8 +630,15 @@ test('differential: evalTerm agrees with termToSmt through cvc5 on 500+ generate
     cases.push({ term, env, varSorts, expected, mode });
   }
 
-  t.diagnostic(`generated ${attempts} term/env pairs; checked ${cases.length}; skipped ${skippedUndef} undef (div0)`);
+  const withUf = cases.filter((c) => ufAppsOf(c.term).length > 0).length;
+  t.diagnostic(
+    `generated ${attempts} term/env pairs; checked ${cases.length}; ` +
+      `skipped ${skippedUndef} undef (div0); ${withUf} apply an uninterpreted symbol`
+  );
   assert.ok(cases.length >= 500, `only ${cases.length} checkable cases generated (skip rate too high)`);
+  // Without this the uf arm could silently stop being generated and the whole
+  // uninterpreted-application path would go untested while the test passed.
+  assert.ok(withUf >= 50, `only ${withUf} cases exercise an uninterpreted application`);
 
   const failures = differential(cases);
   assert.equal(
@@ -566,6 +664,12 @@ function termIsClean(term) {
       return true;
     case 'var':
       return true;
+    case 'str':
+      return true;
+    case 'uf':
+      // An uninterpreted application IS in the checkable fragment: the case
+      // pins the symbol pointwise, so both sides speak about one function.
+      return term.args.every(termIsClean);
     case 'app':
       return (
         ['+', '-', '*', '/', 'div', 'mod', '<', '<=', '>', '>=', '=', 'not', 'and', 'or'].includes(term.op) &&
@@ -577,6 +681,36 @@ function termIsClean(term) {
     default:
       return false; // record, unsupported, anything unknown
   }
+}
+
+/**
+ * A deterministic interpretation for the uninterpreted symbols a REAL DAR term
+ * applies, built from the signature the emitter would declare.
+ *
+ * Any total function will do - what is being checked is that the emitter
+ * APPLIES the symbol the way the evaluator does - so the interpretation is a
+ * cheap hash of the argument values. It must be a FUNCTION (equal arguments
+ * give equal results), which is why it hashes the values rather than drawing
+ * them randomly.
+ */
+function darInterpretation(ufSorts) {
+  const interp = {};
+  for (const [name, sig] of ufSorts) {
+    interp[name] = (...args) => {
+      let h = 0;
+      const mix = (key) => {
+        for (let i = 0; i < key.length; i++) h = ((h << 5) - h + key.charCodeAt(i)) | 0;
+      };
+      for (const a of args) {
+        mix(typeof a === 'string' || typeof a === 'boolean' ? String(a) : `${a.p}/${a.q}`);
+      }
+      mix(name);
+      if (sig.ret === 'Bool') return (h & 1) === 0;
+      if (sig.ret === 'String') return `s${Math.abs(h % 97)}`;
+      return ratNorm(BigInt(h % 1000), 7n);
+    };
+  }
+  return interp;
 }
 
 function containsOp(term, ops) {
@@ -615,6 +749,7 @@ test(
     let skippedDirty = 0;
     let skippedSort = 0;
     let skippedUndef = 0;
+    let withUf = 0;
     for (const { term, rootSort } of candidates) {
       if (hasUnsupported(term) || !termIsClean(term)) {
         skippedDirty++;
@@ -627,24 +762,36 @@ test(
         skippedSort++;
         continue;
       }
-      const { sorts, conflicts } = inferSorts([{ term, sort: rootSort }]);
+      const { sorts, conflicts, ufs } = inferSorts([{ term, sort: rootSort }]);
       if (conflicts.length) {
         skippedSort++;
         continue;
       }
       eligible++;
+      if (ufs.size) withUf++;
+      const interp = darInterpretation(ufs);
       const numSort = intMode ? 'Int' : 'Real';
       for (let i = 0; i < 3; i++) {
         const env = new Map();
         const varSorts = new Map();
         for (const name of varsOf(term)) {
-          const sort = sorts.get(name) === 'Bool' ? 'Bool' : numSort;
+          const inferred = sorts.get(name);
+          const sort = inferred === 'Bool' || inferred === 'String' ? inferred : numSort;
           varSorts.set(name, sort);
-          env.set(name, sort === 'Bool' ? chance(rnd, 0.5) : intMode ? randomInt(rnd) : randomRat(rnd));
+          env.set(
+            name,
+            sort === 'Bool'
+              ? chance(rnd, 0.5)
+              : sort === 'String'
+                ? `t${Math.floor(rnd() * 5)}`
+                : intMode
+                  ? randomInt(rnd)
+                  : randomRat(rnd)
+          );
         }
         let expected;
         try {
-          expected = evalTerm(term, env);
+          expected = evalTerm(term, env, interp);
         } catch (e) {
           skippedSort++; // e.g. a fractional literal feeding div in Int mode
           continue;
@@ -653,16 +800,22 @@ test(
           skippedUndef++;
           continue;
         }
-        cases.push({ term, env, varSorts, expected, mode: intMode ? 'Int' : 'Real' });
+        cases.push({
+          term, env, varSorts, expected, interp, ufSorts: ufs,
+          mode: intMode ? 'Int' : 'Real',
+        });
       }
     }
 
     t.diagnostic(
-      `DAR terms: ${candidates.length} candidates, ${eligible} eligible, ` +
-        `${skippedDirty} outside the fragment, ${skippedSort} sort-skipped, ${skippedUndef} undef; ` +
-        `${cases.length} differential cases`
+      `DAR terms: ${candidates.length} candidates, ${eligible} eligible ` +
+        `(${withUf} applying an uninterpreted symbol), ${skippedDirty} outside the fragment, ` +
+        `${skippedSort} sort-skipped, ${skippedUndef} undef; ${cases.length} differential cases`
     );
     assert.ok(eligible > 0, 'no eligible terms in the DAR: the smoke test checked nothing');
+    // The DAR does abstract text operations; if that stopped happening, this
+    // test would quietly stop covering the uninterpreted path.
+    assert.ok(withUf > 0, 'no DAR term applied an uninterpreted symbol');
     assert.ok(cases.length > 0, 'no checkable cases from the DAR');
 
     const failures = differential(cases);

@@ -39,7 +39,10 @@
 //                    the coverage split is printed
 //   DISPROVED        sat: a concrete counterexample, printed. For a bounded
 //                    check the list length at which it was found is printed
-//                    with it: the property fails already at that length.
+//                    with it: the property fails already at that length. When
+//                    the query used an UNINTERPRETED FUNCTION (see below) the
+//                    verdict says so, because the counterexample may then be
+//                    an artifact of the abstraction rather than a real bug.
 //   NOT-MODELLABLE   the transition or property leaves the translated fragment;
 //                    the reason is printed
 //   NOT-APPLICABLE   the property does not apply (nonconsuming choice, no
@@ -51,6 +54,12 @@
 //     equalities are refused rather than proved wrongly.
 //   * Guards that leave the fragment are dropped, which is sound for proving
 //     (superset of reachable states) but each drop is listed in the report.
+//   * Opaque Text operations are modelled as UNINTERPRETED FUNCTIONS (see the
+//     header of smt.js). That too enlarges the model class, so it is sound for
+//     PROVED - but it makes a DISPROVED only a CANDIDATE: the solver may have
+//     picked an interpretation the real function never takes. Every DISPROVED
+//     over a query that declares such a symbol carries that caveat, naming the
+//     symbols, and no verdict here ever hides it.
 //   * A PROVED-BOUNDED is a statement about short lists only.
 //   * The translator itself (lfir.js) is tested, not verified.
 
@@ -198,6 +207,11 @@ function main() {
       let buildError = null;
       let solverError = null;
       const files = [];
+      // Uninterpreted symbols DECLARED IN THE QUERY that decided the verdict.
+      // Taken from buildQuery rather than from the transition, so the caveat
+      // attaches to the query actually solved: a transition may abstract a
+      // symbol in a part of its body this property never looks at.
+      let queryUfs = [];
       for (const instance of instances) {
         const at = instance.k === null ? '' : ` at list length ${instance.k}`;
         let query;
@@ -207,6 +221,7 @@ function main() {
           buildError = `${e.message}${at}`;
           break;
         }
+        queryUfs = query.ufs || [];
         try {
           solved = solve(query.script, args.solver, args.keep);
         } catch (e) {
@@ -269,6 +284,19 @@ function main() {
         );
       }
 
+      // The abstraction disclosure. It is a note on EVERY verdict that used a
+      // UF, not only on DISPROVED, because a reader of a PROVED is entitled to
+      // know which operations were replaced by unconstrained symbols - the
+      // proof is over a larger model class than the code.
+      if (queryUfs.length) {
+        const why = new Map((t.uninterpreted || []).map((u) => [u.name, u.why]));
+        const shown = queryUfs.slice(0, 3).map((n) => why.get(n) || n);
+        notes.push(
+          `${queryUfs.length} uninterpreted symbol(s) in the query: ${shown.join('; ')}` +
+            `${queryUfs.length > 3 ? `; and ${queryUfs.length - 3} more` : ''}`
+        );
+      }
+
       const cov = inst.coverage;
       const partial = !!(cov && cov.checked < cov.total);
       if (partial) {
@@ -293,24 +321,32 @@ function main() {
           status,
           ...(inst.bounded ? { bound: inst.bound, listName: inst.listName, queries: instances.length } : {}),
           ...(cov ? { coverage: cov } : {}),
+          ...(queryUfs.length ? { uninterpreted: queryUfs } : {}),
           ...(note ? { note } : {}),
           ...loc,
           smt2: files[files.length - 1],
         });
       } else if (solved.verdict === 'sat') {
+        // The abstraction is asymmetric (smt.js): unsat proves, sat does not
+        // refute. A counterexample drawn from a query with an uninterpreted
+        // symbol may use an interpretation the real function never takes, so
+        // it is a CANDIDATE finding and must never read as a confirmed one.
+        const spurious = queryUfs.length
+          ? `; this counterexample MAY BE AN ARTIFACT of the uninterpreted symbol(s) named ` +
+            `above rather than a real behaviour of the code: the solver is free to give them ` +
+            `any interpretation, including ones the real functions never take - check it ` +
+            `against what those functions actually do before treating it as a finding`
+          : '';
+        const bounded = failed.k === null ? '' : `; the property already fails at list length ${failed.k}`;
+        const disproofNote = note
+          ? `${note}${bounded}; the counterexample may be excluded by a dropped guard${spurious}`
+          : `${bounded.replace(/^; /, '')}${spurious}`.replace(/^; /, '');
         results.push({
           property: propName, transition: label, status: 'DISPROVED',
           ...(failed.k === null ? {} : { failedAtListLength: failed.k }),
           counterexample: solved.model,
-          ...(note
-            ? {
-                note:
-                  `${note}${failed.k === null ? '' : `; the property already fails at list length ${failed.k}`}` +
-                  `; the counterexample may be excluded by a dropped guard`,
-              }
-            : failed.k === null
-              ? {}
-              : { note: `the property already fails at list length ${failed.k}` }),
+          ...(queryUfs.length ? { uninterpreted: queryUfs } : {}),
+          ...(disproofNote ? { note: disproofNote } : {}),
           ...loc,
           smt2: files[files.length - 1],
         });
@@ -359,7 +395,11 @@ function main() {
     if (na) process.stdout.write(`\n(${na} not-applicable transition/property pairs omitted; --json lists them)\n`);
   }
 
-  process.exit(results.some((r) => r.status === 'DISPROVED') ? 1 : 0);
+  // `process.exitCode`, NOT `process.exit`: when stdout is a PIPE the write
+  // above is asynchronous, and exiting immediately truncates it - a --json
+  // report with a DISPROVED in it came out cut off at the pipe buffer, which
+  // is 8 KB. Setting the code lets node drain stdout and then exit with it.
+  process.exitCode = results.some((r) => r.status === 'DISPROVED') ? 1 : 0;
 }
 
 main();

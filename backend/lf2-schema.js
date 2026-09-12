@@ -75,6 +75,14 @@ export const RecProj = G.message('Expr.RecProj');
 export const RecUpd = G.message('Expr.RecUpd');
 export const RecCon = G.message('Expr.RecCon');
 export const StructProj = G.message('Expr.StructProj');
+export const StructCon = G.message('Expr.StructCon');
+/**
+ * `Expr.OptionalSome` is the Optional CONSTRUCTOR; `CaseAlt.OptionalSome`
+ * (below) is the Optional PATTERN. They are different messages with different
+ * fields, and the translator needs both: a `case (Some e) of ...` is decided
+ * exactly when the scrutinee is a literal constructor.
+ */
+export const OptionalSomeExpr = G.message('Expr.OptionalSome');
 export const Cons = G.message('Expr.Cons');
 export const FieldWithExpr = G.message('FieldWithExpr');
 export const VarWithType = G.message('VarWithType');

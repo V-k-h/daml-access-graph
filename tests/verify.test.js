@@ -13,7 +13,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -49,6 +49,13 @@ function hasSolver() {
   }
 }
 const SOLVER = hasSolver();
+
+// A real compiled package, used by the end-to-end tests below. Declared here
+// rather than next to them because `skip` options are evaluated when a test is
+// REGISTERED, which happens before any later `const` is initialized.
+const TOKENS_DAR =
+  '/private/tmp/claude-501/-Users-vijay-Downloads-carbon-core/713989a1-4f06-45ac-823b-b4ec40f8b2b8/scratchpad/canton/dlt-canton-main/daml/canton-tokens.dar';
+const HAVE_TOKENS_DAR = existsSync(TOKENS_DAR);
 
 // ------------------------------------------------------------------ helpers
 
@@ -110,8 +117,11 @@ test('buildQuery asserts guards and the negated goal', () => {
     T.app('>', [plus(v('x'), T.num('1')), T.num('1')])
   );
   assert.match(script, /\(declare-const \|x\| Real\)/);
-  assert.match(script, /\(assert \(> \|x\| 0\)\)/);
-  assert.match(script, /\(assert \(not \(> \(\+ \|x\| 1\) 1\)\)\)/);
+  // buildQuery renders numerals as Real literals: every numeric position it
+  // emits is Real, and a bare numeral is an Int that cvc5 refuses as an `ite`
+  // branch against one (see termToSmt's realNumerals).
+  assert.match(script, /\(assert \(> \|x\| 0\.0\)\)/);
+  assert.match(script, /\(assert \(not \(> \(\+ \|x\| 1\.0\) 1\.0\)\)\)/);
   assert.match(script, /\(check-sat\)/);
   assert.deepEqual(vars, ['x']);
 });
@@ -453,6 +463,98 @@ test('Optional case over a computed value is refused with a reason', () => {
   const term = translateExpr(decodeMessage(caseExpr), ctx);
   assert.equal(term.k, 'unsupported');
   assert.match(term.why, /Optional case/);
+});
+
+test('an Optional case naming ONE constructor plus `_` is still the $some encoding', () => {
+  // The compiled Eq instance for Optional writes `case x of None -> _; _ -> _`.
+  // Refusing a case that spells out only one constructor made every
+  // `field /= None` guard untranslatable; the catch-all simply binds nothing.
+  const strings = ['this', 'opt'];
+  const ctx = makeCtx(fakePkg(strings), { selfParam: 'this', argParam: null, label: 't' });
+  const CASE = S.message('Case');
+  const altNone = msg(
+    bf(S.CaseAlt.optionalNone, msg()),
+    bf(S.CaseAlt.body, msg(vf(S.Expr.builtinCon, S.ENUMS.BuiltinCon.CON_TRUE)))
+  );
+  const altDefault = msg(
+    bf(S.CaseAlt.default, msg()),
+    bf(S.CaseAlt.body, msg(vf(S.Expr.builtinCon, S.ENUMS.BuiltinCon.CON_FALSE)))
+  );
+  const caseExpr = msg(
+    bf(S.Expr.case, msg(bf(CASE.scrut, exprProj(exprVar(0), 1)), bf(CASE.alts, altNone), bf(CASE.alts, altDefault)))
+  );
+  const term = translateExpr(decodeMessage(caseExpr), ctx);
+  assert.equal(termToSmt(term), '(ite |this.opt.$some| false true)');
+});
+
+test('a case on a LITERAL Optional constructor is evaluated, not abstracted', () => {
+  // `case None of None -> True; _ -> False` IS True. This is evaluation: the
+  // compiled Eq instance for Optional compares its argument against the
+  // constant `None`, and without deciding that case the comparison dies.
+  const strings = ['x'];
+  const ctx = makeCtx(fakePkg(strings), { selfParam: null, argParam: null, label: 't' });
+  const CASE = S.message('Case');
+  const altNone = msg(
+    bf(S.CaseAlt.optionalNone, msg()),
+    bf(S.CaseAlt.body, msg(vf(S.Expr.builtinCon, S.ENUMS.BuiltinCon.CON_TRUE)))
+  );
+  const altDefault = msg(
+    bf(S.CaseAlt.default, msg()),
+    bf(S.CaseAlt.body, msg(vf(S.Expr.builtinCon, S.ENUMS.BuiltinCon.CON_FALSE)))
+  );
+  const noneExpr = msg(bf(S.Expr.optionalNone, msg()));
+  const caseExpr = msg(
+    bf(S.Expr.case, msg(bf(CASE.scrut, noneExpr), bf(CASE.alts, altNone), bf(CASE.alts, altDefault)))
+  );
+  assert.equal(termToSmt(translateExpr(decodeMessage(caseExpr), ctx)), 'true');
+
+  // and the Some side binds the payload
+  const SOME = S.message('Expr.OptionalSome');
+  const someExpr = msg(bf(S.Expr.optionalSome, msg(bf(SOME.value, exprInt(7)))));
+  const altSome = msg(
+    bf(S.CaseAlt.optionalSome, msg(vf(S.OptionalSomeAlt.varBodyInternedStr, 0))),
+    bf(S.CaseAlt.body, exprVar(0))
+  );
+  const caseSome = msg(
+    bf(S.Expr.case, msg(bf(CASE.scrut, someExpr), bf(CASE.alts, altSome), bf(CASE.alts, altDefault)))
+  );
+  assert.equal(termToSmt(translateExpr(decodeMessage(caseSome), ctx)), '7');
+});
+
+test('a typeclass method is resolved through its dictionary, exactly', () => {
+  // `x == y` compiles to `(structProj m_== $dEq) x y`. Resolving the struct to
+  // the compiled instance picks the very implementation the call site runs;
+  // left unresolved it died as "a function the translation cannot inline",
+  // which is what made Optional and Text comparisons untranslatable.
+  const strings = ['this', 'amount', 'm_==', 'dict'];
+  const ctx = makeCtx(fakePkg(strings), { selfParam: 'this', argParam: null, label: 't' });
+  const STRUCTCON = S.message('Expr.StructCon');
+  const FIELD = S.message('FieldWithExpr');
+  const dict = msg(
+    bf(
+      S.Expr.structCon,
+      msg(
+        bf(
+          STRUCTCON.fields,
+          msg(vf(FIELD.fieldInternedStr, 2), bf(FIELD.expr, exprBuiltin(BF.EQUAL)))
+        )
+      )
+    )
+  );
+  const method = msg(
+    bf(S.Expr.structProj, msg(vf(S.StructProj.fieldInternedStr, 2), bf(S.StructProj.struct, dict)))
+  );
+  const e = exprApp(method, [exprProj(exprVar(0), 1), exprInt(3)]);
+  assert.equal(termToSmt(translateExpr(decodeMessage(e), ctx)), '(= |this.amount| 3)');
+
+  // a dictionary that does not reduce to a struct is refused BY NAME, so the
+  // report says which method went unresolved rather than "some application"
+  const opaque = msg(
+    bf(S.Expr.structProj, msg(vf(S.StructProj.fieldInternedStr, 2), bf(S.StructProj.struct, exprVar(3))))
+  );
+  const bad = translateExpr(decodeMessage(opaque), ctx);
+  assert.equal(bad.k, 'unsupported');
+  assert.match(bad.why, /`m_==` projected off a value the translation could not reduce/);
 });
 
 test('nested projections through let-bound sub-records extend the symbol path', () => {
@@ -1339,11 +1441,207 @@ test('--bound decides how far the compiled fold is unrolled', () => {
   assert.equal(DEFAULT_BOUND, 3);
 });
 
-// ---------------------------------------------- the real thing, end to end
+// ===========================================================================
+// UNINTERPRETED FUNCTIONS
+//
+// The asymmetry is the whole point and it is tested from both sides: an unsat
+// over a query with a UF is a proof, a sat over one is a candidate that must
+// say so. See the header of backend/smt.js.
+// ===========================================================================
 
-const TOKENS_DAR =
-  '/private/tmp/claude-501/-Users-vijay-Downloads-carbon-core/713989a1-4f06-45ac-823b-b4ec40f8b2b8/scratchpad/canton/dlt-canton-main/daml/canton-tokens.dar';
-const HAVE_TOKENS_DAR = existsSync(TOKENS_DAR);
+test('a uf term renders as an application and is declared with its signature', () => {
+  const g = T.uf('isBlank', [v('this.id')], 'Bool');
+  assert.equal(termToSmt(g), '(|isBlank| |this.id|)');
+  // nullary symbols apply as bare symbols, the way a 0-arity declare-fun does
+  assert.equal(termToSmt(T.uf('now', [], 'Real')), '|now|');
+
+  const { script, ufs } = buildQuery([g], T.bool(true));
+  assert.match(script, /\(declare-fun \|isBlank\| \(Real\) Bool\)/);
+  assert.match(script, /\(assert \(\|isBlank\| \|this\.id\|\)\)/);
+  assert.deepEqual(ufs, ['isBlank']);
+});
+
+test('uf argument sorts are inferred from the arguments, and pinned when declared', () => {
+  // an unconstrained argument defaults to Real, as every other position does
+  const loose = inferSorts([{ term: T.uf('f', [v('a')], 'Bool'), sort: 'Bool' }]);
+  assert.deepEqual(loose.conflicts, []);
+  assert.deepEqual(loose.ufs.get('f'), { args: ['Real'], ret: 'Bool' });
+
+  // a String literal anywhere in the argument's sort class pins the whole
+  // class - the order dependence the old single-pass inference had is gone
+  const pinned = inferSorts([
+    { term: T.uf('f', [v('a')], 'Bool'), sort: 'Bool' },
+    { term: eq(v('a'), T.str('x')), sort: 'Bool' },
+  ]);
+  assert.deepEqual(pinned.conflicts, []);
+  assert.deepEqual(pinned.ufs.get('f'), { args: ['String'], ret: 'Bool' });
+  assert.equal(pinned.sorts.get('a'), 'String');
+
+  // declared argument sorts (a builtin whose LF type is fixed) propagate OUT
+  // to the variable, rather than being overridden by it
+  const declared = inferSorts([
+    { term: eq(T.uf('cat', [v('p'), v('q')], 'String', ['String', 'String']), T.str('ab')), sort: 'Bool' },
+  ]);
+  assert.deepEqual(declared.conflicts, []);
+  assert.equal(declared.sorts.get('p'), 'String');
+  assert.equal(declared.sorts.get('q'), 'String');
+});
+
+test('a uf used at two different signatures is a conflict, not a reconciliation', () => {
+  // same name, two arities
+  const arity = inferSorts([
+    { term: T.uf('f', [v('a')], 'Bool'), sort: 'Bool' },
+    { term: T.uf('f', [v('a'), v('b')], 'Bool'), sort: 'Bool' },
+  ]);
+  assert.ok(arity.conflicts.some((c) => /applied to 1 and 2 arguments/.test(c)));
+
+  // same name, two result sorts
+  const ret = inferSorts([
+    { term: T.uf('g', [v('a')], 'Bool'), sort: 'Bool' },
+    { term: eq(T.uf('g', [v('a')], 'Real'), T.num('1')), sort: 'Bool' },
+  ]);
+  assert.ok(ret.conflicts.length > 0);
+
+  // and a conflict refuses the query rather than emitting an ill-sorted script
+  assert.throws(
+    () => buildQuery([T.uf('f', [v('a')], 'Bool')], T.uf('f', [v('a'), v('b')], 'Bool')),
+    /sort conflicts/
+  );
+});
+
+test('cvc5: an unsat over a uf query is a proof; a sat over one is only a candidate', { skip: !SOLVER }, () => {
+  const blank = (x) => T.uf('isBlank', [x], 'Bool');
+  // f(x) => f(x) holds for EVERY interpretation of f: unsat, a real proof
+  assert.match(
+    runSolver(buildQuery([blank(v('this.id'))], blank(v('this.id'))).script),
+    /^unsat/m
+  );
+  // f(x) => f(y) holds only for the interpretations where they agree, so the
+  // solver finds one where they do not: sat, and the counterexample is about
+  // an invented interpretation, not about the code
+  assert.match(
+    runSolver(buildQuery([blank(v('this.id'))], blank(v('this.other'))).script),
+    /^sat/m
+  );
+});
+
+test(
+  'the CLI marks a DISPROVED drawn from a uf query as possibly an artifact',
+  { skip: (!SOLVER && 'no cvc5') || (!HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}`) },
+  () => {
+    const cli = new URL('../backend/verify.js', import.meta.url).pathname;
+    // verify.js exits 1 when anything is DISPROVED, which is the case here.
+    // spawnSync rather than execFileSync: the report still comes out in full
+    // on stdout, which execFileSync truncates on a nonzero exit.
+    const run = spawnSync(
+      'node',
+      [cli, TOKENS_DAR, '--property', 'amount-conservation', '--json'],
+      { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }
+    );
+    const out = JSON.parse(run.stdout).results;
+
+    const withUf = out.filter((r) => (r.uninterpreted || []).length > 0);
+    assert.ok(withUf.length > 0, 'expected some verdicts to rest on uninterpreted symbols');
+
+    // every verdict that used one discloses it, proved or disproved alike
+    for (const r of withUf) {
+      assert.match(r.note || '', /uninterpreted symbol\(s\) in the query/, r.transition);
+    }
+    // and a DISPROVED additionally says the counterexample may be an artifact
+    const disproved = withUf.filter((r) => r.status === 'DISPROVED');
+    assert.ok(disproved.length > 0, 'expected a DISPROVED resting on an uninterpreted symbol');
+    for (const r of disproved) {
+      assert.match(r.note, /MAY BE AN ARTIFACT/, r.transition);
+    }
+    // a PROVED must NOT carry the artifact caveat: unsat is sound under the
+    // abstraction, and saying otherwise would be its own kind of overclaim
+    for (const r of withUf.filter((r) => r.status.startsWith('PROVED'))) {
+      assert.doesNotMatch(r.note, /MAY BE AN ARTIFACT/, r.transition);
+    }
+  }
+);
+
+test(
+  'a real `ensure` recovered from the token DAR: text predicate, Optional and all',
+  { skip: !HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}` },
+  () => {
+    // Abl.CollateralAssetNft's validateCollateralAssetNftData reads
+    //   isValidLifecycleScopedTokenIdShape contractData.id contractData.backdated &&
+    //   validateAssetTokenId (scopedTokenIdPrefix contractData.id) &&
+    //   contractData.businessDate /= None &&
+    //   isNonBlankText contractData.relationshipId &&
+    //   isNonBlankText contractData.investorId &&
+    //   <three `all` quantifiers over contractData.additionalMetadata>
+    // Every line of it used to be dropped; this pins what each one became.
+    const t = extractTransitions(readDarRaw(TOKENS_DAR), { bound: 3 }).find(
+      (x) => x.choice === 'UpdateCollateralAssetNft'
+    );
+    assert.ok(t, 'expected an UpdateCollateralAssetNft transition');
+    const { used, dropped } = usableGuards(t);
+    const rendered = used.map((g) => termToSmt(g));
+
+    // `isNonBlankText x` is `isNotEmpty (trim x)`: the opaque part is `trim`,
+    // and the comparison the compiler generated for isNotEmpty SURVIVES as
+    // real structure rather than being swallowed by one opaque predicate
+    assert.ok(
+      rendered.some((r) => /\(not \(= \(\|DA\.Text:trim@[0-9a-f]+\| \|this\.contractData\.relationshipId\|\) ""\)\)/.test(r)),
+      `expected a recovered isNonBlankText guard, got:\n${rendered.join('\n')}`
+    );
+    // `businessDate /= None` is the EXISTING Optional encoding, not a UF: it
+    // reduces to the presence flag, with no uninterpreted symbol in sight
+    assert.ok(
+      rendered.some((r) => /this\.contractData\.businessDate\.\$some/.test(r) && !/@/.test(r)),
+      `expected businessDate /= None as a $some comparison, got:\n${rendered.join('\n')}`
+    );
+    // the `all` quantifiers over additionalMetadata are still dropped, and
+    // they say why: a fold, not a text chain, and no UF pretends otherwise
+    assert.ok(dropped.length > 0, 'the fold-based conjuncts must still be dropped');
+    assert.ok(
+      dropped.flat().some((w) => /FOLDL|foldl/.test(w)),
+      `expected the dropped conjuncts to name the fold, got:\n${JSON.stringify(dropped)}`
+    );
+    // and the whole query is emittable
+    const { script, ufs } = buildQuery(used, T.bool(true));
+    assert.match(script, /\(declare-fun \|DA\.Text:trim@[0-9a-f]+\| \(/);
+    assert.ok(ufs.length > 0);
+  }
+);
+
+test(
+  'an aborting branch is never abstracted into an uninterpreted value',
+  { skip: !HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}` },
+  () => {
+    // Error paths format their messages with text builtins, so a rule that
+    // looked only at "was the obstacle text?" turned `error` itself into a
+    // uninterpreted Bool - which would treat an aborting branch as a reachable
+    // post-state and silently weaken every `if c then _ else error` guard.
+    const ts = extractTransitions(readDarRaw(TOKENS_DAR), { bound: 3 });
+    const names = new Set();
+    for (const t of ts) for (const u of t.uninterpreted || []) names.add(u.name);
+    for (const n of names) {
+      assert.doesNotMatch(n, /GHC\.Err:error|GHC\.Err:undefined|DA\.Exception/, `abstracted ${n}`);
+    }
+  }
+);
+
+test('every uninterpreted symbol carries the reason it exists', { skip: !HAVE_TOKENS_DAR && 'no DAR' }, () => {
+  const ts = extractTransitions(readDarRaw(TOKENS_DAR), { bound: 3 });
+  let seen = 0;
+  for (const t of ts) {
+    for (const u of t.uninterpreted || []) {
+      seen++;
+      assert.ok(u.why && u.why.length > 20, `no reason recorded for ${u.name}`);
+      // a UF is a modelling choice with a stated cause, never a shrug
+      assert.match(u.why, /TEXT|text|APPEND_TEXT|EXPLODE_TEXT|IMPLODE_TEXT|CODE_POINTS|counterpart/);
+      // the symbol identifies ONE compiled value: package-qualified, or a
+      // globally unique builtin
+      assert.ok(/^builtin:[A-Z0-9_]+$/.test(u.name) || /@[0-9a-f]{8}$/.test(u.name), u.name);
+    }
+  }
+  assert.ok(seen > 0, 'the token DAR abstracts nothing: this test checked nothing');
+});
+
+// ---------------------------------------------- the real thing, end to end
 
 test(
   'a real compiled merge: the fold and the archive loop agree on `arg.holdings`',

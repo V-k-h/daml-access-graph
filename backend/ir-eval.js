@@ -54,6 +54,21 @@
 // Errors vs undef: UNDEF is a semantic value of SMT-LIB ("unspecified");
 // genuinely ill-formed terms (unknown ops, unbound vars, sort mismatches such
 // as `div` on a non-integer) THROW, because they have no SMT meaning at all.
+//
+// UNINTERPRETED FUNCTIONS. A `uf` term denotes the application of a declared
+// but unconstrained symbol (see smt.js). It has no fixed meaning, so this
+// evaluator cannot compute one: the CALLER supplies an INTERPRETATION, a map
+// from symbol name to a JavaScript function over already-evaluated arguments.
+// That is exactly what the differential layer needs - it pins the symbol to a
+// concrete function on both sides (here by calling it, in SMT by asserting its
+// value at the sampled points) and then checks that emitter and evaluator
+// agree. With no interpretation for a symbol the term is ill-formed HERE, not
+// unspecified in SMT, so it throws rather than returning UNDEF: a silent undef
+// would turn a missing test fixture into a skipped case.
+//
+// The interpretation's results go through the same discipline as everything
+// else: a rational must be a {p, q} pair (no floats), a Bool a JS boolean, and
+// arguments arrive already evaluated, so an interpretation never sees a term.
 
 // ---------------------------------------------------------------- rationals
 
@@ -193,6 +208,11 @@ function asIntBig(v, where) {
   return r.p;
 }
 
+function asStr(v, where) {
+  if (typeof v !== 'string') throw new Error(`ir-eval: ${where}: expected String, got ${kindOf(v)}`);
+  return v;
+}
+
 function kindOf(v) {
   if (isUndef(v)) return 'undef';
   if (isRat(v)) return 'rational';
@@ -217,33 +237,41 @@ function chain(args, pred) {
 /**
  * Evaluate an IR term under an environment.
  *
- * @param {Object} term  an lfir.js T.* term (num | bool | var | app | ite)
- * @param {Object|Map} env  var name -> rational {p,q} or boolean
- * @returns {{p: bigint, q: bigint} | boolean | typeof UNDEF}
+ * @param {Object} term  an lfir.js T.* term (num | str | bool | var | app | ite | uf)
+ * @param {Object|Map} env  var name -> rational {p,q}, boolean or string
+ * @param {Object|Map} [interp]  uf symbol name -> (…evaluatedArgs) => value
+ * @returns {{p: bigint, q: bigint} | boolean | string | typeof UNDEF}
  */
-export function evalTerm(term, env) {
+export function evalTerm(term, env, interp = undefined) {
   if (!term || typeof term !== 'object') throw new Error(`ir-eval: not a term: ${term}`);
   switch (term.k) {
     case 'num':
       return ratFromDecimal(term.v);
+    case 'str':
+      // Daml Text is the SMT String sort; a literal evaluates to itself.
+      return String(term.v);
     case 'bool':
       return !!term.v;
     case 'var': {
       const v = env instanceof Map ? env.get(term.name) : env[term.name];
       if (v === undefined) throw new Error(`ir-eval: unbound variable ${term.name}`);
-      if (typeof v === 'boolean') return v;
+      if (typeof v === 'boolean' || typeof v === 'string') return v;
       if (isRat(v)) return ratNorm(v.p, v.q);
-      throw new Error(`ir-eval: env value for ${term.name} is neither boolean nor {p,q}`);
+      throw new Error(
+        `ir-eval: env value for ${term.name} is neither boolean, string nor {p,q}`
+      );
     }
     case 'ite': {
       // lazy on the branches: sound because SMT ite ignores the untaken
       // branch's (always-existing) value; see header note on undef
-      const c = evalTerm(term.c, env);
+      const c = evalTerm(term.c, env, interp);
       if (isUndef(c)) return UNDEF;
-      return evalTerm(asBool(c, 'ite condition') ? term.a : term.b, env);
+      return evalTerm(asBool(c, 'ite condition') ? term.a : term.b, env, interp);
     }
+    case 'uf':
+      return evalUf(term, env, interp);
     case 'app':
-      return evalApp(term, env);
+      return evalApp(term, env, interp);
     case 'record':
       throw new Error('ir-eval: a whole record is not a value in this fragment');
     case 'unsupported':
@@ -253,7 +281,32 @@ export function evalTerm(term, env) {
   }
 }
 
-function evalApp(term, env) {
+/**
+ * Apply an uninterpreted symbol under the caller's interpretation.
+ *
+ * Arguments are evaluated first and undef propagates strictly: the symbol is
+ * an arbitrary TOTAL function, but its value at an unspecified point is itself
+ * unspecified, so there is nothing concrete to check and the case must be
+ * skipped like any other undef.
+ */
+function evalUf(term, env, interp) {
+  const fn = interp instanceof Map ? interp.get(term.name) : interp && interp[term.name];
+  if (typeof fn !== 'function') {
+    throw new Error(
+      `ir-eval: no interpretation supplied for uninterpreted symbol ${term.name}`
+    );
+  }
+  const args = term.args.map((a) => evalTerm(a, env, interp));
+  if (args.some(isUndef)) return UNDEF;
+  const out = fn(...args);
+  if (typeof out === 'boolean' || typeof out === 'string' || isUndef(out)) return out;
+  if (isRat(out)) return ratNorm(out.p, out.q);
+  throw new Error(
+    `ir-eval: interpretation of ${term.name} returned neither boolean, string nor {p,q}`
+  );
+}
+
+function evalApp(term, env, interp) {
   const { op } = term;
 
   // Kleene and/or: a false (resp. true) operand decides the result even if a
@@ -262,7 +315,7 @@ function evalApp(term, env) {
     const decider = op === 'and' ? false : true;
     let sawUndef = false;
     for (const a of term.args) {
-      const v = evalTerm(a, env);
+      const v = evalTerm(a, env, interp);
       if (isUndef(v)) sawUndef = true;
       else if (asBool(v, op) === decider) return decider;
     }
@@ -270,7 +323,7 @@ function evalApp(term, env) {
   }
 
   // strict ops: evaluate all args, propagate undef
-  const args = term.args.map((a) => evalTerm(a, env));
+  const args = term.args.map((a) => evalTerm(a, env, interp));
   if (args.some(isUndef)) return UNDEF;
 
   switch (op) {
@@ -322,6 +375,9 @@ function evalApp(term, env) {
       if (args.length < 2) throw new Error('ir-eval: = needs two arguments');
       if (typeof args[0] === 'boolean') {
         return chain(args, (a, b) => asBool(a, '=') === asBool(b, '='));
+      }
+      if (typeof args[0] === 'string') {
+        return chain(args, (a, b) => asStr(a, '=') === asStr(b, '='));
       }
       return chain(args, (a, b) => ratEq(asRat(a, '='), asRat(b, '=')));
     }

@@ -23,6 +23,59 @@
 // as exact Real. Sound for division-safety, sign and ordering; NOT sound for
 // exact-value equalities on paths that round. Transitions carrying rounding
 // builtins are refused for equality properties rather than proved wrongly.
+//
+// ---------------------------------------------------------------------------
+// UNINTERPRETED FUNCTIONS, and exactly what they cost. This one is asymmetric,
+// unlike the dropped-guard argument above, so it is spelled out in full.
+//
+// Some operations on a guard's path are opaque to the translation: Daml Text
+// manipulation (trim, explode, implode, append) has no counterpart in the
+// arithmetic-plus-Strings fragment the emitter speaks. Rather than dropping
+// the whole conjunct, such an operation is replaced by an UNINTERPRETED
+// FUNCTION SYMBOL of the same arity: `isNonBlankText this.id` becomes
+// `(|Shared:isNonBlankText@<pkg>| |this.id|)`, declared with `declare-fun` and
+// otherwise unconstrained.
+//
+// WHAT THAT DOES TO THE MODEL CLASS. The real function f is ONE function of
+// its signature. The uninterpreted symbol F ranges over ALL functions of that
+// signature, f included. Every model of the original system therefore extends
+// to a model of the abstracted one (interpret F as f), so the set of models
+// GROWS. Two consequences, and they point in opposite directions:
+//
+//   * `unsat` on the abstracted query means NO function of that signature
+//     admits a counterexample - in particular the real one does not. So an
+//     unsat still PROVES the property. UFs are sound for PROVED, for exactly
+//     the same reason dropping a guard is: we quantified over a superset.
+//
+//   * `sat` means SOME function of that signature admits a counterexample.
+//     The witnessing interpretation may be one the real function never takes -
+//     a "counterexample" in which `isNonBlankText` returns True for the empty
+//     string. So a DISPROVED over a query that mentions a UF is NOT a proof of
+//     a bug: it may be an artifact of the abstraction. Every such verdict must
+//     carry that caveat, and verify.js attaches it from `buildQuery`'s
+//     reported `ufs` list. Silence here would be the worst failure this
+//     pipeline can have: a fabricated finding presented as a real one.
+//
+// IDENTITY MATTERS. Two different Daml functions must never share a UF symbol:
+// equating them is a CONSTRAINT, not a relaxation, and constraints can make an
+// unsat spurious - unsound for PROVED, the one direction we cannot lose. The
+// translator therefore names a UF by its fully qualified value name PLUS the
+// id of the package that defines it (see lfir.js: ufName), and a name used at
+// two different signatures is a sort conflict that makes the whole query
+// non-modellable rather than being reconciled.
+//
+// WHAT A UF IS NOT: it is not a fallback for "the translator did not look".
+// Anything whose obstacle has not been identified stays `unsupported` with its
+// reason, and the conjunct is dropped as before.
+//
+// THE RESULT SORT is usually inferred from the position the application is used
+// in, because the translator reads compiled expressions and not their types.
+// That is sound for the same reason the abstraction is: what must exist is ONE
+// interpretation of the symbol reproducing the real function, and the Daml
+// value domains an abstraction can hide - Text, lists of Text, code points,
+// timestamps - are all countable, so each injects into the Real (or String)
+// the position pins. A Bool position can only arise where the real expression
+// was a Bool, since the position comes from the compiled code's own use of it.
 
 import {
   hasUnsupported,
@@ -42,13 +95,26 @@ const OPS = new Set(['+', '-', '*', '/', 'div', 'mod', '<', '<=', '>', '>=', '='
 /**
  * Render a term. Throws on `unsupported` - callers must have checked
  * modellability first, so reaching one here is a bug, not a report.
+ *
+ * `realNumerals` renders an integer-looking numeric literal as a REAL literal
+ * (`0` -> `0.0`). SMT-LIB types a bare numeral as Int, and cvc5 coerces it in
+ * arithmetic and equality contexts but NOT as an `ite` branch against a Real:
+ * `(ite c |x.$value| 0)` - the shape the Optional encoding produces for
+ * `fromOptional 0 x` - is rejected outright as "branches must have comparable
+ * type". buildQuery passes true because every numeric position it emits is
+ * Real (inferSorts has no rule that yields Int), and it is the only caller
+ * that owns a whole script. The default stays off so that a caller rendering a
+ * genuinely Int-sorted term - tests/differential.test.js generates div/mod
+ * terms over Int variables - still gets numerals.
  */
-export function termToSmt(t) {
+export function termToSmt(t, realNumerals = false) {
+  const rec = (x) => termToSmt(x, realNumerals);
   switch (t.k) {
     case 'num': {
       // LF numeric literals arrive as decimal strings ("0.0000000000"),
       // which SMT-LIB accepts as Real literals. Negatives need wrapping.
-      const v = String(t.v);
+      let v = String(t.v);
+      if (realNumerals && !v.includes('.')) v = `${v}.0`;
       return v.startsWith('-') ? `(- ${v.slice(1)})` : v;
     }
     case 'str': {
@@ -66,10 +132,16 @@ export function termToSmt(t) {
       return sym(t.name);
     case 'app': {
       if (!OPS.has(t.op)) throw new Error(`smt: unknown operator ${t.op}`);
-      return `(${t.op} ${t.args.map(termToSmt).join(' ')})`;
+      return `(${t.op} ${t.args.map(rec).join(' ')})`;
     }
+    case 'uf':
+      // An uninterpreted application. A nullary one is applied as a bare
+      // symbol, which is what SMT-LIB does with a 0-arity declare-fun.
+      return t.args.length
+        ? `(${sym(t.name)} ${t.args.map(rec).join(' ')})`
+        : sym(t.name);
     case 'ite':
-      return `(ite ${termToSmt(t.c)} ${termToSmt(t.a)} ${termToSmt(t.b)})`;
+      return `(ite ${rec(t.c)} ${rec(t.a)} ${rec(t.b)})`;
     case 'record':
       throw new Error('smt: a whole record reached the emitter');
     case 'fold':
@@ -88,45 +160,163 @@ export function termToSmt(t) {
 }
 
 /**
- * Infer variable sorts by position: a var used as an ite condition or as a
- * bare guard is Bool; anything under arithmetic or comparison is Real. A var
- * used both ways is a conflict and makes the query non-modellable.
+ * Infer sorts by UNIFICATION over positions.
+ *
+ * Every position that must share a sort is unified: a var occurrence with the
+ * variable's sort class, the operands of an `=` with each other, the branches
+ * of an `ite` with the ite's own sort, an uninterpreted application's argument
+ * i with that symbol's i-th parameter class. Positions with a forced sort
+ * (a Bool under `not`, a Real under arithmetic, a String literal, a UF's
+ * declared result sort) pin their class to it. A class pinned to two different
+ * sorts is a CONFLICT and makes the query non-modellable, which is the only
+ * honest answer: the emitter would otherwise produce an ill-sorted script and
+ * the solver's complaint would arrive as a mysterious SOLVER-ERROR.
+ *
+ * Unification replaced a single left-to-right pass whose `=` rule guessed
+ * Real unless it saw a string literal. The guess was fine while Text appeared
+ * only next to literals; an uninterpreted predicate over a text field pins
+ * that field to String from a position the old pass reached AFTER it had
+ * already committed, which is exactly the order dependence unification
+ * removes.
+ *
+ * A class that ends up pinned to nothing defaults to Real, as before.
+ *
+ * @param {Array<{term: Object, sort: string}>} terms
+ * @returns {{sorts: Map<string,string>, conflicts: string[],
+ *   ufs: Map<string, {args: string[], ret: string}>}}
  */
 export function inferSorts(terms) {
-  /** @type {Map<string, string>} */
-  const sorts = new Map();
+  const CONCRETE = new Set(['Bool', 'Real', 'Int', 'String']);
+  /** union-find parent pointers; a concrete sort name is its own root */
+  const parent = new Map();
   const conflicts = [];
+  /** var names in encounter order, so the declaration list is stable */
+  const varNames = [];
+  const seenVar = new Set();
+  /** uf name -> arity, to catch a symbol used at two different arities */
+  const ufArity = new Map();
+  const ufNames = [];
 
-  const mark = (t, sort) => {
+  const find = (x) => {
+    let r = x;
+    while (parent.has(r) && parent.get(r) !== r) r = parent.get(r);
+    let c = x;
+    while (parent.has(c) && parent.get(c) !== c) {
+      const next = parent.get(c);
+      parent.set(c, r);
+      c = next;
+    }
+    return r;
+  };
+  const node = (id) => {
+    if (!parent.has(id)) parent.set(id, id);
+    return find(id);
+  };
+  const union = (a, b) => {
+    const ra = node(a);
+    const rb = node(b);
+    if (ra === rb) return;
+    const ca = CONCRETE.has(ra);
+    const cb = CONCRETE.has(rb);
+    if (ca && cb) {
+      conflicts.push(`${describe(a)} used as both ${ra} and ${rb}`);
+      return;
+    }
+    // a concrete sort always becomes the root, so a class carries its sort
+    if (ca) parent.set(rb, ra);
+    else parent.set(ra, rb);
+  };
+  const describe = (id) =>
+    id.startsWith('v:') ? id.slice(2) : id.startsWith('u:') ? `\`${id.slice(2)}\`` : id;
+
+  let fresh = 0;
+  const walk = (t, id) => {
     if (!t || typeof t !== 'object') return;
-    if (t.k === 'var') {
-      const prev = sorts.get(t.name);
-      if (prev && prev !== sort) conflicts.push(`${t.name} used as both ${prev} and ${sort}`);
-      else sorts.set(t.name, sort);
-      return;
-    }
-    if (t.k === 'app') {
-      if (t.op === 'not' || t.op === 'and' || t.op === 'or') t.args.forEach((a) => mark(a, 'Bool'));
-      else if (t.op === '=') {
-        // Equality is polymorphic. A string literal on either side makes it a
-        // String equality; otherwise treat both sides as Real unless a side is
-        // already known Bool. Good enough for this fragment.
-        const isString = t.args.some((a) => a && a.k === 'str');
-        t.args.forEach((a) =>
-          mark(a, isString ? 'String' : sorts.get(a.name) === 'Bool' ? 'Bool' : 'Real')
-        );
-      } else t.args.forEach((a) => mark(a, 'Real'));
-      return;
-    }
-    if (t.k === 'ite') {
-      mark(t.c, 'Bool');
-      mark(t.a, sort);
-      mark(t.b, sort);
+    switch (t.k) {
+      case 'var':
+        if (!seenVar.has(t.name)) {
+          seenVar.add(t.name);
+          varNames.push(t.name);
+        }
+        union(id, `v:${t.name}`);
+        return;
+      case 'num':
+        union(id, 'Real');
+        return;
+      case 'str':
+        union(id, 'String');
+        return;
+      case 'bool':
+        union(id, 'Bool');
+        return;
+      case 'uf': {
+        const prev = ufArity.get(t.name);
+        if (prev === undefined) {
+          ufArity.set(t.name, t.args.length);
+          ufNames.push(t.name);
+        } else if (prev !== t.args.length) {
+          conflicts.push(
+            `uninterpreted symbol \`${t.name}\` applied to ${prev} and ${t.args.length} arguments`
+          );
+        }
+        if (t.sort) union(`u:${t.name}`, t.sort);
+        union(id, `u:${t.name}`);
+        t.args.forEach((a, i) => {
+          const slot = `u:${t.name}#${i}`;
+          // A DECLARED parameter sort (a builtin whose LF type is fixed) pins
+          // the class, so it propagates out to the argument rather than being
+          // decided by whatever the argument happened to be used as elsewhere.
+          if (t.argSorts && t.argSorts[i]) union(slot, t.argSorts[i]);
+          walk(a, slot);
+        });
+        return;
+      }
+      case 'app': {
+        if (t.op === 'not' || t.op === 'and' || t.op === 'or') {
+          union(id, 'Bool');
+          t.args.forEach((a) => walk(a, 'Bool'));
+        } else if (t.op === '=') {
+          // Equality is polymorphic: its operands share ONE sort, whatever it
+          // turns out to be. A fresh class stands for it until something pins
+          // it down; unpinned it defaults to Real, as it always did.
+          union(id, 'Bool');
+          const group = `=${fresh++}`;
+          t.args.forEach((a) => walk(a, group));
+        } else if (['<', '<=', '>', '>='].includes(t.op)) {
+          union(id, 'Bool');
+          t.args.forEach((a) => walk(a, 'Real'));
+        } else {
+          union(id, 'Real');
+          t.args.forEach((a) => walk(a, 'Real'));
+        }
+        return;
+      }
+      case 'ite':
+        walk(t.c, 'Bool');
+        walk(t.a, id);
+        walk(t.b, id);
+        return;
+      default:
+        return;
     }
   };
 
-  for (const { term, sort } of terms) mark(term, sort);
-  return { sorts, conflicts };
+  for (const { term, sort } of terms) walk(term, sort);
+
+  const resolve = (id) => {
+    const r = node(id);
+    return CONCRETE.has(r) ? r : 'Real';
+  };
+  const sorts = new Map();
+  for (const name of varNames) sorts.set(name, resolve(`v:${name}`));
+  const ufs = new Map();
+  for (const name of ufNames) {
+    ufs.set(name, {
+      args: Array.from({ length: ufArity.get(name) }, (_, i) => resolve(`u:${name}#${i}`)),
+      ret: resolve(`u:${name}`),
+    });
+  }
+  return { sorts, conflicts, ufs };
 }
 
 /**
@@ -137,7 +327,7 @@ export function inferSorts(terms) {
  * @returns {{script: string, vars: string[]}}
  */
 export function buildQuery(guards, goal) {
-  const { sorts, conflicts } = inferSorts([
+  const { sorts, conflicts, ufs } = inferSorts([
     ...guards.map((g) => ({ term: g, sort: 'Bool' })),
     { term: goal, sort: 'Bool' },
   ]);
@@ -149,11 +339,23 @@ export function buildQuery(guards, goal) {
   for (const [name, sort] of [...sorts.entries()].sort()) {
     lines.push(`(declare-const ${sym(name)} ${sort})`);
   }
-  for (const g of guards) lines.push(`(assert ${termToSmt(g)})`);
-  lines.push(`(assert (not ${termToSmt(goal)}))`);
+  // Uninterpreted symbols: declared, never constrained. See the header for
+  // why an unsat over these still proves the property and a sat does not
+  // refute it.
+  for (const [name, sig] of [...ufs.entries()].sort()) {
+    lines.push(`(declare-fun ${sym(name)} (${sig.args.join(' ')}) ${sig.ret})`);
+  }
+  for (const g of guards) lines.push(`(assert ${termToSmt(g, true)})`);
+  lines.push(`(assert (not ${termToSmt(goal, true)}))`);
   lines.push('(check-sat)');
   lines.push('(get-model)');
-  return { script: lines.join('\n') + '\n', vars: [...sorts.keys()] };
+  return {
+    script: lines.join('\n') + '\n',
+    vars: [...sorts.keys()],
+    // The names verify.js needs to decide whether a DISPROVED has to carry
+    // the abstraction caveat.
+    ufs: [...ufs.keys()],
+  };
 }
 
 // ---------------------------------------------------------------- properties

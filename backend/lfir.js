@@ -106,6 +106,65 @@ const DIVISION = new Set([BF.DIV_NUMERIC, BF.DIV_INT64, BF.MOD_INT64]);
  */
 const IDENTITY_BUILTIN = new Set([BF.COERCE_CONTRACT_ID]);
 
+/**
+ * Text builtins with a SCALAR signature, modelled as uninterpreted functions.
+ *
+ * Daml Text manipulation has no counterpart in the arithmetic-plus-Strings
+ * fragment the emitter speaks, but an operation whose arguments and result are
+ * all scalars still has a signature the emitter can DECLARE. Replacing it by
+ * an uninterpreted symbol of that signature keeps the surrounding guard
+ * assertable instead of dropping it. The cost is asymmetric and spelled out in
+ * smt.js: unsat still proves, sat may be an artifact.
+ *
+ * `arity` counts VALUE arguments from the end of the spine, the way BINOP
+ * does, because scale and dictionary arguments sit in front. `argSorts` and
+ * `sort` are read off the builtin's fixed LF type, so they are facts, not
+ * guesses - and pinning them is what keeps two uses of the same symbol from
+ * looking like two different signatures.
+ *
+ * Deliberately ABSENT: EXPLODE_TEXT ([Text]), IMPLODE_TEXT ([Text] -> Text),
+ * TEXT_TO_CODE_POINTS ([Int]), CODE_POINTS_TO_TEXT, the GENMAP and TEXTMAP
+ * families, and
+ * TEXT_TO_INT64 / TEXT_TO_NUMERIC / TEXT_TO_PARTY. Each has a list, a map or
+ * an Optional on one side, and the emitter's sort set is Bool/Real/Int/String
+ * with nothing to declare such a symbol against. They stay `unsupported` with
+ * that reason - and they are exactly what makes a whole enclosing predicate
+ * eligible for abstraction instead (see textOpaqueUf).
+ */
+const TEXT_UF_BUILTIN = new Map([
+  [BF.APPEND_TEXT, { arity: 2, argSorts: ['String', 'String'], sort: 'String' }],
+  [BF.SHA256_TEXT, { arity: 1, argSorts: ['String'], sort: 'String' }],
+  [BF.KECCAK256_TEXT, { arity: 1, argSorts: ['String'], sort: 'String' }],
+  [BF.SHA256_HEX, { arity: 1, argSorts: ['String'], sort: 'String' }],
+  [BF.HEX_TO_TEXT, { arity: 1, argSorts: ['String'], sort: 'String' }],
+  [BF.TEXT_TO_HEX, { arity: 1, argSorts: ['String'], sort: 'String' }],
+  [BF.INT64_TO_TEXT, { arity: 1, argSorts: ['Real'], sort: 'String' }],
+  [BF.NUMERIC_TO_TEXT, { arity: 1, argSorts: ['Real'], sort: 'String' }],
+  [BF.TIMESTAMP_TO_TEXT, { arity: 1, argSorts: ['Real'], sort: 'String' }],
+  [BF.DATE_TO_TEXT, { arity: 1, argSorts: ['Real'], sort: 'String' }],
+]);
+
+/**
+ * Text builtins whose presence in a refused translation identifies the
+ * obstacle as A TEXT CHAIN, which is what makes an enclosing named function
+ * eligible to be abstracted as a single uninterpreted symbol. Everything in
+ * TEXT_UF_BUILTIN is here too, plus the list-valued ones that cannot be
+ * abstracted on their own.
+ */
+const TEXT_OPAQUE_BUILTIN = new Set([
+  ...TEXT_UF_BUILTIN.keys(),
+  BF.EXPLODE_TEXT,
+  BF.IMPLODE_TEXT,
+  BF.TEXT_TO_CODE_POINTS,
+  BF.CODE_POINTS_TO_TEXT,
+  BF.TEXT_TO_INT64,
+  BF.TEXT_TO_NUMERIC,
+  BF.TEXT_TO_PARTY,
+  BF.TEXT_TO_CONTRACT_ID,
+  BF.CONTRACT_ID_TO_TEXT,
+  BF.PARTY_TO_TEXT,
+]);
+
 /** Default list-length bound for fold/traversal unrolling (`--bound N`). */
 export const DEFAULT_BOUND = 3;
 
@@ -180,6 +239,27 @@ export const T = {
    */
   abort: (why) => ({ k: 'abort', why }),
   /**
+   * An UNINTERPRETED APPLICATION: a named function symbol of fixed arity,
+   * applied to translated arguments, with no definition attached.
+   *
+   * This is how an operation the fragment cannot express - Daml Text
+   * manipulation, essentially - is kept in a guard instead of being dropped.
+   * The soundness argument lives in smt.js's header and is asymmetric:
+   * replacing a concrete function by an uninterpreted one ENLARGES the model
+   * class, so an unsat still proves the property, while a sat may be an
+   * artifact of an interpretation the real function never takes. Anything a
+   * verdict is drawn from must therefore report which UFs it used.
+   *
+   * `name` must IDENTIFY the function (see ufName): two different Daml
+   * functions sharing a symbol would be an assumption that they are equal,
+   * and assumptions - unlike relaxations - can make an unsat spurious.
+   *
+   * `sort` is the result sort when the translation knows it (APPEND_TEXT is
+   * String by signature) and null when it does not, in which case smt.js
+   * infers it from the position the application is used in.
+   */
+  uf: (name, args, sort = null, argSorts = null) => ({ k: 'uf', name, args, sort, argSorts }),
+  /**
    * A fold over a NAMED list, UNROLLED at every list length 0..bound.
    *
    * `unrolled[k]` is the term the fold denotes when the list has exactly k
@@ -211,7 +291,7 @@ export function hasUnsupported(term) {
   // node - it gets dropped or skipped, with the reason reported, never
   // asserted and never proved over.
   if (term.k === 'fold') return true;
-  if (term.k === 'app') return term.args.some(hasUnsupported);
+  if (term.k === 'app' || term.k === 'uf') return term.args.some(hasUnsupported);
   if (term.k === 'ite') return [term.c, term.a, term.b].some(hasUnsupported);
   return false;
 }
@@ -228,8 +308,11 @@ export function unsupportedReasons(term, out = []) {
         `${term.op} over \`${term.listName}\` used where no list length is fixed; ` +
         `only a bounded property instantiates it`,
     });
-  } else if (term.k === 'app') term.args.forEach((a) => unsupportedReasons(a, out));
-  else if (term.k === 'ite') [term.c, term.a, term.b].forEach((a) => unsupportedReasons(a, out));
+  } else if (term.k === 'app' || term.k === 'uf') {
+    term.args.forEach((a) => unsupportedReasons(a, out));
+  } else if (term.k === 'ite') {
+    [term.c, term.a, term.b].forEach((a) => unsupportedReasons(a, out));
+  }
   return out;
 }
 
@@ -255,7 +338,9 @@ export function instantiateFolds(term, k) {
     }
     return instantiateFolds(chosen, k);
   }
-  if (term.k === 'app') return { ...term, args: term.args.map((a) => instantiateFolds(a, k)) };
+  if (term.k === 'app' || term.k === 'uf') {
+    return { ...term, args: term.args.map((a) => instantiateFolds(a, k)) };
+  }
   if (term.k === 'ite') {
     return {
       ...term,
@@ -273,8 +358,11 @@ export function foldLists(term, out = new Set()) {
   if (term.k === 'fold') {
     out.add(term.listName);
     term.unrolled.forEach((u) => foldLists(u, out));
-  } else if (term.k === 'app') term.args.forEach((a) => foldLists(a, out));
-  else if (term.k === 'ite') [term.c, term.a, term.b].forEach((a) => foldLists(a, out));
+  } else if (term.k === 'app' || term.k === 'uf') {
+    term.args.forEach((a) => foldLists(a, out));
+  } else if (term.k === 'ite') {
+    [term.c, term.a, term.b].forEach((a) => foldLists(a, out));
+  }
   return out;
 }
 
@@ -331,7 +419,7 @@ function scrubAborts(t) {
   if (t.k === 'abort') {
     return T.unsupported(`abort (${t.why}) in a guard position the translation cannot eliminate`, null);
   }
-  if (t.k === 'app') return { ...t, args: t.args.map(scrubAborts) };
+  if (t.k === 'app' || t.k === 'uf') return { ...t, args: t.args.map(scrubAborts) };
   if (t.k === 'ite') return { ...t, c: scrubAborts(t.c), a: scrubAborts(t.a), b: scrubAborts(t.b) };
   return t;
 }
@@ -343,6 +431,8 @@ export function divisors(term, out = []) {
     if ((term.op === '/' || term.op === 'div' || term.op === 'mod') && term.args.length === 2) {
       out.push(term.args[1]);
     }
+    term.args.forEach((a) => divisors(a, out));
+  } else if (term.k === 'uf') {
     term.args.forEach((a) => divisors(a, out));
   } else if (term.k === 'ite') {
     [term.c, term.a, term.b].forEach((a) => divisors(a, out));
@@ -435,6 +525,20 @@ function makeCtx(pkg, { selfParam, argParam, label, dispatch = null, bound = DEF
     foldContext: null,
     /** Work cap, so a fold-dense choice cannot blow the translation up. */
     foldBudget: 64,
+    /**
+     * Every refusal raised while translating expressions, in order:
+     * `{kind, builtin?, cascade}`. A refusal is CASCADE when its own cause was
+     * an already-`unsupported` sub-term, so it says nothing new about why the
+     * expression left the fragment. The list is what decides whether a failed
+     * application may be abstracted as an uninterpreted function: eligibility
+     * requires the ORIGINAL obstacles to be text builtins and nothing else,
+     * and that question is only answerable from the refusals raised underneath
+     * (see textOpaqueUf). Append-only, so a slice taken between two marks is
+     * exactly the refusals raised inside that subtree.
+     */
+    refusals: [],
+    /** Uninterpreted symbols introduced, with why: surfaced on the transition. */
+    uninterpreted: [],
     depth: 0,
   };
 }
@@ -448,6 +552,35 @@ function withPkg(ctx, pkg, f) {
   } finally {
     ctx.pkg = prev;
   }
+}
+
+/**
+ * Record a refusal and return the `unsupported` node for it.
+ *
+ * Every refusal raised while translating an EXPRESSION goes through here, so
+ * that an enclosing application can ask what actually stopped the translation
+ * rather than guessing from the reason string. `cascade` marks a refusal whose
+ * cause was already an `unsupported` sub-term - a case whose scrutinee is
+ * opaque, an application whose head is opaque - because such a refusal carries
+ * no independent information about the obstacle.
+ */
+function refuse(ctx, kind, why, { builtin = null, cascade = false } = {}) {
+  if (ctx.refusals) ctx.refusals.push({ kind, builtin, cascade });
+  return T.unsupported(why, ctx.label);
+}
+
+/**
+ * The symbol an uninterpreted application of a compiled value is named by.
+ *
+ * The PACKAGE ID is part of the name and that is load-bearing: two distinct
+ * functions sharing a symbol would assert that they are equal, and an
+ * assumption - unlike the relaxation a UF otherwise is - can make an unsat
+ * spurious. Sharing a symbol is only correct when it really is the same
+ * compiled value, which is what a package-qualified name says.
+ */
+function ufName(qualified, pkgCtx) {
+  const pid = pkgCtx && pkgCtx.selfPackageId;
+  return pid ? `${qualified}@${String(pid).slice(0, 8)}` : qualified;
 }
 
 /** Register (or reuse) a symbolic input for a projection path. */
@@ -466,7 +599,9 @@ function symbol(ctx, root, path, sort) {
  */
 export function translateExpr(expr, ctx) {
   if (!expr) return T.unsupported('empty expression', ctx.label);
-  if (ctx.depth > 120) return T.unsupported('expression nested deeper than the translator follows', ctx.label);
+  if (ctx.depth > 120) {
+    return refuse(ctx, 'depth', 'expression nested deeper than the translator follows');
+  }
   ctx.depth++;
   try {
     return translateInner(expr, ctx);
@@ -482,7 +617,7 @@ function translateInner(expr, ctx) {
   if (has(expr, S.Expr.internedExpr)) {
     const idx = int(expr, S.Expr.internedExpr);
     const target = pkg.internedExprs[idx];
-    if (!target) return T.unsupported(`interned expression ${idx} missing`, ctx.label);
+    if (!target) return refuse(ctx, 'expr', `interned expression ${idx} missing`);
     return translateExpr(target, ctx);
   }
 
@@ -508,7 +643,7 @@ function translateInner(expr, ctx) {
   if (has(expr, S.Expr.varInternedStr)) {
     const name = pkg.str(int(expr, S.Expr.varInternedStr));
     if (ctx.env.has(name)) return ctx.env.get(name);
-    return T.unsupported(`unbound variable \`${name}\``, ctx.label);
+    return refuse(ctx, 'unbound', `unbound variable \`${name}\``);
   }
 
   // literals
@@ -521,13 +656,13 @@ function translateInner(expr, ctx) {
     if (has(lit, S.BuiltinLit.textInternedStr)) {
       return T.str(pkg.str(int(lit, S.BuiltinLit.textInternedStr)));
     }
-    return T.unsupported('literal of a type the translation does not model', ctx.label);
+    return refuse(ctx, 'literal', 'literal of a type the translation does not model');
   }
   if (has(expr, S.Expr.builtinCon)) {
     const c = int(expr, S.Expr.builtinCon);
     if (c === BC.CON_TRUE) return T.bool(true);
     if (c === BC.CON_FALSE) return T.bool(false);
-    return T.unsupported('unit value', ctx.label);
+    return refuse(ctx, 'literal', 'unit value');
   }
 
   // record projection. The base is translated rather than pattern-matched on a
@@ -556,9 +691,11 @@ function translateInner(expr, ctx) {
         return symbol(ctx, p.root, `${p.path}.${segments.join('.')}`, 'Real');
       }
       if (base && base.k === 'unsupported') return base;
-      return T.unsupported(`projection off a value that is not a known record`, ctx.label);
+      return refuse(ctx, 'projection', `projection off a value that is not a known record`, {
+        cascade: false,
+      });
     }
-    return T.unsupported('record projection we could not follow', ctx.label);
+    return refuse(ctx, 'projection', 'record projection we could not follow');
   }
 
   // application of a builtin
@@ -576,17 +713,26 @@ function translateInner(expr, ctx) {
     for (const binding of subs(block, S.Block.bindings)) {
       const binder = sub(binding, S.Binding.binder);
       const name = binder ? pkg.str(int(binder, S.VarWithType.varInternedStr)) : null;
-      const boundTerm = translateExpr(deref(sub(binding, S.Binding.bound), ctx), ctx);
+      const bound = deref(sub(binding, S.Binding.bound), ctx);
+      const boundTerm = translateExpr(bound, ctx);
       if (name) {
-        saved.push([name, ctx.env.has(name) ? ctx.env.get(name) : undefined]);
+        saved.push([
+          name,
+          ctx.env.has(name) ? ctx.env.get(name) : undefined,
+          ctx.rawEnv.has(name) ? ctx.rawEnv.get(name) : undefined,
+        ]);
         ctx.env.set(name, boundTerm);
+        // The RAW expression matters as much as the term: the compiler turns
+        // a guard's failure branches into join points (`let fail = \_ -> False
+        // in ... fail ()`), and a term-only binding leaves the later
+        // APPLICATION of `fail` with nothing to reduce. Keeping the expression
+        // lets betaReduce step through it.
+        if (bound) ctx.rawEnv.set(name, { expr: bound, pkg: ctx.pkg, kind: 'let' });
+        else ctx.rawEnv.delete(name);
       }
     }
     const body = translateExpr(deref(sub(block, S.Block.body), ctx), ctx);
-    for (const [name, prev] of saved.reverse()) {
-      if (prev === undefined) ctx.env.delete(name);
-      else ctx.env.set(name, prev);
-    }
+    restore(saved, ctx);
     return body;
   }
 
@@ -644,16 +790,18 @@ function translateInner(expr, ctx) {
     const mname = ctx.pkg.str(int(ci, S.CallInterface.methodInternedName));
     const impl = ctx.dispatch && ctx.dispatch.methods.get(mname);
     if (!impl) {
-      return T.unsupported(
-        `interface method \`${mname}\` call with no implementation in scope`,
-        ctx.label
+      return refuse(
+        ctx,
+        'interface',
+        `interface method \`${mname}\` call with no implementation in scope`
       );
     }
     const recv = translateExpr(deref(sub(ci, S.CallInterface.interfaceExpr), ctx), ctx);
     if (!(recv && recv.k === 'record' && recv.root === 'this')) {
-      return T.unsupported(
-        `interface method \`${mname}\` called on a value other than this contract`,
-        ctx.label
+      return refuse(
+        ctx,
+        'interface',
+        `interface method \`${mname}\` called on a value other than this contract`
       );
     }
     const prevPkg = ctx.pkg;
@@ -665,14 +813,52 @@ function translateInner(expr, ctx) {
     }
   }
 
-  if (has(expr, S.Expr.optionalSome) || has(expr, S.Expr.optionalNone)) {
-    return T.unsupported(
-      'Optional constructor (only Optional CASE ANALYSIS on contract/argument fields is modelled)',
-      ctx.label
+  // A list VALUE. The emitter's sorts are Bool/Real/Int/String, with nothing
+  // to declare a list against, so a list cannot be a term - but saying so
+  // precisely matters: a list of Text is what EXPLODE_TEXT produces, and a
+  // refusal of this kind inside an otherwise text-only body is part of that
+  // chain rather than an independent gap (see textOpaqueUf).
+  if (has(expr, S.Expr.nil) || has(expr, S.Expr.cons)) {
+    return refuse(
+      ctx,
+      'list',
+      'a list value, which has no sort in the emitter (Bool/Real/Int/String only)'
     );
   }
 
-  return T.unsupported('expression form outside the translated fragment', ctx.label);
+  // A typeclass method, projected off its dictionary. Resolving the
+  // dictionary to the compiled instance is exact; see resolveStructField.
+  const spMsg = sub(expr, S.Expr.structProj);
+  if (spMsg) {
+    const field = structFieldName(spMsg, ctx);
+    const found = field ? resolveStructField(sub(spMsg, S.StructProj.struct), field, ctx) : null;
+    if (found) {
+      const prevPkg = ctx.pkg;
+      ctx.pkg = found.pkg || prevPkg;
+      try {
+        return translateExpr(found.expr, ctx);
+      } finally {
+        ctx.pkg = prevPkg;
+        found.restore();
+      }
+    }
+    return refuse(
+      ctx,
+      'dictionary',
+      `\`${field || '?'}\` projected off a value the translation could not reduce to a ` +
+        `typeclass dictionary, so the instance it selects is unknown`
+    );
+  }
+
+  if (has(expr, S.Expr.optionalSome) || has(expr, S.Expr.optionalNone)) {
+    return refuse(
+      ctx,
+      'expr',
+      'Optional constructor (only Optional CASE ANALYSIS on contract/argument fields is modelled)'
+    );
+  }
+
+  return refuse(ctx, 'expr', 'expression form outside the translated fragment');
 }
 
 /**
@@ -723,20 +909,40 @@ function translateApp(app, ctx) {
     // Not a builtin. Beta reduce: the compiler hoists choice bodies into
     // top-level workers and applies them to `this` / `self` / `arg`, so
     // without this step every projection inside the body is unreachable.
+    //
+    // If that leaves an untranslatable term AND the only thing in the way was
+    // a Daml Text chain, the application is abstracted as ONE uninterpreted
+    // symbol (textOpaqueUf) instead of being refused.
+    //
+    // The abstraction is attempted at the INNERMOST identifiable function,
+    // not the outermost, and that is deliberate. `isNonBlankText value` is
+    // `isNotEmpty (trim value)`: abstracting `trim` alone leaves the
+    // comparison `isNotEmpty` compiles to - an equality against "" - intact
+    // and visible to the solver, whereas one opaque predicate over the whole
+    // chain would throw that structure away. Abstracting the smallest opaque
+    // piece keeps the most interpreted structure, which is the more precise
+    // choice as well as the cheaper one.
+    const mark = ctx.refusals.length;
+    let out;
     const reduced = betaReduce(fun, rawArgs, ctx);
     if (reduced) {
       if (reduced.term) {
+        out = reduced.term;
         reduced.restore();
-        return reduced.term;
+      } else {
+        try {
+          out = translateExpr(reduced.body, ctx);
+        } finally {
+          reduced.restore();
+        }
       }
-      const { body, restore: undo } = reduced;
-      try {
-        return translateExpr(body, ctx);
-      } finally {
-        undo();
-      }
+    } else {
+      out = refuse(ctx, 'inline', 'application of a function the translation cannot inline', {
+        cascade: headIsOpaque(fun, ctx),
+      });
     }
-    return T.unsupported('application of a function the translation cannot inline', ctx.label);
+    if (!hasUnsupported(out)) return out;
+    return textOpaqueUf(fun, rawArgs, ctx, ctx.refusals.slice(mark), out) || out;
   }
 
   return translateBuiltinApp(
@@ -746,12 +952,172 @@ function translateApp(app, ctx) {
   );
 }
 
+/**
+ * Refusal kinds that DISQUALIFY an application from being abstracted as an
+ * uninterpreted function, because each names an obstacle that is not a text
+ * chain and would be silently papered over by a UF:
+ *
+ *   fold        a quantifier over a user list - abstracting it would hide
+ *               the list, not a text operation
+ *   apply       a function the term-applier could not reduce: unidentified
+ *   dictionary  a typeclass dictionary that did not resolve, so WHICH
+ *               function is being called is unknown (see ufName)
+ *   interface   an interface method with no implementation in scope
+ *   depth       the translator gave up, which says nothing about the shape
+ *   projection  a projection off a record the translation lost track of
+ *
+ * The kinds NOT listed here - case, inline, expr, list, literal, unbound -
+ * are the shapes a text chain actually produces once EXPLODE_TEXT has turned
+ * the text into a list nothing downstream can name.
+ */
+const UF_BLOCKING_REFUSAL = new Set([
+  'fold',
+  'apply',
+  'dictionary',
+  'interface',
+  'depth',
+  'projection',
+]);
+
+/** Does a term contain an un-eliminated `abort`? */
+function containsAbort(t) {
+  if (!t || typeof t !== 'object') return false;
+  if (t.k === 'abort') return true;
+  if (t.k === 'app' || t.k === 'uf') return t.args.some(containsAbort);
+  if (t.k === 'ite') return [t.c, t.a, t.b].some(containsAbort);
+  if (t.k === 'fold') return t.unrolled.some(containsAbort);
+  return false;
+}
+
+/** Is the head of this application a variable already known to be opaque? */
+function headIsOpaque(fun, ctx) {
+  if (!fun || !has(fun, S.Expr.varInternedStr)) return false;
+  const bound = ctx.env.get(ctx.pkg.str(int(fun, S.Expr.varInternedStr)));
+  return !!(bound && bound.k === 'unsupported');
+}
+
+/**
+ * Abstract a failed application as ONE uninterpreted symbol, when - and only
+ * when - the reason it failed is a Daml Text chain.
+ *
+ * This is the top-down half of the UF story. `isNonBlankText value` is
+ * `isNotEmpty (trim value)`, and `trim` bottoms out in EXPLODE_TEXT /
+ * IMPLODE_TEXT, whose list-shaped signatures the emitter has no sort for. The
+ * bottom-up route therefore cannot recover the chain; abstracting the named
+ * predicate as a single symbol over its (translatable) arguments can.
+ *
+ * FOUR CONDITIONS, all of which are about being able to justify the symbol
+ * rather than about making the numbers look better:
+ *
+ *   1. Every refusal raised underneath is either a TEXT builtin or a CASCADE
+ *      of one. A fold, a ledger effect, an unresolved dictionary or a
+ *      non-text builtin means the obstacle has NOT been identified as text,
+ *      and an unidentified obstacle is not a modelling choice - it stays
+ *      `unsupported`, exactly as before.
+ *   2. At least one text builtin was actually refused, so the abstraction has
+ *      a stated cause and is not a blanket fallback.
+ *   3. The head resolves to a COMPILED VALUE with a qualified name, which is
+ *      what gives the symbol an identity (see ufName). A function reached
+ *      through an unresolved variable or dictionary has no such identity, and
+ *      giving two different functions one symbol would be an assumption, not
+ *      a relaxation.
+ *   4. Every value argument translates cleanly to a scalar. A dirty argument
+ *      is NOT dropped: an argument that is a typeclass dictionary selects
+ *      WHICH function this is, and dropping it would merge distinct functions
+ *      under one symbol; a record or list argument has no sort to declare the
+ *      parameter against.
+ *
+ * An argument that is itself an opaque text expression
+ * (`validateAssetTokenId (scopedTokenIdPrefix id)`) has already become its own
+ * symbol by the time it is translated here, so it counts as clean.
+ *
+ * @returns {Object|null} a `uf` term, or null to leave the refusal standing
+ */
+function textOpaqueUf(fun, rawArgs, ctx, trace, translated) {
+  // An expression that ABORTS is not opaque - it is understood exactly, and
+  // `guardConjuncts` turns `if c then True else error "..."` into the
+  // assumption `c`. Replacing the abort by an uninterpreted value would throw
+  // that away and, worse, would treat an aborting branch as a reachable
+  // post-state. Error paths format their messages with text builtins, so
+  // without this check `GHC.Err:error` itself came out as a UF.
+  if (containsAbort(translated)) return null;
+
+  const textBuiltins = new Set();
+  const otherKinds = new Set();
+  for (const r of trace) {
+    if (r.kind === 'builtin') {
+      // a builtin refusal is either a text one (the stated cause) or a
+      // disqualifying one; there is no third case
+      if (r.builtin !== null && TEXT_OPAQUE_BUILTIN.has(r.builtin)) {
+        textBuiltins.add(builtinName(r.builtin));
+        continue;
+      }
+      return null;
+    }
+    if (UF_BLOCKING_REFUSAL.has(r.kind)) return null; // condition 1
+    otherKinds.add(r.kind);
+  }
+  if (textBuiltins.size === 0) return null; // condition 2
+
+  const vr = fun ? ctx.pkg.resolveValue(fun) : null;
+  if (!vr || !vr.name) return null; // condition 3
+
+  // condition 4: every value argument, translated on its own
+  const argTerms = [];
+  for (const raw of rawArgs) {
+    const tagged = raw instanceof Uint8Array ? { bytes: raw, pkg: ctx.pkg } : raw;
+    const expr = decodeExpr(tagged.bytes);
+    if (!expr) return null;
+    const term = withPkg(ctx, tagged.pkg, () => translateExpr(expr, ctx));
+    if (!term || hasUnsupported(term) || term.k === 'record') return null; // condition 4
+    argTerms.push(term);
+  }
+  if (argTerms.length === 0) return null;
+
+  const name = ufName(vr.name, vr.pkg);
+  // The inventory is complete on purpose: the stated cause (which text
+  // builtins) AND what else was refused underneath, so a reader can judge the
+  // abstraction rather than take it on trust.
+  const why =
+    `\`${vr.name}\` is modelled as an uninterpreted function of ${argTerms.length} ` +
+    `argument(s): its compiled body bottoms out in ${[...textBuiltins].sort().join(', ')}, ` +
+    `which the translated fragment cannot express` +
+    (otherKinds.size
+      ? `; the rest of its body refused only as ${[...otherKinds].sort().join(', ')}, the ` +
+        `shapes a text chain makes (list construction and matching over the exploded text)`
+      : '');
+  ctx.uninterpreted.push({ name, why });
+  // Result sort left to the emitter: the position the application is used in
+  // decides it, and a symbol used at two different sorts is a conflict there.
+  return T.uf(name, argTerms, null, null);
+}
+
 function translateCase(cse, ctx) {
-  const scrut = translateExpr(deref(sub(cse, 1), ctx), ctx);
+  const scrutExpr = deref(sub(cse, 1), ctx);
   const alts = subs(cse, 2);
   if (alts.length !== 2) {
-    return T.unsupported(`case with ${alts.length} alternatives`, ctx.label);
+    return refuse(ctx, 'case', `case with ${alts.length} alternatives`);
   }
+
+  const noneAlt = alts.find((a) => has(a, S.CaseAlt.optionalNone));
+  const someAlt = alts.find((a) => has(a, S.CaseAlt.optionalSome));
+  // A `_ ->` catch-all standing in for whichever Optional shape is not spelled
+  // out. The compiled Eq instance for Optional writes exactly this shape
+  // (`case x of None -> ...; _ -> ...`), so refusing a case that names only
+  // ONE of the two constructors made every `field /= None` guard untranslatable.
+  const defaultAlt = alts.find((a) => has(a, S.CaseAlt.default));
+
+  // A case whose scrutinee is a LITERAL Optional constructor is decided
+  // statically, exactly: `case None of None -> a; _ -> b` IS `a`. This is not
+  // an abstraction, it is evaluation, and it is what the compiled
+  // `x /= None` reduces to once the Eq dictionary has been resolved - the
+  // instance body compares `x` against the constant `None`.
+  if (noneAlt || someAlt) {
+    const decided = decideOptionalConstructor(scrutExpr, { noneAlt, someAlt, defaultAlt }, ctx);
+    if (decided) return decided;
+  }
+
+  const scrut = translateExpr(scrutExpr, ctx);
 
   // Optional None/Some over a contract or argument field: modelled as a pair
   // of symbols, `<path>.$some : Bool` and `<path>.$value`. Exact: the value
@@ -759,31 +1125,37 @@ function translateCase(cse, ctx) {
   // value when `$some` is false never matters. Only fields (registered
   // symbols) are modelled this way; an Optional produced by computation is
   // outside the fragment and refused below.
-  const noneAlt = alts.find((a) => has(a, S.CaseAlt.optionalNone));
-  const someAlt = alts.find((a) => has(a, S.CaseAlt.optionalSome));
-  if (noneAlt && someAlt) {
+  //
+  // Either constructor may be replaced by the `_ ->` catch-all: a default
+  // branch binds nothing, so the Some side simply cannot name the payload,
+  // which costs nothing for a guard that only asks whether the field is set.
+  if ((noneAlt || someAlt) && (noneAlt || defaultAlt) && (someAlt || defaultAlt)) {
     if (!(scrut.k === 'var' && ctx.params.has(scrut.name))) {
       if (scrut.k === 'unsupported') return scrut;
-      return T.unsupported(
-        'Optional case over a value that is not a contract/argument field',
-        ctx.label
-      );
+      return refuse(ctx, 'case', 'Optional case over a value that is not a contract/argument field');
     }
     const p = ctx.params.get(scrut.name);
     const present = symbol(ctx, p.root, `${p.path}.$some`, 'Bool');
     const value = symbol(ctx, p.root, `${p.path}.$value`, 'Real');
-    const someMsg = sub(someAlt, S.CaseAlt.optionalSome);
-    const binder = ctx.pkg.str(int(someMsg, S.OptionalSomeAlt.varBodyInternedStr));
-    const prev = ctx.env.has(binder) ? ctx.env.get(binder) : undefined;
-    ctx.env.set(binder, value);
     let someBody;
-    try {
-      someBody = translateExpr(deref(sub(someAlt, S.CaseAlt.body), ctx), ctx);
-    } finally {
-      if (prev === undefined) ctx.env.delete(binder);
-      else ctx.env.set(binder, prev);
+    if (someAlt) {
+      const someMsg = sub(someAlt, S.CaseAlt.optionalSome);
+      const binder = ctx.pkg.str(int(someMsg, S.OptionalSomeAlt.varBodyInternedStr));
+      const prev = ctx.env.has(binder) ? ctx.env.get(binder) : undefined;
+      ctx.env.set(binder, value);
+      try {
+        someBody = translateExpr(deref(sub(someAlt, S.CaseAlt.body), ctx), ctx);
+      } finally {
+        if (prev === undefined) ctx.env.delete(binder);
+        else ctx.env.set(binder, prev);
+      }
+    } else {
+      someBody = translateExpr(deref(sub(defaultAlt, S.CaseAlt.body), ctx), ctx);
     }
-    const noneBody = translateExpr(deref(sub(noneAlt, S.CaseAlt.body), ctx), ctx);
+    const noneBody = translateExpr(
+      deref(sub(noneAlt || defaultAlt, S.CaseAlt.body), ctx),
+      ctx
+    );
     return T.ite(present, someBody, noneBody);
   }
 
@@ -801,10 +1173,242 @@ function translateCase(cse, ctx) {
     }
   }
   if (!whenTrue || !whenFalse) {
-    return T.unsupported('case on something other than a two-way Bool', ctx.label);
+    // A case whose SCRUTINEE is already opaque tells us nothing new: whatever
+    // made the scrutinee opaque is the real obstacle, so the refusal cascades.
+    return refuse(ctx, 'case', 'case on something other than a two-way Bool', {
+      cascade: scrut.k === 'unsupported',
+    });
   }
 
   return T.ite(scrut, translateExpr(whenTrue, ctx), translateExpr(whenFalse, ctx));
+}
+
+/**
+ * Decide a `case` whose SCRUTINEE is a literal Optional constructor.
+ *
+ * `case None of None -> a; _ -> b` is `a`; `case (Some e) of Some x -> f x;
+ * _ -> b` is `f e`. Both are plain evaluation, not abstraction: the compiler
+ * emits exactly these when an Eq instance for Optional is applied to the
+ * constant `None`, which is how `contractData.businessDate /= None` reaches
+ * the translator. Returns null when the scrutinee is not a constructor, or
+ * when the matching alternative is absent (which would be an ill-typed case).
+ */
+function decideOptionalConstructor(scrutExpr, { noneAlt, someAlt, defaultAlt }, ctx) {
+  const con = optionalConstructorOf(scrutExpr, ctx);
+  if (!con) return null;
+  if (!con.some) {
+    const alt = noneAlt || defaultAlt;
+    if (!alt) return null;
+    return translateExpr(deref(sub(alt, S.CaseAlt.body), ctx), ctx);
+  }
+  if (!someAlt) {
+    if (!defaultAlt) return null;
+    return translateExpr(deref(sub(defaultAlt, S.CaseAlt.body), ctx), ctx);
+  }
+  // The payload expression belongs to the package the constructor was found
+  // in, which is not necessarily the package the case lives in.
+  const payload = withPkg(ctx, con.pkg, () => translateExpr(deref(con.value, ctx), ctx));
+  const someMsg = sub(someAlt, S.CaseAlt.optionalSome);
+  const binder = ctx.pkg.str(int(someMsg, S.OptionalSomeAlt.varBodyInternedStr));
+  const prev = ctx.env.has(binder) ? ctx.env.get(binder) : undefined;
+  ctx.env.set(binder, payload);
+  try {
+    return translateExpr(deref(sub(someAlt, S.CaseAlt.body), ctx), ctx);
+  } finally {
+    if (prev === undefined) ctx.env.delete(binder);
+    else ctx.env.set(binder, prev);
+  }
+}
+
+/**
+ * Is this expression a literal Optional CONSTRUCTOR, once aliases are chased?
+ *
+ * The compiled Eq instance for Optional compares its two arguments by nested
+ * case analysis, and the argument carrying the constant `None` arrives as a
+ * lambda PARAMETER - so the constructor is only visible through the raw
+ * expression the parameter was bound to. Do-block binders are excluded: they
+ * hold the result of an action, not the action's expression.
+ *
+ * @returns {{some: false} | {some: true, value: Object, pkg: Object} | null}
+ */
+function optionalConstructorOf(expr, ctx, depth = 0) {
+  if (!expr || depth > 16) return null;
+  const e = deref(expr, ctx);
+  if (!e) return null;
+  if (has(e, S.Expr.optionalNone)) return { some: false };
+  const someMsg = sub(e, S.Expr.optionalSome);
+  if (someMsg) {
+    return { some: true, value: sub(someMsg, S.OptionalSomeExpr.value), pkg: ctx.pkg };
+  }
+  const ta = sub(e, S.Expr.tyApp);
+  if (ta) return optionalConstructorOf(sub(ta, 1), ctx, depth + 1);
+  const tb = sub(e, S.Expr.tyAbs);
+  if (tb) return optionalConstructorOf(sub(tb, 2), ctx, depth + 1);
+  if (has(e, S.Expr.varInternedStr)) {
+    const name = ctx.pkg.str(int(e, S.Expr.varInternedStr));
+    const entry = ctx.rawEnv.get(name);
+    if (!entry || !entry.expr || entry.kind === 'do') return null;
+    ctx.rawEnv.delete(name); // no self-reference loops
+    try {
+      return withPkg(ctx, entry.pkg, () => optionalConstructorOf(entry.expr, ctx, depth + 1));
+    } finally {
+      ctx.rawEnv.set(name, entry);
+    }
+  }
+  const vr = ctx.pkg.resolveValue(e);
+  if (vr) {
+    ctx.optChasing = ctx.optChasing || new Set();
+    if (ctx.optChasing.has(vr.key)) return null;
+    ctx.optChasing.add(vr.key);
+    try {
+      return withPkg(ctx, vr.pkg, () => optionalConstructorOf(vr.body, ctx, depth + 1));
+    } finally {
+      ctx.optChasing.delete(vr.key);
+    }
+  }
+  return null;
+}
+
+/**
+ * Reduce a STRUCT expression to the struct construction it denotes and select
+ * one field, returning `{expr, pkg, restore}` (or null).
+ *
+ * WHY THIS EXISTS. Daml compiles every typeclass method call to a projection
+ * off a dictionary struct: `x == y` is `(structProj m_== $dEq) x y`, and the
+ * dictionary arrives as a lambda parameter, a hoisted value, or a dictionary
+ * FUNCTION applied to sub-dictionaries (`$fEqOptional $dEqTime`). Left
+ * unresolved, every such call died as "application of a function the
+ * translation cannot inline", which is how `contractData.businessDate /= None`
+ * - an ordinary Optional comparison - left the fragment.
+ *
+ * Resolving the projection is EXACT, not an abstraction: the dictionary is a
+ * closed record of method implementations in the compiled package, and this
+ * picks out the very implementation the call site would have run. Anything it
+ * cannot reduce to a struct construction returns null, and the caller reports
+ * a refusal with the method name.
+ *
+ * Bindings introduced on the way (a dictionary function's parameters) stay in
+ * place until `restore()` runs, so the returned expression's free variables
+ * are still bound when the caller translates it - the same discipline
+ * betaReduce uses.
+ */
+function resolveStructField(structExpr, field, ctx, depth = 0) {
+  if (!structExpr || depth > 24) return null;
+  const e = deref(structExpr, ctx);
+  if (!e) return null;
+  const nothing = () => {};
+
+  const con = sub(e, S.Expr.structCon);
+  if (con) {
+    for (const f of subs(con, S.StructCon.fields)) {
+      if (ctx.pkg.str(int(f, S.FieldWithExpr.fieldInternedStr)) !== field) continue;
+      return { expr: sub(f, S.FieldWithExpr.expr), pkg: ctx.pkg, restore: nothing };
+    }
+    return null;
+  }
+
+  // a hoisted dictionary value, in its own package
+  const vr = ctx.pkg.resolveValue(e);
+  if (vr) {
+    ctx.structing = ctx.structing || new Set();
+    if (ctx.structing.has(vr.key)) return null; // recursive dictionary
+    ctx.structing.add(vr.key);
+    const prevPkg = ctx.pkg;
+    ctx.pkg = vr.pkg || prevPkg;
+    const inner = resolveStructField(vr.body, field, ctx, depth + 1);
+    ctx.pkg = prevPkg;
+    if (!inner) {
+      ctx.structing.delete(vr.key);
+      return null;
+    }
+    return {
+      ...inner,
+      restore: () => {
+        inner.restore();
+        ctx.structing.delete(vr.key);
+      },
+    };
+  }
+
+  const ta = sub(e, S.Expr.tyApp);
+  if (ta) return resolveStructField(sub(ta, 1), field, ctx, depth + 1);
+  const tb = sub(e, S.Expr.tyAbs);
+  if (tb) return resolveStructField(sub(tb, 2), field, ctx, depth + 1);
+
+  // the dictionary is a parameter: it was bound to the CALLER's expression
+  if (has(e, S.Expr.varInternedStr)) {
+    const name = ctx.pkg.str(int(e, S.Expr.varInternedStr));
+    const entry = ctx.rawEnv.get(name);
+    if (!entry || !entry.expr) return null;
+    ctx.rawEnv.delete(name); // no self-reference loops
+    const prevPkg = ctx.pkg;
+    ctx.pkg = entry.pkg || prevPkg;
+    const inner = resolveStructField(entry.expr, field, ctx, depth + 1);
+    ctx.pkg = prevPkg;
+    if (!inner) {
+      ctx.rawEnv.set(name, entry);
+      return null;
+    }
+    return {
+      ...inner,
+      restore: () => {
+        inner.restore();
+        ctx.rawEnv.set(name, entry);
+      },
+    };
+  }
+
+  // a dictionary FUNCTION applied to sub-dictionaries: reduce it, then look
+  // for the field in what it returns
+  const app = sub(e, S.Expr.app);
+  if (app) {
+    const rawArgs = many(app, 2)
+      .filter((v) => v instanceof Uint8Array)
+      .map((b) => ({ bytes: b, pkg: ctx.pkg }));
+    const reduced = betaReduce(deref(sub(app, 1), ctx), rawArgs, ctx, depth + 1);
+    if (!reduced || !reduced.body) {
+      if (reduced) reduced.restore();
+      return null;
+    }
+    const inner = resolveStructField(reduced.body, field, ctx, depth + 1);
+    if (!inner) {
+      reduced.restore();
+      return null;
+    }
+    return {
+      ...inner,
+      restore: () => {
+        inner.restore();
+        reduced.restore();
+      },
+    };
+  }
+
+  const block = sub(e, S.Expr.let);
+  if (block) {
+    const saved = bindBlock(block, ctx);
+    const inner = resolveStructField(sub(block, S.Block.body), field, ctx, depth + 1);
+    if (!inner) {
+      restore(saved, ctx);
+      return null;
+    }
+    return {
+      ...inner,
+      restore: () => {
+        inner.restore();
+        restore(saved, ctx);
+      },
+    };
+  }
+
+  return null;
+}
+
+/** The method name a struct projection selects, for reporting. */
+function structFieldName(spMsg, ctx) {
+  return has(spMsg, S.StructProj.fieldInternedStr)
+    ? ctx.pkg.str(int(spMsg, S.StructProj.fieldInternedStr))
+    : null;
 }
 
 /**
@@ -926,6 +1530,58 @@ function betaReduce(fun, rawArgs, ctx, depth = 0) {
     };
   }
 
+  // A VARIABLE at the head of the spine, bound to a function by a `let` or by
+  // an enclosing application. The term environment holds that function's
+  // VALUE, which for a function is meaningless, so reduction has to go through
+  // the expression it was bound to. Do-block binders are excluded: they hold
+  // the result of an action, not an inlinable function.
+  if (has(fun, S.Expr.varInternedStr)) {
+    const vname = ctx.pkg.str(int(fun, S.Expr.varInternedStr));
+    const entry = ctx.rawEnv.get(vname);
+    if (!entry || !entry.expr || entry.kind === 'do') return null;
+    ctx.rawEnv.delete(vname); // no self-reference loops
+    const prevPkg = ctx.pkg;
+    ctx.pkg = entry.pkg || prevPkg;
+    const inner = betaReduce(deref(entry.expr, ctx), args, ctx, depth + 1);
+    ctx.pkg = prevPkg;
+    if (!inner) {
+      ctx.rawEnv.set(vname, entry);
+      return null;
+    }
+    return {
+      ...inner,
+      restore: () => {
+        inner.restore();
+        ctx.rawEnv.set(vname, entry);
+      },
+    };
+  }
+
+  // a typeclass method at the head of the spine: resolve the dictionary, then
+  // reduce the instance's implementation against the arguments
+  const spHead = sub(fun, S.Expr.structProj);
+  if (spHead) {
+    const field = structFieldName(spHead, ctx);
+    const found = field ? resolveStructField(sub(spHead, S.StructProj.struct), field, ctx) : null;
+    if (!found) return null;
+    const prevPkg = ctx.pkg;
+    ctx.pkg = found.pkg || prevPkg;
+    const inner = betaReduce(deref(found.expr, ctx), args, ctx, depth + 1);
+    if (!inner) {
+      ctx.pkg = prevPkg;
+      found.restore();
+      return null;
+    }
+    return {
+      ...inner,
+      restore: () => {
+        inner.restore();
+        ctx.pkg = prevPkg;
+        found.restore();
+      },
+    };
+  }
+
   // a builtin at the bottom of the spine: reduce to a term
   if (has(fun, S.Expr.builtin)) {
     const term = translateBuiltinApp(int(fun, S.Expr.builtin), args, ctx);
@@ -1033,7 +1689,7 @@ function translateBuiltinApp(builtin, args, ctx) {
   if (EXACT_CONVERSION.has(builtin)) {
     const converted = args.length ? translateArg(args[args.length - 1]) : null;
     if (!converted) {
-      return T.unsupported(`${builtinName(builtin)} applied to no value`, ctx.label);
+      return refuse(ctx, 'builtin', `${builtinName(builtin)} applied to no value`, { builtin });
     }
     return converted;
   }
@@ -1044,22 +1700,48 @@ function translateBuiltinApp(builtin, args, ctx) {
   // lets an archive loop be matched against the element it archives.
   if (IDENTITY_BUILTIN.has(builtin)) {
     if (!args.length) {
-      return T.unsupported(`${builtinName(builtin)} applied to no value`, ctx.label);
+      return refuse(ctx, 'builtin', `${builtinName(builtin)} applied to no value`, { builtin });
     }
     return translateArg(args[args.length - 1]);
   }
 
+  // A text builtin with a scalar signature becomes an UNINTERPRETED
+  // application rather than a refusal, provided every value argument is
+  // itself translatable. A dirty argument is not dropped: dropping it would
+  // merge applications at different arguments under one symbol, which asserts
+  // an equality nobody established.
+  const uf = TEXT_UF_BUILTIN.get(builtin);
+  if (uf) {
+    const vals = args.slice(-uf.arity).map(translateArg);
+    if (vals.length === uf.arity && !vals.some(hasUnsupported)) {
+      const name = `builtin:${builtinName(builtin)}`;
+      ctx.uninterpreted.push({
+        name,
+        why: `${builtinName(builtin)} has no counterpart in the translated fragment`,
+      });
+      return T.uf(name, vals, uf.sort, uf.argSorts);
+    }
+    return refuse(
+      ctx,
+      'builtin',
+      `builtin ${builtinName(builtin)} applied to an argument outside the fragment, so it ` +
+        `cannot be modelled as an uninterpreted function of that argument`,
+      { builtin, cascade: true }
+    );
+  }
+
   const op = BINOP.get(builtin);
-  if (!op) return T.unsupported(`builtin ${builtinName(builtin)} is outside the fragment`, ctx.label);
+  if (!op) {
+    return refuse(ctx, 'builtin', textlessBuiltinReason(builtin), { builtin });
+  }
 
   const terms = args.map(translateArg);
   // Numeric builtins carry dictionary/scale arguments ahead of the two values.
   const valueArgs = terms.slice(-2);
   if (valueArgs.length !== 2) {
-    return T.unsupported(
-      `builtin ${builtinName(builtin)} applied to ${terms.length} arguments`,
-      ctx.label
-    );
+    return refuse(ctx, 'builtin', `builtin ${builtinName(builtin)} applied to ${terms.length} arguments`, {
+      builtin,
+    });
   }
   const term = T.app(op, valueArgs);
   if (DIVISION.has(builtin)) {
@@ -1274,18 +1956,18 @@ function listNameOfExpr(expr, ctx, depth = 0) {
  * traversal's parameter binding.
  */
 function applyToTerms(fn, terms, ctx, depth = 0, onBody = null) {
-  if (!fn) return T.unsupported('function applied to terms is missing', ctx.label);
+  if (!fn) return refuse(ctx, 'apply', 'function applied to terms is missing');
   if (depth > 32) {
-    return T.unsupported('function nested deeper than the term-applier follows', ctx.label);
+    return refuse(ctx, 'apply', 'function nested deeper than the term-applier follows');
   }
   const e = deref(fn, ctx);
-  if (!e) return T.unsupported('function applied to terms is missing', ctx.label);
+  if (!e) return refuse(ctx, 'apply', 'function applied to terms is missing');
 
   const vr = ctx.pkg.resolveValue(e);
   if (vr) {
     ctx.inlining = ctx.inlining || new Set();
     if (ctx.inlining.has(vr.key)) {
-      return T.unsupported(`recursive value ${vr.name} applied to terms`, ctx.label);
+      return refuse(ctx, 'apply', `recursive value ${vr.name} applied to terms`);
     }
     ctx.inlining.add(vr.key);
     try {
@@ -1323,14 +2005,16 @@ function applyToTerms(fn, terms, ctx, depth = 0, onBody = null) {
   const abs = sub(e, S.Expr.abs);
   if (!abs) {
     if (has(e, S.Expr.builtin)) {
-      return T.unsupported(
-        `builtin ${builtinName(int(e, S.Expr.builtin))} used where a lambda was expected`,
-        ctx.label
+      return refuse(
+        ctx,
+        'apply',
+        `builtin ${builtinName(int(e, S.Expr.builtin))} used where a lambda was expected`
       );
     }
-    return T.unsupported(
-      'function applied to terms is not a lambda the translation can reduce',
-      ctx.label
+    return refuse(
+      ctx,
+      'apply',
+      'function applied to terms is not a lambda the translation can reduce'
     );
   }
 
@@ -1394,10 +2078,12 @@ function applyToTerms(fn, terms, ctx, depth = 0, onBody = null) {
 function translateFold(builtin, args, ctx) {
   const op = builtin === BF.FOLDL ? 'foldl' : 'foldr';
   if (args.length < 3) {
-    return T.unsupported(
+    return refuse(
+      ctx,
+      'fold',
       `${builtinName(builtin)} applied to ${args.length} argument(s); only a fully applied ` +
         `fold is unrolled`,
-      ctx.label
+      { builtin }
     );
   }
   const [fnArg, initArg, listArg] = args.slice(-3);
@@ -1405,25 +2091,31 @@ function translateFold(builtin, args, ctx) {
     listNameOfExpr(decodeExpr(listArg.bytes), ctx)
   );
   if (!listName) {
-    return T.unsupported(
+    return refuse(
+      ctx,
+      'fold',
       `${builtinName(builtin)} over a list with no canonical name: its elements cannot be ` +
         `identified with the contracts the choice archives, and inventing names for them ` +
         `would relate unrelated symbols`,
-      ctx.label
+      { builtin }
     );
   }
   if (ctx.foldDepth > 0) {
-    return T.unsupported(
+    return refuse(
+      ctx,
+      'fold',
       `${builtinName(builtin)} over \`${listName}\` inside another fold's step; the unroller ` +
         `does not nest`,
-      ctx.label
+      { builtin }
     );
   }
   if (ctx.foldBudget <= 0) {
-    return T.unsupported(
+    return refuse(
+      ctx,
+      'fold',
       `fold unrolling budget exhausted on this choice before ${builtinName(builtin)} over ` +
         `\`${listName}\``,
-      ctx.label
+      { builtin }
     );
   }
   ctx.foldBudget -= 1;
@@ -1469,6 +2161,27 @@ function translateFold(builtin, args, ctx) {
   return T.fold(listName, op, unrolled);
 }
 
+/**
+ * Why a builtin outside BINOP is not modelled, said precisely.
+ *
+ * The text builtins get their own sentence because "outside the fragment" is
+ * not the whole story for them: they are outside it because one side of their
+ * signature is a list, a map or an Optional, and the emitter's sort set
+ * (Bool/Real/Int/String) has nothing to declare such a symbol against. That
+ * distinction is what tells a reader whether a better translation is possible
+ * and what it would take.
+ */
+function textlessBuiltinReason(builtin) {
+  if (TEXT_OPAQUE_BUILTIN.has(builtin)) {
+    return (
+      `builtin ${builtinName(builtin)} has a list, map or Optional on one side of its ` +
+      `signature, so there is no sort to declare an uninterpreted symbol against; only a ` +
+      `NAMED enclosing function over scalars can be abstracted instead`
+    );
+  }
+  return `builtin ${builtinName(builtin)} is outside the fragment`;
+}
+
 function builtinName(n) {
   for (const [k, v] of Object.entries(BF)) if (v === n) return k;
   return `builtin#${n}`;
@@ -1490,6 +2203,10 @@ export { BF, BINOP, ROUNDING, EXACT_CONVERSION, DIVISION, makeCtx, symbol };
  * @property {Array<{template: string, fields: Record<string, Term>, path: Term[]}>} creates
  * @property {Array<{denominator: Term, path: Term[]}>} divisions
  * @property {string[]} rounding    rounding/truncating builtins seen on the path
+ * @property {Array<{name: string, why: string}>} uninterpreted  symbols the
+ *   translation abstracted as uninterpreted functions, with the stated reason.
+ *   A verdict drawn from a query mentioning one of these is sound for PROVED
+ *   and only SUGGESTIVE for DISPROVED; see smt.js.
  * @property {Array<{listName: string, effect: string}>} archivedInputs
  *   contracts the choice consumes BESIDES `this`, identified as "every element
  *   of listName". Their amounts are the same `<listName>$<i>.amount` symbols a
@@ -1552,6 +2269,10 @@ export function extractTransitions(raw, options = {}) {
         const ctx = makeCtx(raw.ctx, { selfParam, argParam, label: `${template}.${choice}`, bound });
         // carry the precondition's discovered symbols into this choice
         for (const [k, v] of precondCtx.params) ctx.params.set(k, v);
+        // ...and the abstractions it made: the ensure guards travel onto every
+        // choice, so the reasons behind their uninterpreted symbols have to
+        // travel with them or a verdict would name a symbol it cannot explain.
+        ctx.uninterpreted.push(...precondCtx.uninterpreted);
 
         const creates = [];
         const unsupported = [];
@@ -1579,6 +2300,7 @@ export function extractTransitions(raw, options = {}) {
             ...(d.fold ? { fold: d.fold, index: d.index } : {}),
           })),
           rounding: [...new Set(ctx.rounding)],
+          uninterpreted: dedupeUninterpreted(ctx.uninterpreted),
           symbolicElements: ctx.symbolicElements.slice(),
           consumesOthers: ctx.consumesOthers.slice(),
           archivedInputs: dedupeArchived(ctx.archivedInputs),
@@ -1721,6 +2443,7 @@ function interfaceInstanceTransitions({
       creates: [],
       divisions: [],
       rounding: [],
+      uninterpreted: [],
       archivedInputs: [],
       unmodelledLoopEffects: [],
       listElements: [],
@@ -1762,6 +2485,7 @@ function interfaceInstanceTransitions({
       ctx.env.set(selfBinder, T.unsupported('the exercised contract id `self`', label));
     }
     for (const [k, v] of precondCtx.params) ctx.params.set(k, v);
+    ctx.uninterpreted.push(...precondCtx.uninterpreted);
 
     const creates = [];
     const unsupported = [];
@@ -1788,6 +2512,7 @@ function interfaceInstanceTransitions({
         ...(d.fold ? { fold: d.fold, index: d.index } : {}),
       })),
       rounding: [...new Set(ctx.rounding)],
+      uninterpreted: dedupeUninterpreted(ctx.uninterpreted),
       symbolicElements: ctx.symbolicElements.slice(),
       consumesOthers: ctx.consumesOthers.slice(),
       archivedInputs: dedupeArchived(ctx.archivedInputs),
@@ -1807,6 +2532,16 @@ function interfaceInstanceTransitions({
 function dedupeArchived(entries) {
   const seen = new Map();
   for (const e of entries || []) seen.set(`${e.listName}\u0000${e.effect}`, e);
+  return [...seen.values()];
+}
+
+/**
+ * One entry per uninterpreted symbol, keyed by name: the same abstraction
+ * reached twice is one modelling decision, not two.
+ */
+function dedupeUninterpreted(entries) {
+  const seen = new Map();
+  for (const e of entries || []) if (!seen.has(e.name)) seen.set(e.name, e);
   return [...seen.values()];
 }
 
