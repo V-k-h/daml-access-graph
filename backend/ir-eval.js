@@ -80,6 +80,19 @@ export function isUndef(v) {
   return typeof v === 'object' && v !== null && v.undef === 'div0';
 }
 
+/**
+ * A value of the uninterpreted `Party` sort: an opaque token naming which
+ * element of the model's Party carrier this constant denotes. Two party
+ * constants are equal exactly when their tokens are the same string, which is
+ * all an uninterpreted sort ever fixes.
+ */
+export const party = (token) => ({ party: String(token) });
+
+/** Is a value a party token? */
+export function isParty(v) {
+  return typeof v === 'object' && v !== null && typeof v.party === 'string';
+}
+
 /** Is a value a rational {p, q}? */
 export function isRat(v) {
   return (
@@ -256,10 +269,24 @@ export function evalTerm(term, env, interp = undefined) {
       const v = env instanceof Map ? env.get(term.name) : env[term.name];
       if (v === undefined) throw new Error(`ir-eval: unbound variable ${term.name}`);
       if (typeof v === 'boolean' || typeof v === 'string') return v;
+      if (isParty(v)) return v;
       if (isRat(v)) return ratNorm(v.p, v.q);
       throw new Error(
         `ir-eval: env value for ${term.name} is neither boolean, string nor {p,q}`
       );
+    }
+    case 'party': {
+      // A constant of the UNINTERPRETED `Party` sort. It has no structure and
+      // no operations: the only thing a model fixes about it is which other
+      // party constants it is equal to, so the caller's environment supplies
+      // exactly that - an equivalence-class token - and nothing else.
+      // Deliberately NOT a String: an SMT String and an uninterpreted sort are
+      // different sorts, and letting a party compare equal to a Text literal
+      // would let the evaluator agree with the emitter for the wrong reason.
+      const v = env instanceof Map ? env.get(term.name) : env[term.name];
+      if (v === undefined) throw new Error(`ir-eval: unbound party constant ${term.name}`);
+      if (!isParty(v)) throw new Error(`ir-eval: env value for ${term.name} is not a party token`);
+      return v;
     }
     case 'ite': {
       // lazy on the branches: sound because SMT ite ignores the untaken
@@ -378,6 +405,14 @@ function evalApp(term, env, interp) {
       }
       if (typeof args[0] === 'string') {
         return chain(args, (a, b) => asStr(a, '=') === asStr(b, '='));
+      }
+      if (isParty(args[0])) {
+        // Equality on an uninterpreted sort is identity of the model's
+        // element, which the class token names.
+        return chain(args, (a, b) => {
+          if (!isParty(a) || !isParty(b)) throw new Error('ir-eval: = mixes a party with another sort');
+          return a.party === b.party;
+        });
       }
       return chain(args, (a, b) => ratEq(asRat(a, '='), asRat(b, '=')));
     }

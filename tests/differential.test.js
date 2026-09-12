@@ -67,6 +67,7 @@ import {
   eucDiv,
   eucMod,
   evalTerm,
+  party,
 } from '../backend/ir-eval.js';
 
 // ------------------------------------------------------------ solver gating
@@ -824,5 +825,96 @@ test(
       0,
       `${failures.length} live-DAR case(s) where the evaluator and the emitter disagree:\n\n${failures.join('\n\n')}`
     );
+  }
+);
+
+// ============================================ differential: the Party sort
+//
+// The authorisation property (smt.js: createAuthority) introduces a sort the
+// emitter had no previous reason to speak: an UNINTERPRETED `Party`, whose
+// only operation is equality. Nothing in the arithmetic differential harness
+// above reaches it - there is no value to bind a party to - so it gets its own
+// cross-check, and it is worth having precisely because a false PROVED here
+// would be a security-relevant lie rather than a wrong number.
+//
+// The model of an uninterpreted sort is fixed by saying which constants are
+// equal. A case therefore draws a random PARTITION of the party constants;
+// the query asserts that partition (equalities inside a class, disequalities
+// across classes) and the evaluator is given the same partition as class
+// tokens. If the emitted goal and the evaluated goal ever disagree, the goal
+// construction, the sort emission or the evaluator's equality is wrong.
+
+/** A random partition of `names` into at most `k` classes. */
+function randomPartition(rnd, names, k) {
+  const classes = new Map();
+  for (const n of names) classes.set(n, `c${Math.floor(rnd() * k)}`);
+  return classes;
+}
+
+/** A create-authority goal over party constants, plus the parties it names. */
+function authorityCase(required, authority) {
+  const cover = (s) => ({
+    k: 'app',
+    op: 'or',
+    args: authority.map((a) => ({ k: 'app', op: '=', args: [T.party(s), T.party(a)] })),
+  });
+  const goals = required.map(cover);
+  const goal = goals.length === 1 ? goals[0] : { k: 'app', op: 'and', args: goals };
+  const names = [...new Set([...required, ...authority])].map((p) => T.party(p).name);
+  return { goal, names };
+}
+
+test(
+  'differential: an uninterpreted Party agrees with the evaluator on every partition',
+  { skip: !SOLVER && 'cvc5 not installed' },
+  (t) => {
+    const rnd = mulberry32(SEED ^ 0x9a27);
+    const shapes = [
+      { required: ['this.admin'], authority: ['this.admin'] },
+      { required: ['this.admin'], authority: ['this.owner'] },
+      { required: ['this.admin', 'arg.newOwner'], authority: ['this.admin', 'arg.actor'] },
+      { required: ['this.gov.approver'], authority: ['this.admin', 'this.gov.approver'] },
+      { required: ['a', 'b', 'c'], authority: ['b', 'd'] },
+    ];
+    let checked = 0;
+    const failures = [];
+    for (const shape of shapes) {
+      const { goal, names } = authorityCase(shape.required, shape.authority);
+      const { sorts } = inferSorts([{ term: goal, sort: 'Bool' }]);
+      for (const n of names) {
+        assert.equal(sorts.get(n), 'Party', `${n} must be Party-sorted, not defaulted to Real`);
+      }
+      for (let i = 0; i < 12; i++) {
+        const partition = randomPartition(rnd, names, 1 + Math.floor(rnd() * names.length));
+        const env = new Map();
+        for (const [n, c] of partition) env.set(n, party(c));
+        const expected = evalTerm(goal, env);
+        assert.equal(typeof expected, 'boolean');
+
+        const lines = ['(set-logic ALL)', '(declare-sort Party 0)'];
+        for (const n of names) lines.push(`(declare-const |${n}| Party)`);
+        // Pin the model: same class means equal, different classes distinct.
+        for (let a = 0; a < names.length; a++) {
+          for (let b = a + 1; b < names.length; b++) {
+            const same = partition.get(names[a]) === partition.get(names[b]);
+            const eq = `(= |${names[a]}| |${names[b]}|)`;
+            lines.push(`(assert ${same ? eq : `(not ${eq})`})`);
+          }
+        }
+        lines.push(`(assert (not (= ${termToSmt(goal, true)} ${expected})))`);
+        lines.push('(check-sat)');
+        const out = runSolver(lines.join('\n') + '\n');
+        checked++;
+        if (!/^unsat/m.test(out)) {
+          failures.push(
+            `partition ${JSON.stringify(Object.fromEntries(partition))} expected ${expected}\n` +
+              lines.join('\n') +
+              `\nsolver said:\n${out}`
+          );
+        }
+      }
+    }
+    t.diagnostic(`Party differential: ${checked} partition case(s)`);
+    assert.equal(failures.length, 0, failures.join('\n\n'));
   }
 );

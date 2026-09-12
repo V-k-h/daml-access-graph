@@ -78,10 +78,12 @@
 // was a Bool, since the position comes from the compiled code's own use of it.
 
 import {
+  T,
   hasUnsupported,
   unsupportedReasons,
   instantiateFolds,
   foldLists,
+  rewriteVars,
   DEFAULT_BOUND,
 } from './lfir.js';
 
@@ -129,6 +131,10 @@ export function termToSmt(t, realNumerals = false) {
     case 'bool':
       return t.v ? 'true' : 'false';
     case 'var':
+      return sym(t.name);
+    case 'party':
+      // An uninterpreted constant of the `Party` sort: a bare symbol, exactly
+      // like a nullary declare-fun.
       return sym(t.name);
     case 'app': {
       if (!OPS.has(t.op)) throw new Error(`smt: unknown operator ${t.op}`);
@@ -181,12 +187,18 @@ export function termToSmt(t, realNumerals = false) {
  *
  * A class that ends up pinned to nothing defaults to Real, as before.
  *
- * @param {Array<{term: Object, sort: string}>} terms
+ * @param {Array<{term: Object, sort: string}>} terms  `sort` may be a concrete
+ *   sort name or any other string, which is then just a class identifier: a
+ *   caller that wants a term's sort INFERRED rather than forced passes a fresh
+ *   identifier per term (see nonNegativeFields).
  * @returns {{sorts: Map<string,string>, conflicts: string[],
- *   ufs: Map<string, {args: string[], ret: string}>}}
+ *   ufs: Map<string, {args: string[], ret: string}>, pinned: Set<string>}}
  */
 export function inferSorts(terms) {
-  const CONCRETE = new Set(['Bool', 'Real', 'Int', 'String']);
+  // `Party` is an UNINTERPRETED sort: no literals, no arithmetic, nothing but
+  // equality. Nothing else in the emitter produces a Party-sorted position, so
+  // adding it here cannot move any position that used to resolve to Real.
+  const CONCRETE = new Set(['Bool', 'Real', 'Int', 'String', 'Party']);
   /** union-find parent pointers; a concrete sort name is its own root */
   const parent = new Map();
   const conflicts = [];
@@ -238,6 +250,17 @@ export function inferSorts(terms) {
           seenVar.add(t.name);
           varNames.push(t.name);
         }
+        union(id, `v:${t.name}`);
+        return;
+      case 'party':
+        // Declared like any other constant, but PINNED to Party rather than
+        // inferred: a party constant has no position that could type it, and
+        // defaulting it to Real would let the solver do arithmetic on it.
+        if (!seenVar.has(t.name)) {
+          seenVar.add(t.name);
+          varNames.push(t.name);
+        }
+        union(`v:${t.name}`, 'Party');
         union(id, `v:${t.name}`);
         return;
       case 'num':
@@ -308,7 +331,21 @@ export function inferSorts(terms) {
     return CONCRETE.has(r) ? r : 'Real';
   };
   const sorts = new Map();
-  for (const name of varNames) sorts.set(name, resolve(`v:${name}`));
+  /**
+   * The variables whose sort came from a POSITION rather than from the default.
+   *
+   * `resolve` answers Real for a class nothing pinned, which is the right
+   * default for the emitter but is NOT evidence: a party field, a contract id
+   * and a date all reach an unconstrained class and all come back Real. A
+   * property that needs to know whether a term really is numeric - asserting
+   * `>= 0` of a Text field would be a fabricated obligation, not a check -
+   * asks this set instead of reading `sorts`.
+   */
+  const pinned = new Set();
+  for (const name of varNames) {
+    sorts.set(name, resolve(`v:${name}`));
+    if (CONCRETE.has(node(`v:${name}`))) pinned.add(name);
+  }
   const ufs = new Map();
   for (const name of ufNames) {
     ufs.set(name, {
@@ -316,7 +353,7 @@ export function inferSorts(terms) {
       ret: resolve(`u:${name}`),
     });
   }
-  return { sorts, conflicts, ufs };
+  return { sorts, conflicts, ufs, pinned };
 }
 
 /**
@@ -336,6 +373,9 @@ export function buildQuery(guards, goal) {
   const lines = [];
   lines.push('(set-logic ALL)');
   lines.push('(set-option :produce-models true)');
+  // The uninterpreted sort, declared only when the query actually uses it, so
+  // every script this pipeline used to emit is byte-for-byte what it was.
+  if ([...sorts.values()].includes('Party')) lines.push('(declare-sort Party 0)');
   for (const [name, sort] of [...sorts.entries()].sort()) {
     lines.push(`(declare-const ${sym(name)} ${sort})`);
   }
@@ -690,6 +730,483 @@ export function divisionSafety(transition) {
   };
 }
 
+// --------------------------------------------------------- shape helpers
+
+const TRUE = { k: 'bool', v: true };
+
+/** Conjunction of a list of Bool terms, flattened to nothing when empty. */
+function allOf(terms) {
+  const real = terms.filter((t) => !(t && t.k === 'bool' && t.v === true));
+  if (real.length === 0) return TRUE;
+  return real.length === 1 ? real[0] : { k: 'app', op: 'and', args: real };
+}
+
+/** Disjunction of a list of Bool terms. */
+function anyOf(terms) {
+  if (terms.length === 0) return { k: 'bool', v: false };
+  return terms.length === 1 ? terms[0] : { k: 'app', op: 'or', args: terms };
+}
+
+/**
+ * `a => b`, written with the operators the emitter speaks (there is no `=>`
+ * in OPS). An antecedent that is statically true disappears.
+ *
+ * This is how a PER-CREATE obligation is stated. Asserting the branch
+ * conditions of every create as GUARDS instead would be unsound in the one
+ * direction that matters: two creates on opposite sides of an `if` would
+ * contribute `c` and `not c` to the same assumption set, the query would be
+ * trivially unsat, and every such transition would come back PROVED without
+ * anything having been checked.
+ */
+function implies(a, b) {
+  if (a && a.k === 'bool' && a.v === true) return b;
+  return { k: 'app', op: 'or', args: [{ k: 'app', op: 'not', args: [a] }, b] };
+}
+
+/**
+ * Rounding builtins whose SMT-LIB counterpart is not sign-compatible with
+ * Daml's, and therefore the only ones that make a SIGN property unsound.
+ *
+ * The argument, in full, because the refusal is narrower than the one
+ * amount-conservation makes and the difference has to be defensible:
+ *
+ *   * ROUND_NUMERIC, CAST_NUMERIC, SHIFT_NUMERIC and NUMERIC_TO_INT64 have no
+ *     term at all. None of them is in BINOP, EXACT_CONVERSION,
+ *     IDENTITY_BUILTIN or TEXT_UF_BUILTIN, so translateBuiltinApp refuses them
+ *     and the field that used one carries an `unsupported` node. Such a field
+ *     is SKIPPED by this property and counted in coverage - it is never proved
+ *     non-negative - so no composition of exact-Real arithmetic with a real
+ *     rounding step can reach a checked obligation. That, and not a claim
+ *     about rounding preserving signs, is what makes the narrower refusal
+ *     sound: `round x - x` would indeed break a naive sign argument, and it is
+ *     also exactly the shape that never survives translation.
+ *
+ *   * MOD_INT64 does have a term. SMT-LIB's `mod` is the Euclidean remainder,
+ *     which is ALWAYS non-negative; Daml's `mod` takes the sign of the
+ *     dividend, so `mod (-7) 2` is -1 where the model says 1. A model that
+ *     proves `>= 0` there would be proving something false about the code.
+ *
+ *   * DIV_INT64 has a term too. SMT-LIB's `div` is Euclidean and Daml's
+ *     truncates toward zero; they agree in sign on every input we could
+ *     construct, but the two definitions are genuinely different functions and
+ *     a sign proof resting on which of them the solver implements is not an
+ *     argument we are prepared to write down. It is refused with MOD_INT64.
+ *
+ * The refusal is on the TRANSITION, not the field, because these two also
+ * reach the GUARDS, where they are assumptions rather than obligations and a
+ * wrong one is unsound in the same direction.
+ */
+const SIGN_UNSAFE_ROUNDING = new Set(['DIV_INT64', 'MOD_INT64']);
+
+/** Operators whose result is a number by construction. */
+const ARITHMETIC_OPS = new Set(['+', '-', '*', '/', 'div', 'mod']);
+
+/**
+ * Is this term KNOWN to denote a number?
+ *
+ * Not "does the emitter give it sort Real" - it gives everything it cannot
+ * place sort Real, by design, because Real is the emitter's default and the
+ * default has to be something. A party field, a contract id, a date and a
+ * text all reach an unconstrained class and all come back Real, and asserting
+ * `>= 0` of one of them would not be a weak check but a FABRICATED one: the
+ * solver would answer about a symbol that stands for nothing numeric, and a
+ * DISPROVED would name a "negative owner".
+ *
+ * So evidence is required, and there are exactly three kinds:
+ *
+ *   * a numeric literal, which the LF decoder read out of an INT64 or NUMERIC
+ *     literal and nothing else;
+ *   * an arithmetic operator, which only a numeric builtin produces;
+ *   * a variable some OTHER position in the transition pinned to Real -
+ *     compared with `<`, added to something, divided by. That is the compiled
+ *     code using the field as a number, which is the same fact a type would
+ *     have told us, read off the code instead.
+ *
+ * Anything else is skipped and SAID to be skipped. The field types are not
+ * available here: readDarRaw keeps the template definitions, not the
+ * DefDataType records that carry the field types, so there is no type to
+ * consult and the honest thing is to report the gap rather than guess from
+ * the field's name.
+ */
+function numericEvidence(term, isRealVar) {
+  if (!term || typeof term !== 'object') return false;
+  switch (term.k) {
+    case 'num':
+      return true;
+    case 'app':
+      return ARITHMETIC_OPS.has(term.op);
+    case 'var':
+      return isRealVar(term.name);
+    case 'uf':
+      return term.sort === 'Real';
+    case 'ite':
+      // Both branches share one sort, so evidence from either types the whole.
+      return numericEvidence(term.a, isRealVar) || numericEvidence(term.b, isRealVar);
+    default:
+      return false;
+  }
+}
+
+/**
+ * NON-NEGATIVITY: every numeric field of every created contract is `>= 0`
+ * under the guards that hold on the path that creates it.
+ *
+ * Per FIELD, the way division-safety is per denominator: one field the
+ * translation could not read must not hide the ones it could, and the
+ * coverage split is what keeps a partial answer from printing as a whole one.
+ *
+ * WHAT IS AND IS NOT AN OBLIGATION HERE. Only fields the create ASSIGNS are
+ * checked. A `create this with amount = ...` inherits every field it does not
+ * mention, and an inherited field's value is the pre-state's, about which this
+ * transition establishes nothing at all - `this.owner >= 0` is not a property
+ * of the choice. Those fields are disclosed on the verdict rather than
+ * counted, because there is no type information here to count them with.
+ */
+export function nonNegativeFields(transition) {
+  const creates = transition.creates || [];
+  if (!creates.length) {
+    return { applicable: false, why: 'creates nothing (pure archive or effects outside the fragment)' };
+  }
+
+  const signUnsafe = (transition.rounding || []).filter((r) => SIGN_UNSAFE_ROUNDING.has(r));
+  if (signUnsafe.length) {
+    return {
+      applicable: false,
+      notModellable: true,
+      why:
+        `the path uses [${signUnsafe.join(', ')}], whose SMT-LIB counterpart is Euclidean while ` +
+        `Daml's truncates toward zero; the two disagree in sign on negative operands (SMT-LIB's ` +
+        `\`mod\` is never negative, Daml's takes the sign of the dividend), so a sign proof over ` +
+        `this transition would be a proof about a different function`,
+    };
+  }
+
+  // SORT EVIDENCE, gathered from the transition ITSELF and never from the
+  // goal: unifying a field with the `>= 0` obligation would pin it to Real and
+  // make every field look numeric, which is the failure this whole function
+  // exists to avoid. Each field term gets a FRESH class so the field terms are
+  // not unified with each other either.
+  const evidence = [];
+  let fresh = 0;
+  for (const g of [...transition.guards, ...(transition.pathConditions || [])]) {
+    evidence.push({ term: g, sort: 'Bool' });
+  }
+  for (const c of creates) {
+    for (const p of c.path || []) evidence.push({ term: p, sort: 'Bool' });
+    for (const t of Object.values(c.fields || {})) evidence.push({ term: t, sort: `field$${fresh++}` });
+  }
+  for (const d of transition.divisions || []) {
+    evidence.push({ term: d.denominator, sort: `denominator$${fresh++}` });
+  }
+  const { sorts, pinned } = inferSorts(evidence);
+  const isRealVar = (name) => pinned.has(name) && sorts.get(name) === 'Real';
+
+  const checkable = [];
+  const skipped = [];
+  let nonNumeric = 0;
+  let total = 0;
+  for (const c of creates) {
+    const usablePath = [];
+    const droppedPath = [];
+    for (const p of c.path || []) {
+      if (hasUnsupported(p)) droppedPath.push(p);
+      else usablePath.push(p);
+    }
+    for (const [name, term] of Object.entries(c.fields || {})) {
+      total++;
+      const at = `${c.template}.${name}`;
+      if (hasUnsupported(term)) {
+        // NOT assumed non-negative: an unreadable field is an unanswered
+        // question, and it is reported as one.
+        skipped.push(`${at} is outside the fragment: ${unsupportedReasons(term).map((u) => u.why).join('; ')}`);
+        continue;
+      }
+      if (!numericEvidence(term, isRealVar)) {
+        nonNumeric++;
+        skipped.push(
+          `${at} is not known to be numeric: nothing in the transition uses it as a number and ` +
+            `the compiled package's field types are not available here, so it is left unchecked ` +
+            `rather than asserted about`
+        );
+        continue;
+      }
+      checkable.push({ at, term, path: usablePath, droppedPath });
+    }
+  }
+
+  if (checkable.length === 0) {
+    if (total === 0) {
+      return { applicable: false, why: 'no create resolves a field the translation could read' };
+    }
+    if (nonNumeric === total) {
+      return {
+        applicable: false,
+        why: `none of the ${total} resolved created field(s) is known to be numeric`,
+      };
+    }
+    return {
+      applicable: false,
+      notModellable: true,
+      why: `all ${total} resolved created field(s) are unchecked: ${[...new Set(skipped)].join('; ')}`,
+    };
+  }
+
+  const goal = allOf(
+    checkable.map((o) =>
+      implies(allOf(o.path), { k: 'app', op: '>=', args: [o.term, { k: 'num', v: '0' }] })
+    )
+  );
+  const { used, dropped } = usableGuards(transition);
+  for (const o of checkable) {
+    for (const p of o.droppedPath) dropped.push(unsupportedReasons(p).map((u) => u.why));
+  }
+
+  const inherits = creates.filter((c) => c.base === 'this' || c.base === 'arg');
+  const notes = [];
+  if (inherits.length) {
+    notes.push(
+      `${inherits.length} create(s) copy a record (\`create ${inherits[0].base} with ...\`) and ` +
+        `inherit every field they do not name; only the fields they DO name are checked, because ` +
+        `an inherited field's value is the pre-state's and this choice establishes nothing about it`
+    );
+  }
+  if ((transition.rounding || []).length) {
+    notes.push(
+      `the path carries rounding builtins [${transition.rounding.join(', ')}]; none of them ` +
+        `produces a term, so every field built through one is among the skipped ones above`
+    );
+  }
+
+  return {
+    applicable: true,
+    guards: used,
+    goal,
+    dropped,
+    notes,
+    coverage: { checked: checkable.length, total, skipped: [...new Set(skipped)] },
+  };
+}
+
+// ------------------------------------------------------- create-authority
+
+/**
+ * Re-root one of the CREATED template's party paths onto the CREATING
+ * contract, using the create's own field assignments and nothing else.
+ *
+ * `create T with admin = this.admin` is the only kind of evidence that relates
+ * two party references in this model. A signatory path `this.admin` of T is
+ * rewritten to `this.admin` of the creating contract because the assignment
+ * says so; a signatory path of T whose field the create assigns from anything
+ * else - an expression, a fetched contract, a field the walk did not see -
+ * comes back null, and the caller leaves that create unadjudicated rather than
+ * relating the two by their shared FIELD NAME. Field names in two templates
+ * are not known to denote the same ledger Party, which is exactly the
+ * limitation src/analysis.js reports rather than asserts.
+ *
+ * A dotted path (`this.governance.approver`) is re-rooted at its FIRST
+ * segment, since that is the field the create assigns.
+ */
+function relinkPartyPath(path, create, owningTemplate) {
+  const dot = path.indexOf('.');
+  if (dot < 0) return null;
+  // Paths from a template's own signatory clause are rooted at that template's
+  // parameter, which analysePartyExpr names `this`. Anything else (a choice
+  // argument of some other choice) cannot appear and is not guessed at.
+  if (path.slice(0, dot) !== 'this') return null;
+  const rest = path.slice(dot + 1);
+  const field = rest.split('.')[0];
+  const tail = rest.slice(field.length);
+  const fields = create.fields || {};
+  if (Object.prototype.hasOwnProperty.call(fields, field)) {
+    const assigned = fields[field];
+    return assigned && assigned.k === 'var' ? `${assigned.name}${tail}` : null;
+  }
+  // Not assigned: the create copies a record wholesale and inherits it.
+  if (create.base === 'this') {
+    // `create this with ...` only type-checks against the SAME template, so a
+    // mismatch means the walk mis-identified the record; refuse instead.
+    return create.template === owningTemplate ? `this.${rest}` : null;
+  }
+  if (create.base === 'arg') return `arg.${rest}`;
+  return null;
+}
+
+/**
+ * CREATE AUTHORITY: every party required to sign a contract this choice
+ * creates is covered by the authority the choice acts with.
+ *
+ * The acting authority of a sub-transaction of an exercise is the signatories
+ * of the contract exercised on plus the controllers of the choice, so the
+ * obligation, per created contract and per required signatory `s`, is
+ *
+ *     present(s)  =>  OR over authority a of ( present(a) AND s = a )
+ *
+ * with `present` the condition under which a conditional stakeholder clause
+ * actually contributes that party (see lfir.js: PartyRef). Equality is
+ * equality of UNINTERPRETED PARTY CONSTANTS: the solver has no way to make two
+ * of them equal except through an equation the translation asserted, and the
+ * only equations asserted are the create's own field assignments. So a
+ * required signatory that could not be linked does not become "some other
+ * party" and does not become "the same party" - it stays unconstrained, the
+ * obligation stays unprovable, and this property reports the create as
+ * UNCHECKED with the reason rather than answering about it.
+ *
+ * DIRECTION OF EVERY APPROXIMATION, because they must point opposite ways:
+ *   * the required set is used only when the created template's clause was
+ *     walked EXACTLY (over-approximating is safe, missing one is not);
+ *   * the authority set is whatever was recovered, which under-approximates
+ *     (inventing an authority would authorise a create the ledger rejects).
+ * An under-approximated authority makes a DISPROVED weaker, not a PROVED
+ * wrong, and the verdict says which parts were left out.
+ *
+ * WHAT A PARTY CONSTANT DENOTES, since a stakeholder field is not always one
+ * party: it denotes the SET of parties the field reference stands for - a
+ * singleton for `Party`, the list's parties for `[Party]`, the Optional's for
+ * `Optional Party`. Read that way the obligation is still exactly right:
+ * `s = a` says the two references denote the SAME set, which implies the
+ * required set is contained in the authority. It is a SUFFICIENT condition,
+ * never a necessary one, so it can leave a real coverage unproved (reported as
+ * a DISPROVED with its caveats) but can never approve one that does not hold.
+ */
+export function createAuthority(transition) {
+  const creates = transition.creates || [];
+  if (!creates.length) {
+    return { applicable: false, why: 'creates nothing (pure archive or effects outside the fragment)' };
+  }
+
+  const table = transition.templateSignatories;
+  if (!table || typeof table.get !== 'function') {
+    return {
+      applicable: false,
+      notModellable: true,
+      why:
+        'the transition carries no package-level signatory table, so the required signatories of ' +
+        'a created template cannot be looked up (extractTransitions attaches one)',
+    };
+  }
+
+  const own = transition.signatories || { refs: [], exact: false, why: 'not analysed' };
+  const ctrl = transition.controllers || { refs: [], exact: false, why: 'not analysed' };
+  const authority = [
+    ...own.refs.map((r) => ({ ...r, from: `a signatory of ${transition.template}` })),
+    ...ctrl.refs.map((r) => ({ ...r, from: `a controller of ${transition.choice}` })),
+  ];
+  if (!authority.length) {
+    return {
+      applicable: false,
+      notModellable: true,
+      why:
+        `no party reference could be recovered from the signatories of ${transition.template} or ` +
+        `the controllers of ${transition.choice}, so there is no authority set to check against: ` +
+        `${[own.why, ctrl.why].filter(Boolean).join('; ')}`,
+    };
+  }
+
+  const covers = (s) =>
+    anyOf(
+      authority.map((a) =>
+        allOf([a.presence, { k: 'app', op: '=', args: [T.party(s), T.party(a.path)] }])
+      )
+    );
+
+  const checked = [];
+  const skipped = [];
+  for (const c of creates) {
+    const target = table.get(c.template);
+    if (!target) {
+      skipped.push(
+        `create of ${c.template}: no template of that name is declared in this package (it is ` +
+          `declared in a dependency, or the create's type could not be named), so its required ` +
+          `signatories are unknown`
+      );
+      continue;
+    }
+    if (target.ambiguous) {
+      skipped.push(`create of ${c.template}: ${target.why}`);
+      continue;
+    }
+    if (!target.exact) {
+      skipped.push(
+        `create of ${c.template}: its signatory clause was only partly walked (${target.why}), so ` +
+          `the required signatory set is not known to be complete and proving the recovered part ` +
+          `would claim more than was checked`
+      );
+      continue;
+    }
+    if (!target.refs.length) {
+      skipped.push(`create of ${c.template}: its signatory clause yielded no party reference at all`);
+      continue;
+    }
+
+    const link = (path) => relinkPartyPath(path, c, transition.template);
+    const obligations = [];
+    let unlinked = null;
+    for (const req of target.refs) {
+      const s = link(req.path);
+      if (s === null) {
+        unlinked = req.path;
+        break;
+      }
+      const presence = rewriteVars(req.presence, link);
+      if (hasUnsupported(presence)) {
+        unlinked = req.path;
+        break;
+      }
+      obligations.push(implies(presence, covers(s)));
+    }
+    if (unlinked !== null) {
+      skipped.push(
+        `create of ${c.template}: its required signatory \`${unlinked}\` is assigned something ` +
+          `this translation cannot relate to a party of the creating contract, and two field ` +
+          `names are NOT assumed to denote the same ledger Party, so the create is left unchecked`
+      );
+      continue;
+    }
+
+    const usablePath = (c.path || []).filter((p) => !hasUnsupported(p));
+    checked.push({ template: c.template, goal: implies(allOf(usablePath), allOf(obligations)) });
+  }
+
+  if (!checked.length) {
+    return {
+      applicable: false,
+      notModellable: true,
+      why: `no create could be adjudicated: ${[...new Set(skipped)].join('; ')}`,
+    };
+  }
+
+  const { used, dropped } = usableGuards(transition);
+  const notes = [
+    'party identity comes ONLY from the create\'s own field assignments: two party fields are ' +
+      'equal in this model exactly when the compiled create assigned one from the other, never ' +
+      'because they share a name',
+  ];
+  if (!ctrl.refs.length) {
+    notes.push(
+      `the acting authority is an UNDER-approximation: the controllers of ${transition.choice} ` +
+        `contributed nothing (${ctrl.why}), so only ${transition.template}'s signatories were ` +
+        `used - which can only make a goal harder to prove, and makes a DISPROVED here possibly ` +
+        `an artifact of the missing controllers rather than a real authorisation gap`
+    );
+  }
+  if (!own.exact) {
+    notes.push(
+      `${transition.template}'s own signatory clause was only partly walked (${own.why}); the ` +
+        `authority uses the references that were recovered, which under-approximates it in the ` +
+        `same safe direction`
+    );
+  }
+
+  return {
+    applicable: true,
+    guards: used,
+    goal: allOf(checked.map((c) => c.goal)),
+    dropped,
+    notes,
+    coverage: { checked: checked.length, total: creates.length, skipped: [...new Set(skipped)] },
+  };
+}
+
 export const PROPERTIES = {
   'amount-conservation': {
     fn: amountConservation,
@@ -700,5 +1217,19 @@ export const PROPERTIES = {
   'division-safety': {
     fn: divisionSafety,
     describe: 'no division on the transition can divide by zero under its guards',
+  },
+  'non-negative-fields': {
+    fn: nonNegativeFields,
+    describe:
+      'every numeric field a created contract is given is >= 0 under the guards on the path ' +
+      'that creates it; a field the translation cannot read, or cannot show to be numeric, is ' +
+      'reported unchecked rather than assumed',
+  },
+  'create-authority': {
+    fn: createAuthority,
+    describe:
+      "every party required to sign a contract the choice creates is covered by the choice's " +
+      'acting authority (the signatories of the contract exercised on, plus the controllers); ' +
+      'parties are uninterpreted constants related only by the create\'s own field assignments',
   },
 };

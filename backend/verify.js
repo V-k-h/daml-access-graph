@@ -5,7 +5,8 @@
 //
 //   node backend/verify.js path/to/package.dar [options]
 //
-//   --property NAME    amount-conservation | division-safety (default: all)
+//   --property NAME    amount-conservation | division-safety |
+//                      non-negative-fields | create-authority (default: all)
 //   --template NAME    restrict to one template
 //   --choice NAME      restrict to one choice
 //   --bound N          list length to unroll folds and archive loops to
@@ -62,6 +63,16 @@
 //     symbols, and no verdict here ever hides it.
 //   * A PROVED-BOUNDED is a statement about short lists only.
 //   * The translator itself (lfir.js) is tested, not verified.
+//   * PARTIES are UNINTERPRETED CONSTANTS of an uninterpreted sort
+//     (create-authority). Two party references are equal in the model exactly
+//     when the compiled create assigned one from the other; sharing a FIELD
+//     NAME across two templates establishes nothing, which is the limitation
+//     src/analysis.js reports rather than asserts. The consequences are
+//     asymmetric and both are disclosed on the verdict: an unlinkable party
+//     leaves its create UNCHECKED (never PROVED), and the acting authority is
+//     an under-approximation, so a DISPROVED there may be an artifact of a
+//     controller clause the translation could not read rather than a real
+//     authorisation gap.
 
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -244,6 +255,11 @@ function main() {
       }
 
       const notes = [];
+      // Disclosures the PROPERTY itself wants on the verdict: which parts of
+      // its statement it narrowed, and which of its inputs were
+      // approximations. verify.js cannot derive these from the transition -
+      // only the property knows what it did and did not claim.
+      if (inst.notes && inst.notes.length) notes.push(...inst.notes);
       if (inst.dropped && inst.dropped.length) {
         notes.push(`${inst.dropped.length} guard(s) dropped (untranslatable ensure/branches) - sound for PROVED, see report`);
       }

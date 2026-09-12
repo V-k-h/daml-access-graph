@@ -34,6 +34,8 @@ import {
   usableGuards,
   amountConservation,
   divisionSafety,
+  nonNegativeFields,
+  createAuthority,
 } from '../backend/smt.js';
 
 const v = (name) => T.varRef(name, 'Real');
@@ -1734,5 +1736,590 @@ test(
     const narrow = run(['--bound', '1']);
     assert.equal(narrow.status, 'PROVED-BOUNDED (lists up to length 1)');
     assert.equal(narrow.queries, 2);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// non-negative-fields and create-authority
+//
+// Two things are being pinned here, and they pull in opposite directions.
+// For non-negativity it is that a field is checked only on EVIDENCE that it is
+// numeric, so that a party or a text field is reported unchecked rather than
+// asserted about. For authorisation it is that a party is covered only on
+// EVIDENCE that it is the same party, so that a false PROVED - the one failure
+// that would make this property worse than not having it - cannot be produced
+// by two templates sharing a field name.
+// ---------------------------------------------------------------------------
+
+/** A transition carrying the party machinery, for create-authority. */
+function authTransition(overrides = {}) {
+  const { signatories, controllers, templates, ...rest } = overrides;
+  return transition({
+    template: 'Tok',
+    choice: 'C',
+    signatories: signatories || { refs: [{ path: 'this.admin', presence: T.bool(true) }], exact: true, why: null },
+    controllers: controllers || { refs: [{ path: 'arg.actor', presence: T.bool(true) }], exact: true, why: null },
+    templateSignatories: new Map(Object.entries(templates || {})),
+    ...rest,
+  });
+}
+
+/** An exactly-walked signatory clause for a created template. */
+const sigOf = (...paths) => ({
+  refs: paths.map((p) => (typeof p === 'string' ? { path: p, presence: T.bool(true) } : p)),
+  exact: true,
+  why: null,
+});
+
+// ------------------------------------------------- non-negativity: shape
+
+test('non-negative-fields: applicability needs a create with a resolved field', () => {
+  assert.match(nonNegativeFields(transition({ creates: [] })).why, /creates nothing/);
+  assert.equal(nonNegativeFields(transition({ creates: [] })).notModellable, undefined);
+
+  const noFields = nonNegativeFields(
+    transition({ creates: [{ template: 'T', base: null, fields: {}, path: [] }] })
+  );
+  assert.equal(noFields.applicable, false);
+  assert.match(noFields.why, /no create resolves a field/);
+});
+
+test('non-negative-fields: only terms with numeric EVIDENCE become obligations', () => {
+  // `amount` is arithmetic, so it is numeric by construction. `owner` is a
+  // bare projection nothing in the transition uses as a number: it might be a
+  // Party, a ContractId or a date, and `owner >= 0` would be a fabricated
+  // obligation rather than a weak one - so it is skipped, and SAID to be.
+  const t = transition({
+    creates: [
+      {
+        template: 'T',
+        base: null,
+        fields: {
+          amount: T.app('-', [v('this.amount'), v('arg.qty')]),
+          owner: v('arg.newOwner'),
+        },
+        path: [],
+      },
+    ],
+  });
+  const inst = nonNegativeFields(t);
+  assert.equal(inst.applicable, true);
+  assert.deepEqual(inst.coverage, {
+    checked: 1,
+    total: 2,
+    skipped: [inst.coverage.skipped[0]],
+  });
+  assert.match(inst.coverage.skipped[0], /T\.owner is not known to be numeric/);
+  assert.equal(termToSmt(inst.goal), '(>= (- |this.amount| |arg.qty|) 0)');
+});
+
+test('non-negative-fields: a variable another position types as Real IS evidence', () => {
+  // Nothing here is arithmetic, but the transition's own guard compares
+  // `arg.qty` with a number, which is the compiled code using the field as a
+  // number - the same fact a type would have carried. `label` gets no such
+  // position and stays unchecked.
+  const t = transition({
+    guards: [T.app('>', [v('arg.qty'), T.num('0')])],
+    creates: [
+      { template: 'T', base: null, fields: { qty: v('arg.qty'), label: v('arg.label') }, path: [] },
+    ],
+  });
+  const inst = nonNegativeFields(t);
+  assert.equal(inst.coverage.checked, 1);
+  assert.equal(inst.coverage.total, 2);
+  assert.equal(termToSmt(inst.goal), '(>= |arg.qty| 0)');
+
+  // ...and a variable pinned to something else is not quietly taken as Real
+  const text = nonNegativeFields(
+    transition({
+      guards: [T.app('=', [v('arg.label'), T.str('x')])],
+      creates: [{ template: 'T', base: null, fields: { label: v('arg.label') }, path: [] }],
+    })
+  );
+  assert.equal(text.applicable, false);
+  assert.match(text.why, /none of the 1 resolved created field\(s\) is known to be numeric/);
+});
+
+test('non-negative-fields: an unreadable field is SKIPPED, never assumed non-negative', () => {
+  const t = transition({
+    creates: [
+      {
+        template: 'T',
+        base: null,
+        fields: {
+          good: T.app('+', [v('a'), T.num('1')]),
+          bad: T.app('*', [v('b'), T.unsupported('a fetch in the field expression', 'T')]),
+        },
+        path: [],
+      },
+    ],
+  });
+  const inst = nonNegativeFields(t);
+  assert.equal(inst.coverage.checked, 1);
+  assert.equal(inst.coverage.total, 2);
+  assert.match(inst.coverage.skipped.join(' '), /T\.bad is outside the fragment.*fetch/);
+  // the skipped field appears nowhere in the goal
+  assert.doesNotMatch(termToSmt(inst.goal), /\|b\|/);
+});
+
+test('non-negative-fields: every field unreadable is a REFUSAL, not a pass', () => {
+  const inst = nonNegativeFields(
+    transition({
+      creates: [
+        { template: 'T', base: null, fields: { x: T.unsupported('outside', 'T') }, path: [] },
+      ],
+    })
+  );
+  assert.equal(inst.applicable, false);
+  assert.equal(inst.notModellable, true);
+  assert.match(inst.why, /all 1 resolved created field\(s\) are unchecked/);
+});
+
+test('non-negative-fields: the rounding refusal is exactly DIV_INT64 and MOD_INT64', () => {
+  const create = {
+    template: 'T',
+    base: null,
+    fields: { amount: T.app('-', [v('this.amount'), T.num('1')]) },
+    path: [],
+  };
+  // Numeric-scale rounding does NOT refuse: none of those builtins produces a
+  // term at all (translateBuiltinApp refuses them), so a field built through
+  // one carries an `unsupported` node and is skipped by the coverage split.
+  for (const r of ['ROUND_NUMERIC', 'CAST_NUMERIC', 'SHIFT_NUMERIC', 'NUMERIC_TO_INT64']) {
+    const inst = nonNegativeFields(transition({ creates: [create], rounding: [r] }));
+    assert.equal(inst.applicable, true, `${r} must not refuse`);
+    assert.ok(inst.notes.some((n) => n.includes(r)), `${r} must still be disclosed`);
+  }
+  // The Int64 pair DOES refuse: SMT-LIB's div/mod are Euclidean, Daml's
+  // truncate toward zero, and they disagree in sign on negative operands.
+  for (const r of ['DIV_INT64', 'MOD_INT64']) {
+    const inst = nonNegativeFields(transition({ creates: [create], rounding: [r] }));
+    assert.equal(inst.applicable, false, `${r} must refuse`);
+    assert.equal(inst.notModellable, true);
+    assert.match(inst.why, /Euclidean/);
+  }
+});
+
+test('non-negative-fields: branch conditions are an IMPLICATION, never a guard', () => {
+  // Two creates on opposite sides of an `if`. Asserting both branch conditions
+  // as assumptions would make the guard set contradictory and every such
+  // transition would come back PROVED having checked nothing - the exact shape
+  // of a vacuous proof. Each obligation carries its own antecedent instead.
+  const c = T.app('>', [v('arg.qty'), T.num('0')]);
+  const inst = nonNegativeFields(
+    transition({
+      creates: [
+        { template: 'T', base: null, fields: { a: T.app('+', [v('arg.qty'), T.num('1')]) }, path: [c] },
+        {
+          template: 'T',
+          base: null,
+          fields: { a: T.app('-', [T.num('0'), v('arg.qty')]) },
+          path: [T.app('not', [c])],
+        },
+      ],
+    })
+  );
+  const smt = termToSmt(inst.goal);
+  assert.match(smt, /\(or \(not \(> \|arg\.qty\| 0\)\) \(>= \(\+ \|arg\.qty\| 1\) 0\)\)/);
+  assert.match(smt, /\(or \(not \(not \(> \|arg\.qty\| 0\)\)\) \(>= \(- 0 \|arg\.qty\|\) 0\)\)/);
+  assert.deepEqual(inst.guards, [], 'branch conditions must not become assumptions');
+});
+
+test('non-negative-fields: an inherited field is disclosed, not counted as checked', () => {
+  const inst = nonNegativeFields(
+    transition({
+      creates: [
+        { template: 'Tok', base: 'this', fields: { amount: T.app('-', [v('this.amount'), T.num('1')]) }, path: [] },
+      ],
+    })
+  );
+  assert.equal(inst.coverage.total, 1, 'only the ASSIGNED field is an obligation');
+  assert.ok(
+    inst.notes.some((n) => /inherit every field they do not name/.test(n)),
+    `expected an inheritance disclosure, got ${JSON.stringify(inst.notes)}`
+  );
+});
+
+test('non-negative-fields: cvc5 proves what the guards imply and refutes what they do not', { skip: !SOLVER }, () => {
+  const create = (term) => ({ template: 'T', base: null, fields: { amount: term }, path: [] });
+  const provable = nonNegativeFields(
+    transition({
+      guards: [T.app('>=', [v('this.amount'), v('arg.qty')]), T.app('>=', [v('arg.qty'), T.num('0')])],
+      creates: [create(T.app('-', [v('this.amount'), v('arg.qty')]))],
+    })
+  );
+  assert.match(runSolver(buildQuery(provable.guards, provable.goal).script), /^unsat/m);
+
+  const refutable = nonNegativeFields(
+    transition({
+      guards: [T.app('>=', [v('this.amount'), T.num('0')])],
+      creates: [create(T.app('-', [v('this.amount'), v('arg.qty')]))],
+    })
+  );
+  const out = runSolver(buildQuery(refutable.guards, refutable.goal).script);
+  assert.match(out, /^sat/m);
+  assert.match(out, /arg\.qty/);
+});
+
+// ------------------------------------------------------- create-authority
+
+test('create-authority: applicability and the two refusals about the target', () => {
+  assert.match(createAuthority(authTransition({ creates: [] })).why, /creates nothing/);
+
+  const create = { template: 'Other', base: null, fields: { admin: v('this.admin') }, path: [] };
+
+  // the target is not in this package: refuse, never assume it needs nothing
+  const missing = createAuthority(authTransition({ creates: [create], templates: {} }));
+  assert.equal(missing.applicable, false);
+  assert.equal(missing.notModellable, true);
+  assert.match(missing.why, /no template of that name is declared in this package/);
+
+  // two templates share the name: refuse rather than pick one
+  const ambiguous = createAuthority(
+    authTransition({
+      creates: [create],
+      templates: { Other: { refs: [], exact: false, ambiguous: true, why: 'two templates named `Other`' } },
+    })
+  );
+  assert.match(ambiguous.why, /two templates named/);
+
+  // the target's clause was only partly walked: the required set is not known
+  // to be complete, so proving the recovered part would claim too much
+  const inexact = createAuthority(
+    authTransition({
+      creates: [create],
+      templates: { Other: { refs: [{ path: 'this.admin', presence: T.bool(true) }], exact: false, why: 'a helper' } },
+    })
+  );
+  assert.equal(inexact.applicable, false);
+  assert.match(inexact.why, /only partly walked/);
+});
+
+test('create-authority: no recoverable authority at all is a refusal', () => {
+  const inst = createAuthority(
+    authTransition({
+      creates: [{ template: 'Other', base: null, fields: { admin: v('this.admin') }, path: [] }],
+      signatories: { refs: [], exact: false, why: 'a computed signatory list' },
+      controllers: { refs: [], exact: false, why: 'an interface view' },
+      templates: { Other: sigOf('this.admin') },
+    })
+  );
+  assert.equal(inst.applicable, false);
+  assert.equal(inst.notModellable, true);
+  assert.match(inst.why, /no party reference could be recovered/);
+});
+
+test('create-authority: a linked signatory is related ONLY through the field assignment', () => {
+  const inst = createAuthority(
+    authTransition({
+      creates: [{ template: 'Other', base: null, fields: { boss: v('this.admin') }, path: [] }],
+      templates: { Other: sigOf('this.boss') },
+    })
+  );
+  assert.equal(inst.applicable, true, inst.why);
+  // `Other.boss` became `this.admin` because the create assigned it so - not
+  // because the two are both called `boss`.
+  const smt = termToSmt(inst.goal);
+  assert.match(smt, /\|party:this\.admin\|/);
+  assert.doesNotMatch(smt, /party:this\.boss/);
+  assert.equal(inst.coverage.checked, 1);
+});
+
+test('create-authority: an UNLINKED party can never yield PROVED', { skip: !SOLVER }, () => {
+  // THE security-critical case. `Other.boss` is assigned an expression the
+  // translation cannot relate to any party of the creating contract. It must
+  // not be assumed equal to `this.admin` (a false PROVED, which is the lie
+  // this property exists to avoid) and it must not be assumed distinct
+  // either. The create is left UNCHECKED, with the reason.
+  const unlinked = createAuthority(
+    authTransition({
+      creates: [
+        {
+          template: 'Other',
+          base: null,
+          fields: { boss: T.uf('Shared:pickApprover', [v('this.admin')], null, null) },
+          path: [],
+        },
+      ],
+      templates: { Other: sigOf('this.boss') },
+    })
+  );
+  assert.equal(unlinked.applicable, false, 'an unlinkable party must not produce a query at all');
+  assert.equal(unlinked.notModellable, true);
+  assert.match(unlinked.why, /two field names are NOT assumed to denote the same ledger Party/);
+
+  // ...and with a second, linkable create alongside it the verdict is PARTIAL,
+  // which verify.js prints as PROVED-PARTIAL and never as PROVED.
+  const mixed = createAuthority(
+    authTransition({
+      creates: [
+        {
+          template: 'Other',
+          base: null,
+          fields: { boss: T.uf('Shared:pickApprover', [v('this.admin')], null, null) },
+          path: [],
+        },
+        { template: 'Plain', base: null, fields: { boss: v('this.admin') }, path: [] },
+      ],
+      templates: { Other: sigOf('this.boss'), Plain: sigOf('this.boss') },
+    })
+  );
+  assert.equal(mixed.applicable, true);
+  assert.equal(mixed.coverage.checked, 1);
+  assert.equal(mixed.coverage.total, 2);
+  assert.ok(mixed.coverage.checked < mixed.coverage.total, 'must print as PROVED-PARTIAL');
+  assert.match(runSolver(buildQuery(mixed.guards, mixed.goal).script), /^unsat/m);
+});
+
+test('create-authority: cvc5 proves a covered create and refutes an uncovered one', { skip: !SOLVER }, () => {
+  const covered = createAuthority(
+    authTransition({
+      creates: [{ template: 'Other', base: null, fields: { boss: v('arg.actor') }, path: [] }],
+      templates: { Other: sigOf('this.boss') },
+    })
+  );
+  assert.match(runSolver(buildQuery(covered.guards, covered.goal).script), /^unsat/m);
+
+  // the created contract needs a party the choice does not act with: the
+  // constants are unrelated, so the goal is refuted with a model naming them
+  const uncovered = createAuthority(
+    authTransition({
+      creates: [{ template: 'Other', base: null, fields: { boss: v('this.outsider') }, path: [] }],
+      templates: { Other: sigOf('this.boss') },
+    })
+  );
+  const out = runSolver(buildQuery(uncovered.guards, uncovered.goal).script);
+  assert.match(out, /^sat/m);
+  assert.match(out, /party:this\.outsider/);
+});
+
+test('create-authority: a CONDITIONAL signatory is carried with its condition', { skip: !SOLVER }, () => {
+  // `[this.admin] <> optionalParty this.gov.approver` is what compiled Daml
+  // produces, and the second party is a signatory only when the Optional is
+  // set. Because the create copies `gov` wholesale, the created contract's
+  // presence flag IS the creating contract's presence flag - the same symbol -
+  // so the obligation `present(s) => covered(s)` discharges. Dropping the
+  // condition instead would either over-state the required set (a spurious
+  // DISPROVED) or over-state the authority (a false PROVED).
+  const some = (p) => T.varRef(`${p}.$some`, 'Bool');
+  const inst = createAuthority(
+    authTransition({
+      creates: [
+        { template: 'Other', base: null, fields: { admin: v('this.admin'), gov: v('this.gov') }, path: [] },
+      ],
+      signatories: {
+        refs: [
+          { path: 'this.admin', presence: T.bool(true) },
+          { path: 'this.gov.approver.$value', presence: some('this.gov.approver') },
+        ],
+        exact: true,
+        why: null,
+      },
+      controllers: { refs: [], exact: false, why: 'none recovered' },
+      templates: {
+        Other: {
+          refs: [
+            { path: 'this.admin', presence: T.bool(true) },
+            { path: 'this.gov.approver.$value', presence: some('this.gov.approver') },
+          ],
+          exact: true,
+          why: null,
+        },
+      },
+    })
+  );
+  assert.equal(inst.applicable, true, inst.why);
+  const { script } = buildQuery(inst.guards, inst.goal);
+  assert.match(script, /\(declare-const \|this\.gov\.approver\.\$some\| Bool\)/);
+  assert.match(runSolver(script), /^unsat/m);
+  // the missing controllers are disclosed as an under-approximation
+  assert.ok(inst.notes.some((n) => /UNDER-approximation/.test(n)), JSON.stringify(inst.notes));
+});
+
+test('create-authority: `create this with ...` inherits only within the same template', () => {
+  // A RecUpd over `this` only type-checks against the same template, so the
+  // un-overridden signatory field is the pre-state's. A target name that does
+  // NOT match means the walk mis-identified the record: refuse rather than
+  // inherit a field from a different template.
+  const same = createAuthority(
+    authTransition({
+      creates: [{ template: 'Tok', base: 'this', fields: { amount: T.num('1') }, path: [] }],
+      templates: { Tok: sigOf('this.admin') },
+    })
+  );
+  assert.equal(same.applicable, true, same.why);
+  assert.match(termToSmt(same.goal), /\(= \|party:this\.admin\| \|party:this\.admin\|\)/);
+
+  const crossed = createAuthority(
+    authTransition({
+      creates: [{ template: 'Other', base: 'this', fields: { amount: T.num('1') }, path: [] }],
+      templates: { Other: sigOf('this.admin') },
+    })
+  );
+  assert.equal(crossed.applicable, false);
+  assert.match(crossed.why, /left unchecked/);
+});
+
+// ----------------------------------------------------------- the Party sort
+
+test('the Party sort is uninterpreted, declared on demand, and never arithmetic', () => {
+  const goal = T.app('=', [T.party('this.admin'), T.party('arg.actor')]);
+  const { script, vars } = buildQuery([], goal);
+  assert.match(script, /\(declare-sort Party 0\)/);
+  assert.match(script, /\(declare-const \|party:this\.admin\| Party\)/);
+  assert.match(script, /\(declare-const \|party:arg\.actor\| Party\)/);
+  assert.deepEqual(vars.sort(), ['party:arg.actor', 'party:this.admin']);
+
+  // an arithmetic query does not grow a sort declaration it never uses
+  assert.doesNotMatch(buildQuery([], T.app('>', [v('x'), T.num('0')])).script, /declare-sort/);
+
+  // a party in a numeric position is a CONFLICT, not a silent coercion
+  assert.throws(
+    () => buildQuery([], T.app('>', [T.party('this.admin'), T.num('0')])),
+    /sort conflicts/
+  );
+
+  // T.party namespaces the symbol, so the arithmetic symbol for the same path
+  // stays a DIFFERENT constant: a guard can never establish party identity
+  assert.equal(T.party('this.admin').name, 'party:this.admin');
+  assert.equal(T.party(T.party('this.admin').name).name, 'party:this.admin');
+});
+
+test('inferSorts reports which sorts came from a POSITION rather than the default', () => {
+  const { sorts, pinned } = inferSorts([
+    { term: T.app('>', [v('a'), T.num('1')]), sort: 'Bool' },
+    { term: T.app('not', [v('b')]), sort: 'Bool' },
+    { term: T.app('=', [v('c'), v('d')]), sort: 'Bool' },
+    { term: T.party('this.admin'), sort: 'free$0' },
+  ]);
+  assert.equal(sorts.get('a'), 'Real');
+  assert.ok(pinned.has('a'), 'a comparison operand is pinned');
+  assert.ok(pinned.has('b'), 'a Bool position is pinned');
+  assert.ok(pinned.has('party:this.admin'), 'a party constant is pinned');
+  // `c` and `d` are only known to share a sort; nothing pinned it, so `Real`
+  // is the emitter's DEFAULT and must not be read as evidence.
+  assert.equal(sorts.get('c'), 'Real');
+  assert.equal(pinned.has('c'), false);
+  assert.equal(pinned.has('d'), false);
+});
+
+// -------------------------------------------- against the compiled package
+
+test(
+  'party references recovered from the token DAR: definite, conditional and refused',
+  { skip: !HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}` },
+  () => {
+    const ts = extractTransitions(readDarRaw(TOKENS_DAR), { bound: 3 });
+    const t = ts.find((x) => x.template === 'CollateralUnitToken' && x.choice === 'LockCollateralUnitToken');
+    assert.ok(t, 'expected a LockCollateralUnitToken transition');
+
+    // `controller this.admin` is read exactly, with no condition attached
+    assert.equal(t.controllers.exact, true, t.controllers.why);
+    assert.deepEqual(t.controllers.refs.map((r) => r.path), ['this.admin']);
+    assert.deepEqual(t.controllers.refs.map((r) => r.presence.k), ['bool']);
+
+    // The templates' own signatory clause is `[this.admin] <> optionalParty
+    // this.governance.approvalParty`, whose tail bottoms out in a Foldable
+    // dictionary this walk does not reduce. `this.admin` IS recovered (an
+    // element of a cons is contributed whatever the tail turns out to be) and
+    // the clause is reported INEXACT, which is what stops it being used as a
+    // required-signatory set.
+    assert.equal(t.signatories.exact, false);
+    assert.deepEqual(t.signatories.refs.map((r) => r.path), ['this.admin']);
+    assert.match(t.signatories.why, /cannot reduce to its body/);
+
+    // ...and that inexactness is what create-authority refuses on, by name
+    const inst = createAuthority(t);
+    assert.equal(inst.applicable, false);
+    assert.equal(inst.notModellable, true);
+    assert.match(inst.why, /LockedCollateralUnitToken: its signatory clause was only partly walked/);
+
+    // an INTERFACE choice's controllers are over the view: reported, not guessed
+    const viaIface = ts.find((x) => x.via && x.controllers);
+    assert.equal(viaIface.controllers.exact, false);
+    assert.match(viaIface.controllers.why, /interface view/);
+  }
+);
+
+test(
+  'the package signatory table keys templates by name and is shared, not per transition',
+  { skip: !HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}` },
+  () => {
+    const ts = extractTransitions(readDarRaw(TOKENS_DAR), { bound: 3 });
+    const table = ts[0].templateSignatories;
+    assert.ok(table instanceof Map);
+    for (const t of ts) assert.equal(t.templateSignatories, table, 'one table per package');
+    assert.ok(table.has('CollateralUnitToken'));
+    // every template got an entry, and none of them silently claims an empty
+    // signatory set: an empty `refs` always comes with `exact: false`
+    for (const [name, a] of table) {
+      assert.ok(Array.isArray(a.refs), name);
+      if (a.refs.length === 0) assert.equal(a.exact, false, `${name} claims no signatories`);
+    }
+  }
+);
+
+test(
+  'the CLI selects each new property on its own and runs all four by default',
+  { skip: (!SOLVER && 'no cvc5') || (!HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}`) },
+  () => {
+    const cli = new URL('../backend/verify.js', import.meta.url).pathname;
+    const run = (extra) => {
+      let out;
+      try {
+        out = execFileSync('node', [cli, TOKENS_DAR, '--choice', 'LockCollateralUnitToken', '--json', ...extra], {
+          encoding: 'utf8',
+          maxBuffer: 1 << 26,
+        });
+      } catch (e) {
+        out = e.stdout;
+      }
+      return JSON.parse(out).results;
+    };
+    const one = run(['--property', 'non-negative-fields']);
+    assert.deepEqual([...new Set(one.map((r) => r.property))], ['non-negative-fields']);
+    const other = run(['--property', 'create-authority']);
+    assert.deepEqual([...new Set(other.map((r) => r.property))], ['create-authority']);
+    assert.deepEqual(
+      [...new Set(run([]).map((r) => r.property))].sort(),
+      ['amount-conservation', 'create-authority', 'division-safety', 'non-negative-fields']
+    );
+    // a partial answer never prints as a bare PROVED, and it carries the split
+    const partial = one.find((r) => r.status === 'PROVED-PARTIAL');
+    assert.ok(partial, `expected a PROVED-PARTIAL, got ${one.map((r) => r.status).join(', ')}`);
+    assert.ok(partial.coverage.checked < partial.coverage.total);
+    assert.match(partial.note, /obligation\(s\) checked/);
+  }
+);
+
+test(
+  'the two new properties leave the existing verdicts on the token DAR exactly as they were',
+  { skip: (!SOLVER && 'no cvc5') || (!HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}`) },
+  () => {
+    // The regression this whole change had to preserve: a shared edit (the
+    // Party sort, the `pinned` set) must not move a verdict that was already
+    // being produced. Run the two old properties and count.
+    const cli = new URL('../backend/verify.js', import.meta.url).pathname;
+    let out;
+    try {
+      out = execFileSync(
+        'node',
+        [cli, TOKENS_DAR, '--property', 'amount-conservation', '--property', 'division-safety', '--json'],
+        { encoding: 'utf8', maxBuffer: 1 << 26 }
+      );
+    } catch (e) {
+      out = e.stdout;
+    }
+    const counts = {};
+    for (const r of JSON.parse(out).results) {
+      const k = r.status.split(' (')[0];
+      counts[k] = (counts[k] || 0) + 1;
+    }
+    assert.deepEqual(counts, {
+      PROVED: 10,
+      'PROVED-BOUNDED': 7,
+      DISPROVED: 3,
+      'NOT-APPLICABLE': 116,
+    });
   }
 );

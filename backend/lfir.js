@@ -227,6 +227,23 @@ export const T = {
   record: (root) => ({ k: 'record', root }),
   bool: (v) => ({ k: 'bool', v }),
   varRef: (name, sort) => ({ k: 'var', name, sort }),
+  /**
+   * A PARTY CONSTANT: an uninterpreted constant of the dedicated `Party` sort
+   * (smt.js declares the sort; cvc5 takes `declare-sort` in logic ALL).
+   *
+   * Deliberately NOT a `var`. A party has no arithmetic, and the one thing the
+   * authorisation properties must never do is relate two party references that
+   * the translation has not shown to be the same reference: with an
+   * uninterpreted sort the solver can only use equalities that were ASSERTED,
+   * so two constants are equal exactly when a create's own field assignment
+   * made them equal, and never because they happen to share a field name.
+   *
+   * `name` is namespaced (`party:this.admin`) so that the arithmetic symbol for
+   * the same path - a guard comparing a field, say - stays a different symbol.
+   * That costs information (a guard CANNOT establish party identity here) in
+   * the safe direction: it can only make a goal harder to prove.
+   */
+  party: (name) => ({ k: 'party', name: name.startsWith('party:') ? name : `party:${name}` }),
   app: (op, args) => ({ k: 'app', op, args }),
   ite: (c, a, b) => ({ k: 'ite', c, a, b }),
   /**
@@ -2190,6 +2207,352 @@ function builtinName(n) {
 export { BF, BINOP, ROUNDING, EXACT_CONVERSION, DIVISION, makeCtx, symbol };
 
 // ---------------------------------------------------------------------------
+// Party references: signatory sets and the acting authority
+// ---------------------------------------------------------------------------
+
+/**
+ * A PARTY REFERENCE recovered from a signatory or controller expression:
+ *
+ *   { path: 'this.admin', presence: <Bool term> }
+ *
+ * `path` is a projection path off the contract (`this`) or the choice argument
+ * (`arg`), named exactly the way `symbol()` names every other field, so the
+ * SAME field reached from two places is the SAME string.
+ *
+ * `presence` is the condition under which the expression actually contributes
+ * that party. `signatory this.admin` contributes unconditionally, so its
+ * presence is `true`; the `[this.admin] <> optionalParty this.gov.approver`
+ * shape that compiled Daml produces contributes the second party only when the
+ * Optional is set, so its presence is `this.gov.approver.$some` - the very
+ * symbol the Optional encoding already uses (see translateCase). Carrying the
+ * condition rather than dropping the party is what makes the SAME analysis
+ * usable in both directions, which is the whole difficulty here:
+ *
+ *   * as the REQUIRED signatories of a created contract the set must be an
+ *     OVER-approximation (missing one would let an unauthorised create pass);
+ *   * as the ACTING AUTHORITY of the choice it must be an UNDER-approximation
+ *     (inventing one would authorise a create that the ledger would reject).
+ *
+ * A conditional party guarded by its own condition is correct for both: the
+ * obligation `present(s) => covered(s)` neither ignores it nor asserts it.
+ *
+ * @typedef {{path: string, presence: Object}} PartyRef
+ *
+ * @typedef {Object} PartyAnalysis
+ * @property {PartyRef[]} refs   party references the expression DOES contribute.
+ *   Always sound to use as an under-approximation: each one was read off an
+ *   element the expression really produces, whatever else it may produce.
+ * @property {boolean} exact     true when the walk covered the WHOLE expression,
+ *   so `refs` also over-approximates. Only then may the set be used as a
+ *   required-signatory set; `false` means "at least these", never "exactly".
+ * @property {string|null} why   what stopped the walk, when `exact` is false.
+ */
+
+/** The presence condition of an unconditional party. */
+const PRESENT = T.bool(true);
+
+function andPresence(a, b) {
+  if (a && a.k === 'bool' && a.v === true) return b;
+  if (b && b.k === 'bool' && b.v === true) return a;
+  return T.app('and', [a, b]);
+}
+
+const mergeParty = (a, b) => ({
+  refs: [...a.refs, ...b.refs],
+  exact: a.exact && b.exact,
+  why: a.why || b.why,
+});
+
+const partyFail = (why) => ({ refs: [], exact: false, why });
+
+/**
+ * Rewrite every variable name in a term through `fn`. A name `fn` maps to null
+ * could not be resolved, and the whole term degrades to `unsupported` rather
+ * than keeping a name that means something else - the rewrite is used to carry
+ * a created template's presence condition back onto the creating contract's
+ * symbols, where a wrong name would silently relate two different fields.
+ */
+export function rewriteVars(term, fn) {
+  if (!term || typeof term !== 'object') return term;
+  if (term.k === 'var') {
+    const name = fn(term.name);
+    return name === null
+      ? T.unsupported(`\`${term.name}\` could not be linked to the creating contract`, null)
+      : { ...term, name };
+  }
+  if (term.k === 'app' || term.k === 'uf') return { ...term, args: term.args.map((a) => rewriteVars(a, fn)) };
+  if (term.k === 'ite') {
+    return { ...term, c: rewriteVars(term.c, fn), a: rewriteVars(term.a, fn), b: rewriteVars(term.b, fn) };
+  }
+  return term;
+}
+
+/**
+ * A single party (or party-valued field) read off a translated term.
+ *
+ * The ONLY shape accepted is a registered projection path, because that is the
+ * only thing this translation can name a party by. An `ite` - what an Optional
+ * case reduces to - is split into its two branches under the branch condition,
+ * so a conditional party is kept WITH its condition instead of being lost.
+ */
+function partyFromTerm(term, presence) {
+  if (term && term.k === 'var') return { refs: [{ path: term.name, presence }], exact: true, why: null };
+  if (term && term.k === 'ite' && !hasUnsupported(term.c)) {
+    return mergeParty(
+      partyFromTerm(term.a, andPresence(presence, term.c)),
+      partyFromTerm(term.b, andPresence(presence, T.app('not', [term.c])))
+    );
+  }
+  if (term && term.k === 'unsupported') {
+    return partyFail(`party expression outside the translated fragment: ${term.why}`);
+  }
+  return partyFail(
+    'party expression that does not reduce to a projection off the contract or the choice argument'
+  );
+}
+
+/**
+ * Walk a compiled `[Party]` expression (a `signatory`, `observer` or
+ * `controller` clause) into party references.
+ *
+ * Refusal is the default: a shape the walk does not recognise sets
+ * `exact: false` with its reason, and the caller decides what that costs. It
+ * never guesses a party, and it never drops one silently - the two failure
+ * modes that would make an authorisation verdict a lie.
+ *
+ * WHY A PARTY CANNOT APPEAR FROM NOWHERE. Daml-LF has no party literal
+ * (`BuiltinLit` carries int64, numeric, text, date, timestamp and nothing
+ * else), so inside a stakeholder clause every Party value is either projected
+ * out of the record in scope or produced by TEXT_TO_PARTY. The first is what
+ * this walk names; the second reaches `partyFromTerm` as an `unsupported`
+ * node, because TEXT_TO_PARTY has an Optional on its result side and is
+ * refused by translateBuiltinApp. So an `exact: true` walk really has seen
+ * every party the expression can yield.
+ */
+export function analysePartyExpr(expr, ctx, presence = PRESENT, depth = 0) {
+  if (!expr) return partyFail('empty party expression');
+  if (depth > 40) return partyFail('party expression nested deeper than the extractor follows');
+  const node = deref(expr, ctx);
+  if (!node) return partyFail('party expression behind an interning index that is not in the table');
+
+  // a hoisted value (the compiler puts every stakeholder clause in one)
+  const valRef = ctx.pkg.resolveValue(node);
+  if (valRef) {
+    ctx.partySeen = ctx.partySeen || new Set();
+    if (ctx.partySeen.has(valRef.key)) return partyFail(`recursive value ${valRef.name} in a party expression`);
+    ctx.partySeen.add(valRef.key);
+    const prev = ctx.pkg;
+    ctx.pkg = valRef.pkg || prev;
+    try {
+      return analysePartyExpr(valRef.body, ctx, presence, depth + 1);
+    } finally {
+      ctx.pkg = prev;
+      ctx.partySeen.delete(valRef.key);
+    }
+  }
+
+  // type layers carry no value
+  for (const [field, bodyField] of [[S.Expr.tyAbs, 2], [S.Expr.tyApp, 1]]) {
+    const inner = sub(node, field);
+    if (inner) return analysePartyExpr(sub(inner, bodyField), ctx, presence, depth + 1);
+  }
+
+  if (has(node, S.Expr.nil)) return { refs: [], exact: true, why: null };
+
+  const cons = sub(node, S.Expr.cons);
+  if (cons) {
+    let out = { refs: [], exact: true, why: null };
+    for (const bytes of many(cons, S.Cons.front)) {
+      if (!(bytes instanceof Uint8Array)) continue;
+      out = mergeParty(out, analysePartyExpr(decodeExpr(bytes), ctx, presence, depth + 1));
+    }
+    return mergeParty(out, analysePartyExpr(sub(cons, S.Cons.tail), ctx, presence, depth + 1));
+  }
+
+  const block = sub(node, S.Expr.let);
+  if (block) {
+    const saved = bindBlock(block, ctx);
+    try {
+      return analysePartyExpr(sub(block, S.Block.body), ctx, presence, depth + 1);
+    } finally {
+      restore(saved, ctx);
+    }
+  }
+
+  const app = sub(node, S.Expr.app);
+  if (app) {
+    // Reduce rather than abstract: `$$csignatory this` and the stdlib's
+    // `toParties`/`optionalParty` wrappers all disappear under beta reduction,
+    // and what is left is the list the clause really builds. A head we cannot
+    // reduce is a refusal, not an opaque party source - see the note above on
+    // why nothing may be assumed about what such a function returns.
+    const rawArgs = many(app, 2).filter((v) => v instanceof Uint8Array);
+    const reduced = betaReduce(deref(sub(app, 1), ctx), rawArgs, ctx);
+    if (reduced) {
+      try {
+        return reduced.term
+          ? partyFromTerm(reduced.term, presence)
+          : analysePartyExpr(reduced.body, ctx, presence, depth + 1);
+      } finally {
+        reduced.restore();
+      }
+    }
+    return partyFail('a party expression built by a function the extractor cannot reduce to its body');
+  }
+
+  const cse = sub(node, S.Expr.case);
+  if (cse) return analysePartyCase(cse, ctx, presence, depth);
+
+  // A VARIABLE bound to a list. The term environment cannot carry one - a list
+  // has no sort in the emitter - so a parameter bound to `[this.admin] <> ...`
+  // reads as `unsupported` there, and the walk has to go to the EXPRESSION the
+  // binding was made from. That is the shape every compiled stakeholder clause
+  // takes: `$$csignatory this` reduces to `toParties ps` with `ps` bound to
+  // the list, and without this the whole clause is refused. A variable whose
+  // term IS a party path (a `let` alias for a projection) is taken from the
+  // term environment as before, so nothing here changes how those resolve.
+  if (has(node, S.Expr.varInternedStr)) {
+    const term = translateExpr(node, ctx);
+    if (term && term.k === 'var') return partyFromTerm(term, presence);
+    const name = ctx.pkg.str(int(node, S.Expr.varInternedStr));
+    const entry = ctx.rawEnv.get(name);
+    if (entry && entry.expr && entry.kind !== 'do') {
+      ctx.rawEnv.delete(name); // no self-reference loops
+      const prev = ctx.pkg;
+      ctx.pkg = entry.pkg || prev;
+      try {
+        return analysePartyExpr(entry.expr, ctx, presence, depth + 1);
+      } finally {
+        ctx.pkg = prev;
+        ctx.rawEnv.set(name, entry);
+      }
+    }
+    return partyFromTerm(term, presence);
+  }
+
+  return partyFromTerm(translateExpr(node, ctx), presence);
+}
+
+/**
+ * A branch inside a party expression. Both shapes translateCase knows are
+ * handled, and each side is walked UNDER ITS OWN CONDITION, so the two
+ * branches contribute disjointly guarded references instead of one unguarded
+ * union (which would over-state the authority) or nothing (which would
+ * under-state the required signatories).
+ */
+function analysePartyCase(cse, ctx, presence, depth) {
+  const scrutExpr = deref(sub(cse, S.Case.scrut), ctx);
+  const alts = subs(cse, S.Case.alts);
+  if (alts.length !== 2) return partyFail(`party expression branching ${alts.length} ways`);
+
+  const noneAlt = alts.find((a) => has(a, S.CaseAlt.optionalNone));
+  const someAlt = alts.find((a) => has(a, S.CaseAlt.optionalSome));
+  const defaultAlt = alts.find((a) => has(a, S.CaseAlt.default));
+  const scrut = translateExpr(scrutExpr, ctx);
+
+  if ((noneAlt || someAlt) && (noneAlt || defaultAlt) && (someAlt || defaultAlt)) {
+    if (!(scrut.k === 'var' && ctx.params.has(scrut.name))) {
+      return partyFail(
+        'party expression matching on an Optional that is not a contract or choice-argument field'
+      );
+    }
+    const p = ctx.params.get(scrut.name);
+    // The same two symbols translateCase uses, so a presence condition
+    // recovered here and a guard recovered there speak about one flag.
+    const present = symbol(ctx, p.root, `${p.path}.$some`, 'Bool');
+    const value = symbol(ctx, p.root, `${p.path}.$value`, 'Real');
+    let some;
+    if (someAlt) {
+      const binder = ctx.pkg.str(
+        int(sub(someAlt, S.CaseAlt.optionalSome), S.OptionalSomeAlt.varBodyInternedStr)
+      );
+      const prev = ctx.env.has(binder) ? ctx.env.get(binder) : undefined;
+      ctx.env.set(binder, value);
+      try {
+        some = analysePartyExpr(sub(someAlt, S.CaseAlt.body), ctx, andPresence(presence, present), depth + 1);
+      } finally {
+        if (prev === undefined) ctx.env.delete(binder);
+        else ctx.env.set(binder, prev);
+      }
+    } else {
+      some = analysePartyExpr(sub(defaultAlt, S.CaseAlt.body), ctx, andPresence(presence, present), depth + 1);
+    }
+    const none = analysePartyExpr(
+      sub(noneAlt || defaultAlt, S.CaseAlt.body),
+      ctx,
+      andPresence(presence, T.app('not', [present])),
+      depth + 1
+    );
+    return mergeParty(some, none);
+  }
+
+  let whenTrue = null;
+  let whenFalse = null;
+  for (const alt of alts) {
+    const body = sub(alt, S.CaseAlt.body);
+    if (has(alt, S.CaseAlt.builtinCon)) {
+      if (int(alt, S.CaseAlt.builtinCon) === BC.CON_TRUE) whenTrue = body;
+      else whenFalse = body;
+    } else if (has(alt, S.CaseAlt.default)) {
+      if (whenTrue === null) whenTrue = body;
+      else whenFalse = body;
+    }
+  }
+  if (!whenTrue || !whenFalse || hasUnsupported(scrut)) {
+    return partyFail('party expression branching on a condition outside the translated fragment');
+  }
+  return mergeParty(
+    analysePartyExpr(whenTrue, ctx, andPresence(presence, scrut), depth + 1),
+    analysePartyExpr(whenFalse, ctx, andPresence(presence, T.app('not', [scrut])), depth + 1)
+  );
+}
+
+/**
+ * The signatory references of every template in the package, keyed by template
+ * NAME - which is how a `create` names its target (createTargetName reads the
+ * TypeConId's dotted name).
+ *
+ * A name declared by two templates is stored as an explicit AMBIGUOUS entry
+ * rather than resolved to the first one: picking either would attach one
+ * template's signatories to the other's create, and a create-authority PROVED
+ * built on that would be exactly the security-relevant lie this property is
+ * supposed to rule out. A name that is not in the table at all (a template
+ * declared in a dependency package) is simply absent, and the property refuses
+ * rather than assuming anything about it.
+ */
+function packageSignatories(raw, bound) {
+  const out = new Map();
+  const seen = new Set();
+  for (const mod of raw.modules) {
+    for (const tpl of mod.templates) {
+      const name = raw.ctx.dname(int(tpl, S.DefTemplate.tyconInternedDname));
+      if (seen.has(name)) {
+        out.set(name, {
+          module: null,
+          refs: [],
+          exact: false,
+          ambiguous: true,
+          why:
+            `more than one template in this package is named \`${name}\`, and a create names its ` +
+            `target by that name alone, so which signatory set applies cannot be decided`,
+        });
+        continue;
+      }
+      seen.add(name);
+      const param = raw.ctx.str(int(tpl, S.DefTemplate.paramInternedStr));
+      const ctx = makeCtx(raw.ctx, {
+        selfParam: param,
+        argParam: null,
+        label: `${name}.signatory`,
+        bound,
+      });
+      out.set(name, { module: mod.name, ...analysePartyExpr(sub(tpl, S.DefTemplate.signatories), ctx) });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Transitions
 // ---------------------------------------------------------------------------
 
@@ -2217,6 +2580,16 @@ export { BF, BINOP, ROUNDING, EXACT_CONVERSION, DIVISION, makeCtx, symbol };
  * @property {Array<{listName: string, index: number}>} listElements
  * @property {number} bound          list length the folds were unrolled to
  * @property {Array<{why: string}>} unsupported
+ * @property {PartyAnalysis} signatories  the party references of the template
+ *   this choice runs on, rooted at `this`.
+ * @property {PartyAnalysis} controllers  the party references of the choice's
+ *   controller clause, rooted at `this` and `arg`. Together with
+ *   `signatories.refs` these are the ACTING AUTHORITY of everything the choice
+ *   does; `exact: false` there costs nothing but coverage, because an
+ *   authority set may be under-approximated but never guessed at.
+ * @property {Map<string, PartyAnalysis>} templateSignatories  every template
+ *   in the package by NAME, so a create's target can be looked up. Shared by
+ *   every transition of one extraction: it is a property of the package.
  */
 
 /**
@@ -2237,6 +2610,10 @@ export { BF, BINOP, ROUNDING, EXACT_CONVERSION, DIVISION, makeCtx, symbol };
 export function extractTransitions(raw, options = {}) {
   const bound =
     Number.isInteger(options.bound) && options.bound >= 0 ? options.bound : DEFAULT_BOUND;
+  // One walk of every template's signatory clause, shared by every transition:
+  // a create's target may be any template in the package, including one whose
+  // own choices are being translated elsewhere in this loop.
+  const templateSignatories = packageSignatories(raw, bound);
   const out = [];
   for (const mod of raw.modules) {
     for (const tpl of mod.templates) {
@@ -2265,6 +2642,20 @@ export function extractTransitions(raw, options = {}) {
         const argParam = argBinder
           ? raw.ctx.str(int(argBinder, S.VarWithType.varInternedStr))
           : null;
+
+        // The controller clause in its OWN context: it contributes to the
+        // acting authority, not to the choice's arithmetic, and sharing a
+        // context would fold its divisions and rounding into the body's.
+        const controllerCtx = makeCtx(raw.ctx, {
+          selfParam,
+          argParam,
+          label: `${template}.${choice}.controller`,
+          bound,
+        });
+        const controllers = analysePartyExpr(
+          sub(choiceMsg, S.TemplateChoice.controllers),
+          controllerCtx
+        );
 
         const ctx = makeCtx(raw.ctx, { selfParam, argParam, label: `${template}.${choice}`, bound });
         // carry the precondition's discovered symbols into this choice
@@ -2308,6 +2699,13 @@ export function extractTransitions(raw, options = {}) {
           listElements: dedupeElements(ctx.listElements),
           bound,
           unsupported,
+          signatories: templateSignatories.get(template) || {
+            refs: [],
+            exact: false,
+            why: `no signatory clause was recovered for ${template}`,
+          },
+          controllers,
+          templateSignatories,
           location: readLocation(choiceMsg, S.TemplateChoice.location, raw.ctx) || tplLocation,
         });
       }
@@ -2326,6 +2724,7 @@ export function extractTransitions(raw, options = {}) {
           precondCtx,
           tplLocation,
           bound,
+          templateSignatories,
           out,
         });
       }
@@ -2409,9 +2808,31 @@ function interfaceInstanceTransitions({
   precondCtx,
   tplLocation,
   bound,
+  templateSignatories,
   out,
 }) {
   const resolved = resolveInterfaceDef(implMsg, raw);
+  const ownSignatories = templateSignatories.get(template) || {
+    refs: [],
+    exact: false,
+    why: `no signatory clause was recovered for ${template}`,
+  };
+  // An INTERFACE choice's controller clause is written over the interface
+  // VIEW, whose fields are computed by the instance's view body and are not
+  // template fields. Mapping `view.admin` back onto `this.<something>` is a
+  // correspondence this translation has not established, and an authority set
+  // is the one place where guessing is unsafe in the direction that matters:
+  // an invented controller AUTHORISES a create. So the controllers are
+  // reported as unrecovered, the authority shrinks to the template's own
+  // signatories, and the property says so on the verdict.
+  const ifaceControllers = {
+    refs: [],
+    exact: false,
+    why:
+      `the choice is an interface choice: its controller clause is expressed over the ` +
+      `interface view, and this translation has not established which template fields the ` +
+      `view fields come from`,
+  };
   const implLocation = readLocation(implMsg, S.Implements.location, raw.ctx) || tplLocation;
 
   // The instance's method bodies live in THIS package regardless of where the
@@ -2448,6 +2869,9 @@ function interfaceInstanceTransitions({
       unmodelledLoopEffects: [],
       listElements: [],
       bound,
+      signatories: ownSignatories,
+      controllers: ifaceControllers,
+      templateSignatories,
       unsupported: [{ why: resolved.error }],
       location: implLocation,
     });
@@ -2519,6 +2943,9 @@ function interfaceInstanceTransitions({
       unmodelledLoopEffects: ctx.unmodelledLoopEffects.slice(),
       listElements: dedupeElements(ctx.listElements),
       bound,
+      signatories: ownSignatories,
+      controllers: ifaceControllers,
+      templateSignatories,
       unsupported,
       location: implLocation,
     });
