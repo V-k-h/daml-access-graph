@@ -197,6 +197,22 @@ function main() {
       // division denominators, say, one being untranslatable) must never print
       // as a bare PROVED: the unchecked ones are unknown, not safe.
       // PROVED-PARTIAL is a distinct status carrying the coverage split.
+      // A counterexample naming an `elem$N` symbol is about an ARBITRARY list
+      // element, not a known one: the fold's real elements may be constrained
+      // by validation the translation cannot see. Sound for PROVED (an
+      // unconstrained element is the universal statement); for DISPROVED it
+      // means "unless every element is constrained elsewhere", so say so.
+      const elems = t.symbolicElements || [];
+      if (elems.length) {
+        const roots = [...new Set(elems.map((e) => e.root))];
+        notes.push(
+          `${roots.length} symbolic list element(s) (${elems
+            .slice(0, 3)
+            .map((e) => `${e.root} for \`${e.param}\``)
+            .join(', ')}${elems.length > 3 ? ', ...' : ''}): results hold for an ARBITRARY element`
+        );
+      }
+
       const cov = inst.coverage;
       const partial = !!(cov && cov.checked < cov.total);
       if (partial) {

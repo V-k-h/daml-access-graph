@@ -265,6 +265,13 @@ function makeCtx(pkg, { selfParam, argParam, label, dispatch = null }) {
     params: new Map(),
     rounding: [],
     divisions: [],
+    /**
+     * Fresh records standing for the elements of a list a higher-order
+     * builtin ranges over. Surfaced on the transition so a verdict can state
+     * that it holds for an arbitrary element rather than a known one.
+     */
+    symbolicElements: [],
+    elementCount: 0,
     depth: 0,
   };
 }
@@ -413,10 +420,43 @@ function translateInner(expr, ctx) {
   const cse = sub(expr, S.Expr.case);
   if (cse) return translateCase(cse, ctx);
 
-  // lambda: translate the body, leaving parameters unbound
+  // An UNAPPLIED lambda: the function argument of a higher-order builtin
+  // (foldl, map, filter). Its parameters are not bound by any application, so
+  // leaving them unbound made every expression inside unreachable - which is
+  // how a whole concentration calculation reduced to `unbound variable
+  // \`entry\``.
+  //
+  // Instead each parameter becomes a FRESH SYMBOLIC ELEMENT record, so a
+  // projection inside the body resolves to `elem$N.field`. For a property
+  // that is universally quantified over the list elements - division safety
+  // being the case that matters - proving it of an unconstrained element IS
+  // the statement "for every element", because the symbol is free in the
+  // query and the solver quantifies over all its values.
+  //
+  // This does NOT model the fold's aggregate: FOLDL itself is still outside
+  // BINOP, so a summed value stays `unsupported` and any property depending
+  // on it is refused. The elements are recorded on the context so a verdict
+  // that relied on one can say so.
   for (const fn of [S.Expr.abs, S.Expr.tyAbs]) {
     const inner = sub(expr, fn);
-    if (inner) return translateExpr(deref(sub(inner, 2), ctx), ctx);
+    if (!inner) continue;
+    if (fn === S.Expr.tyAbs) return translateExpr(deref(sub(inner, 2), ctx), ctx);
+
+    const params = subs(inner, 1);
+    const saved = [];
+    for (const param of params) {
+      const name = pkg.str(int(param, S.VarWithType.varInternedStr));
+      const root = `elem$${ctx.elementCount}`;
+      ctx.elementCount += 1;
+      ctx.symbolicElements.push({ param: name, root, at: ctx.label });
+      saved.push([name, ctx.env.has(name) ? ctx.env.get(name) : undefined]);
+      ctx.env.set(name, T.record(root));
+    }
+    try {
+      return translateExpr(deref(sub(inner, 2), ctx), ctx);
+    } finally {
+      restore(saved, ctx);
+    }
   }
 
   // throw / abort: understood exactly, eliminated by guardConjuncts when it
@@ -969,6 +1009,7 @@ export function extractTransitions(raw) {
           creates,
           divisions: ctx.divisions.map((d) => ({ denominator: d.denominator })),
           rounding: [...new Set(ctx.rounding)],
+          symbolicElements: ctx.symbolicElements.slice(),
           unsupported,
           location: readLocation(choiceMsg, S.TemplateChoice.location, raw.ctx) || tplLocation,
         });

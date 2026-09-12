@@ -714,3 +714,35 @@ test('a zero-capable denominator is refuted, a constant one is proved', { skip: 
   );
   assert.match(runSolver(buildQuery(guarded.guards, guarded.goal).script), /^unsat/m);
 });
+
+test('unapplied lambda parameters become fresh symbolic elements', async () => {
+  // A lambda handed to foldl/map is never applied, so its parameters used to
+  // translate as `unbound variable`, making everything inside unreachable.
+  // Each parameter now stands for an arbitrary element of the list.
+  const { T: Tm, makeCtx } = await import('../backend/lfir.js');
+  assert.ok(Tm.record('elem$0').root === 'elem$0');
+  // the context tracks them so a verdict can disclose the quantification
+  const ctx = makeCtx({ str: () => 'x', dname: () => 'y', internedExprs: [], resolveValue: () => null }, {
+    selfParam: 'this', argParam: 'arg', label: 'T.C',
+  });
+  assert.deepEqual(ctx.symbolicElements, []);
+  assert.equal(ctx.elementCount, 0);
+});
+
+test('an arbitrary element with an unconstrained divisor is refuted', { skip: !SOLVER }, () => {
+  // the ApplyConcentration shape: dividing by a field of a fold element
+  const inst = divisionSafety(
+    transition({ divisions: [{ denominator: v('elem$0.fx') }] })
+  );
+  assert.match(runSolver(buildQuery(inst.guards, inst.goal).script), /^sat/m);
+
+  // constrain that element and the same division is safe: this is why the
+  // verdict must disclose that the element is arbitrary
+  const guarded = divisionSafety(
+    transition({
+      guards: [T.app('>', [v('elem$0.fx'), T.num('0')])],
+      divisions: [{ denominator: v('elem$0.fx') }],
+    })
+  );
+  assert.match(runSolver(buildQuery(guarded.guards, guarded.goal).script), /^unsat/m);
+});
