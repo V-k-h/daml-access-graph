@@ -8,6 +8,8 @@
 //   --property NAME    amount-conservation | division-safety (default: all)
 //   --template NAME    restrict to one template
 //   --choice NAME      restrict to one choice
+//   --bound N          list length to unroll folds and archive loops to
+//                      (default 3); see PROVED-BOUNDED below
 //   --solver BIN       solver binary (default: cvc5; z3 also works)
 //   --keep DIR         keep the generated .smt2 files here
 //   --json             machine-readable report on stdout
@@ -23,10 +25,21 @@
 // Verdict vocabulary, chosen so that silence cannot be mistaken for safety:
 //
 //   PROVED           unsat: no counterexample exists in the model
+//   PROVED-BOUNDED (lists up to length N)
+//                    unsat, but only for lists of at most N elements. A
+//                    transition whose arithmetic folds over a list (a merge
+//                    summing its inputs) is instantiated at every list length
+//                    0..N and one query is emitted per length; all of them
+//                    came back unsat. This says NOTHING about a list of N+1
+//                    elements - not "probably fine", nothing at all - which is
+//                    why it is a status of its own and not a footnote on
+//                    PROVED. Raise it with --bound.
 //   PROVED-PARTIAL   unsat, but only some of the property's obligations
 //                    were inside the fragment; the rest are UNKNOWN, and
 //                    the coverage split is printed
-//   DISPROVED        sat: a concrete counterexample, printed
+//   DISPROVED        sat: a concrete counterexample, printed. For a bounded
+//                    check the list length at which it was found is printed
+//                    with it: the property fails already at that length.
 //   NOT-MODELLABLE   the transition or property leaves the translated fragment;
 //                    the reason is printed
 //   NOT-APPLICABLE   the property does not apply (nonconsuming choice, no
@@ -38,6 +51,7 @@
 //     equalities are refused rather than proved wrongly.
 //   * Guards that leave the fragment are dropped, which is sound for proving
 //     (superset of reachable states) but each drop is listed in the report.
+//   * A PROVED-BOUNDED is a statement about short lists only.
 //   * The translator itself (lfir.js) is tested, not verified.
 
 import { execFileSync } from 'node:child_process';
@@ -46,7 +60,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { readDarRaw } from './dalf.js';
-import { extractTransitions } from './lfir.js';
+import { extractTransitions, DEFAULT_BOUND } from './lfir.js';
 import { PROPERTIES, buildQuery } from './smt.js';
 
 function parseArgs(argv) {
@@ -59,12 +73,14 @@ function parseArgs(argv) {
     keep: null,
     json: false,
     help: false,
+    bound: DEFAULT_BOUND,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--property') args.properties.push(argv[++i]);
     else if (a === '--template') args.template = argv[++i];
     else if (a === '--choice') args.choice = argv[++i];
+    else if (a === '--bound') args.bound = Number.parseInt(argv[++i], 10);
     else if (a === '--solver') args.solver = argv[++i];
     else if (a === '--keep') args.keep = argv[++i];
     else if (a === '--json') args.json = true;
@@ -72,6 +88,7 @@ function parseArgs(argv) {
     else args.dar = a;
   }
   if (args.properties.length === 0) args.properties = Object.keys(PROPERTIES);
+  if (!Number.isInteger(args.bound) || args.bound < 0) args.bound = DEFAULT_BOUND;
   return args;
 }
 
@@ -82,6 +99,7 @@ const USAGE = `Usage: node backend/verify.js <package.dar> [options]
     .join('\n                    ')}
   --template NAME   restrict to one template
   --choice NAME     restrict to one choice
+  --bound N         list length folds/archive loops are unrolled to (default ${DEFAULT_BOUND})
   --solver BIN      solver binary (default: cvc5)
   --keep DIR        keep generated .smt2 files
   --json            machine-readable report`;
@@ -137,7 +155,9 @@ function main() {
   }
 
   const raw = readDarRaw(args.dar);
-  let transitions = extractTransitions(raw);
+  // The bound is fixed at extraction: unrolling a fold reduces its step
+  // function inside the translation context, which does not outlive that call.
+  let transitions = extractTransitions(raw, { bound: args.bound });
   if (args.template) transitions = transitions.filter((t) => t.template === args.template);
   if (args.choice) transitions = transitions.filter((t) => t.choice === args.choice);
 
@@ -167,20 +187,47 @@ function main() {
         });
         continue;
       }
-      let query;
-      try {
-        query = buildQuery(inst.guards, inst.goal);
-      } catch (e) {
-        results.push({ property: propName, transition: label, status: 'NOT-MODELLABLE', why: e.message, ...loc });
+      // A BOUNDED property emits one query per list length: the transition's
+      // arithmetic is a different term at each length, so there is no single
+      // query to ask. All lengths unsat is the bounded verdict; the FIRST sat
+      // is a counterexample AND the length at which the property already
+      // fails, which is strictly more informative than "somewhere <= N".
+      const instances = inst.instances || [{ k: null, guards: inst.guards, goal: inst.goal }];
+      let solved = null;
+      let failed = null;
+      let buildError = null;
+      let solverError = null;
+      const files = [];
+      for (const instance of instances) {
+        const at = instance.k === null ? '' : ` at list length ${instance.k}`;
+        let query;
+        try {
+          query = buildQuery(instance.guards, instance.goal);
+        } catch (e) {
+          buildError = `${e.message}${at}`;
+          break;
+        }
+        try {
+          solved = solve(query.script, args.solver, args.keep);
+        } catch (e) {
+          solverError = `${e.message}${at}`;
+          break;
+        }
+        files.push(solved.file);
+        if (solved.verdict !== 'unsat') {
+          failed = instance;
+          break;
+        }
+      }
+      if (buildError) {
+        results.push({ property: propName, transition: label, status: 'NOT-MODELLABLE', why: buildError, ...loc });
         continue;
       }
-      let solved;
-      try {
-        solved = solve(query.script, args.solver, args.keep);
-      } catch (e) {
-        results.push({ property: propName, transition: label, status: 'SOLVER-ERROR', why: e.message, ...loc });
+      if (solverError) {
+        results.push({ property: propName, transition: label, status: 'SOLVER-ERROR', why: solverError, ...loc });
         continue;
       }
+
       const notes = [];
       if (inst.dropped && inst.dropped.length) {
         notes.push(`${inst.dropped.length} guard(s) dropped (untranslatable ensure/branches) - sound for PROVED, see report`);
@@ -212,6 +259,15 @@ function main() {
             .join(', ')}${elems.length > 3 ? ', ...' : ''}): results hold for an ARBITRARY element`
         );
       }
+      // The bounded check's own disclosure: which list, how far, and - the
+      // point of the design - that the archived inputs are the SAME symbols
+      // the fold produced rather than a second, unrelated family.
+      if (inst.bounded) {
+        notes.push(
+          inst.boundedNote ||
+            `bounded: lists instantiated up to length ${inst.bound} only`
+        );
+      }
 
       const cov = inst.coverage;
       const partial = !!(cov && cov.checked < cov.total);
@@ -223,25 +279,48 @@ function main() {
       }
 
       const note = notes.length ? notes.join('; ') : null;
-      if (solved.verdict === 'unsat') {
+      if (!failed) {
+        // Every instance came back unsat. A bounded run has proved the
+        // property only for the lengths it enumerated, and the status says so
+        // in words rather than in a footnote.
+        const status = partial
+          ? 'PROVED-PARTIAL'
+          : inst.bounded
+            ? `PROVED-BOUNDED (lists up to length ${inst.bound})`
+            : 'PROVED';
         results.push({
           property: propName, transition: label,
-          status: partial ? 'PROVED-PARTIAL' : 'PROVED',
+          status,
+          ...(inst.bounded ? { bound: inst.bound, listName: inst.listName, queries: instances.length } : {}),
           ...(cov ? { coverage: cov } : {}),
           ...(note ? { note } : {}),
           ...loc,
-          smt2: solved.file,
+          smt2: files[files.length - 1],
         });
       } else if (solved.verdict === 'sat') {
         results.push({
           property: propName, transition: label, status: 'DISPROVED',
+          ...(failed.k === null ? {} : { failedAtListLength: failed.k }),
           counterexample: solved.model,
-          ...(note ? { note: `${note}; the counterexample may be excluded by a dropped guard` } : {}),
+          ...(note
+            ? {
+                note:
+                  `${note}${failed.k === null ? '' : `; the property already fails at list length ${failed.k}`}` +
+                  `; the counterexample may be excluded by a dropped guard`,
+              }
+            : failed.k === null
+              ? {}
+              : { note: `the property already fails at list length ${failed.k}` }),
           ...loc,
-          smt2: solved.file,
+          smt2: files[files.length - 1],
         });
       } else {
-        results.push({ property: propName, transition: label, status: 'SOLVER-UNKNOWN', ...loc, smt2: solved.file });
+        results.push({
+          property: propName, transition: label, status: 'SOLVER-UNKNOWN',
+          ...(failed.k === null ? {} : { failedAtListLength: failed.k }),
+          ...loc,
+          smt2: files[files.length - 1],
+        });
       }
     }
   }
@@ -255,8 +334,20 @@ function main() {
       `${raw.name} ${raw.version || ''} (LF 2.${raw.lfMinor}) - ${transitions.length} transition(s)\n` +
       `verdicts: ${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(' ')}\n\n`
     );
-    const order = { DISPROVED: 0, PROVED: 1, 'PROVED-PARTIAL': 1.5, 'SOLVER-UNKNOWN': 2, 'SOLVER-ERROR': 3, 'NOT-MODELLABLE': 4, 'NOT-APPLICABLE': 5 };
-    for (const r of [...results].sort((a, b) => order[a.status] - order[b.status])) {
+    const order = {
+      DISPROVED: 0,
+      PROVED: 1,
+      'PROVED-BOUNDED': 1.2,
+      'PROVED-PARTIAL': 1.5,
+      'SOLVER-UNKNOWN': 2,
+      'SOLVER-ERROR': 3,
+      'NOT-MODELLABLE': 4,
+      'NOT-APPLICABLE': 5,
+    };
+    // PROVED-BOUNDED carries its bound in the status text, so rank on the
+    // part before the parenthesis.
+    const rank = (status) => order[status.split(' (')[0]] ?? 9;
+    for (const r of [...results].sort((a, b) => rank(a.status) - rank(b.status))) {
       if (r.status === 'NOT-APPLICABLE') continue; // summarized above, noise below
       process.stdout.write(`[${r.status}] ${r.property} :: ${r.transition}\n`);
       if (r.location) process.stdout.write(`    at ${r.location}\n`);

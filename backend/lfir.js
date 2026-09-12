@@ -94,6 +94,64 @@ const EXACT_CONVERSION = new Set([BF.INT64_TO_NUMERIC]);
 
 const DIVISION = new Set([BF.DIV_NUMERIC, BF.DIV_INT64, BF.MOD_INT64]);
 
+/**
+ * Builtins that are the IDENTITY on the value they carry.
+ *
+ * COERCE_CONTRACT_ID changes only the phantom type of a contract id, never the
+ * id, so `toInterfaceContractId cid` and `cid` denote the SAME contract.
+ * Modelling it as the identity is exact, and it is what lets the archive loop
+ * of a merge be recognised as archiving the very elements the sum ranges over
+ * (see collectTraversal): the compiled loop archives
+ * `toInterfaceContractId h`, not `h`.
+ */
+const IDENTITY_BUILTIN = new Set([BF.COERCE_CONTRACT_ID]);
+
+/** Default list-length bound for fold/traversal unrolling (`--bound N`). */
+export const DEFAULT_BOUND = 3;
+
+/**
+ * Compiled stdlib functions that traverse a list ELEMENTWISE, IN ORDER, and
+ * WITHOUT changing its length, keyed by the fully qualified name of the
+ * compiled value the application spine resolves to. The name is read out of
+ * the DAR's own value table (resolveValue), not guessed from source.
+ *
+ * WHY THIS TABLE EXISTS. Element symbols are keyed to the LIST THEY RANGE
+ * OVER (listNameOfExpr), and that is the whole reason a merge can be stated
+ * correctly. A compiled merge fetches its inputs with
+ * `tokens <- mapA fetch arg.holdings`, folds over `tokens`, and archives
+ * `arg.holdings`. If `tokens` were named after itself, the fold would speak
+ * about `tokens$i.amount` and the archive loop about `arg.holdings$i`, the
+ * conservation goal would relate two unrelated families of free symbols, and
+ * the solver would hand back a spurious counterexample. Because these
+ * functions preserve length and index, element i of the result IS derived
+ * from element i of the source, so naming both after the source is exact.
+ *
+ * `fn` and `list` are positions in the FLATTENED spine counted from the end,
+ * because the number of dictionary arguments in front varies.
+ *
+ * The table is deliberately limited to shapes VERIFIED against compiled
+ * packages (both entries below occur in canton-tokens.dar and were read out
+ * of it). An unrecognised traversal is not guessed at: the list stays
+ * unnameable and the dependent property refuses.
+ */
+const LIST_TRAVERSALS = new Map([
+  ['DA.Internal.Prelude:mapA', { fn: -2, list: -1 }],
+  ['DA.Foldable:mapA_', { fn: -2, list: -1 }],
+]);
+
+/**
+ * The choice whose exercise is recognised as ARCHIVING its target.
+ *
+ * Only `Archive` qualifies, and the restriction is load-bearing rather than
+ * lazy: conservation with archived inputs states
+ * `sum(created) = this.amount + sum(archived)`. If a choice that does NOT
+ * consume its target were counted as archived, that goal would excuse a
+ * transition which mints the inputs' amounts into the created contract
+ * without consuming them - a spurious PROVED. Every other exercise inside a
+ * traversal therefore keeps the `consumesOthers` refusal.
+ */
+const ARCHIVING_CHOICE = 'Archive';
+
 // --------------------------------------------------------------------- terms
 
 export const T = {
@@ -121,6 +179,21 @@ export const T = {
    * `unsupported` so it can never be asserted or proved over.
    */
   abort: (why) => ({ k: 'abort', why }),
+  /**
+   * A fold over a NAMED list, UNROLLED at every list length 0..bound.
+   *
+   * `unrolled[k]` is the term the fold denotes when the list has exactly k
+   * elements, with element i standing for the record `<listName>$<i>`; the
+   * archive-loop detector produces the same records, so the two agree by
+   * construction rather than by coincidence.
+   *
+   * A fold node NEVER reaches the SMT emitter: a property instantiates it at
+   * one k (instantiateFolds), emits one query per k, and the verdict prints
+   * the bound. Uninstantiated it counts as unsupported everywhere, so a
+   * property that does not know about folds drops it exactly as it dropped
+   * the `builtin FOLDL is outside the fragment` node it replaces.
+   */
+  fold: (listName, op, unrolled) => ({ k: 'fold', listName, op, unrolled }),
   unsupported: (why, at) => ({ k: 'unsupported', why, at }),
 };
 
@@ -131,6 +204,13 @@ export const T = {
 export function hasUnsupported(term) {
   if (!term || typeof term !== 'object') return false;
   if (term.k === 'unsupported' || term.k === 'abort') return true;
+  // An UNINSTANTIATED fold is not a value: it denotes a different term at
+  // every list length. Counting it as unsupported here is what keeps every
+  // property that does not opt into bounded reasoning (division-safety, any
+  // guard) behaving exactly as it did when a fold was a plain `unsupported`
+  // node - it gets dropped or skipped, with the reason reported, never
+  // asserted and never proved over.
+  if (term.k === 'fold') return true;
   if (term.k === 'app') return term.args.some(hasUnsupported);
   if (term.k === 'ite') return [term.c, term.a, term.b].some(hasUnsupported);
   return false;
@@ -141,8 +221,60 @@ export function unsupportedReasons(term, out = []) {
   if (!term || typeof term !== 'object') return out;
   if (term.k === 'unsupported') out.push(term);
   else if (term.k === 'abort') out.push({ k: 'unsupported', why: `abort (${term.why})` });
-  else if (term.k === 'app') term.args.forEach((a) => unsupportedReasons(a, out));
+  else if (term.k === 'fold') {
+    out.push({
+      k: 'unsupported',
+      why:
+        `${term.op} over \`${term.listName}\` used where no list length is fixed; ` +
+        `only a bounded property instantiates it`,
+    });
+  } else if (term.k === 'app') term.args.forEach((a) => unsupportedReasons(a, out));
   else if (term.k === 'ite') [term.c, term.a, term.b].forEach((a) => unsupportedReasons(a, out));
+  return out;
+}
+
+/**
+ * Replace every fold node by its unrolling at list length `k`.
+ *
+ * This is the ONLY way a fold becomes a term the emitter can render, and it
+ * is what makes a bounded verdict mean something precise: the query the
+ * solver saw is the transition's arithmetic for a list of exactly k elements.
+ * A k beyond what the fold was unrolled to is a caller bug and degrades to an
+ * explicit `unsupported` rather than to a silently shorter list.
+ */
+export function instantiateFolds(term, k) {
+  if (!term || typeof term !== 'object') return term;
+  if (term.k === 'fold') {
+    const chosen = term.unrolled[k];
+    if (chosen === undefined) {
+      return T.unsupported(
+        `${term.op} over \`${term.listName}\` was unrolled to ${term.unrolled.length - 1} ` +
+          `element(s), which does not cover list length ${k}`,
+        null
+      );
+    }
+    return instantiateFolds(chosen, k);
+  }
+  if (term.k === 'app') return { ...term, args: term.args.map((a) => instantiateFolds(a, k)) };
+  if (term.k === 'ite') {
+    return {
+      ...term,
+      c: instantiateFolds(term.c, k),
+      a: instantiateFolds(term.a, k),
+      b: instantiateFolds(term.b, k),
+    };
+  }
+  return term;
+}
+
+/** Names of the lists a term folds over, in encounter order. */
+export function foldLists(term, out = new Set()) {
+  if (!term || typeof term !== 'object') return out;
+  if (term.k === 'fold') {
+    out.add(term.listName);
+    term.unrolled.forEach((u) => foldLists(u, out));
+  } else if (term.k === 'app') term.args.forEach((a) => foldLists(a, out));
+  else if (term.k === 'ite') [term.c, term.a, term.b].forEach((a) => foldLists(a, out));
   return out;
 }
 
@@ -214,6 +346,8 @@ export function divisors(term, out = []) {
     term.args.forEach((a) => divisors(a, out));
   } else if (term.k === 'ite') {
     [term.c, term.a, term.b].forEach((a) => divisors(a, out));
+  } else if (term.k === 'fold') {
+    term.unrolled.forEach((u) => divisors(u, out));
   }
   return out;
 }
@@ -226,7 +360,7 @@ export function divisors(term, out = []) {
  * `env` maps an LF variable name to a term, which is how `let` bindings and
  * lambda parameters are resolved without substituting into the protobuf.
  */
-function makeCtx(pkg, { selfParam, argParam, label, dispatch = null }) {
+function makeCtx(pkg, { selfParam, argParam, label, dispatch = null, bound = DEFAULT_BOUND }) {
   const env = new Map();
   if (selfParam) env.set(selfParam, T.record('this'));
   if (argParam) env.set(argParam, T.record('arg'));
@@ -274,8 +408,46 @@ function makeCtx(pkg, { selfParam, argParam, label, dispatch = null }) {
     elementCount: 0,
     /** Effects consuming contracts other than `this` (see collectEffects). */
     consumesOthers: [],
+    /**
+     * Contracts consumed by a loop whose list WE CAN NAME: `{listName, effect}`
+     * meaning "every element of listName is archived". Unlike consumesOthers
+     * these do not refuse the conservation property - they change its
+     * statement, and the amounts they contribute are the very symbols a fold
+     * over the same list produces.
+     */
+    archivedInputs: [],
+    /**
+     * Effects inside a traversal that the per-element modelling cannot carry
+     * (a create per element, say). Recorded separately because they make the
+     * TOTAL over created contracts unstateable, which is a refusal, not a
+     * mere translation gap.
+     */
+    unmodelledLoopEffects: [],
+    /** Set while walking a traversal body: the element the parameter denotes. */
+    loopElement: null,
+    /** List length bound for fold and traversal unrolling. */
+    bound,
+    /** Element records introduced by fold unrolling: {listName, index}. */
+    listElements: [],
+    /** Nesting guard: a fold inside a fold's step is not unrolled. */
+    foldDepth: 0,
+    /** `{fold, index}` while a fold step is being reduced; null otherwise. */
+    foldContext: null,
+    /** Work cap, so a fold-dense choice cannot blow the translation up. */
+    foldBudget: 64,
     depth: 0,
   };
+}
+
+/** Run `f` with ctx.pkg temporarily switched to `pkg`. */
+function withPkg(ctx, pkg, f) {
+  const prev = ctx.pkg;
+  ctx.pkg = pkg || prev;
+  try {
+    return f();
+  } finally {
+    ctx.pkg = prev;
+  }
 }
 
 /** Register (or reuse) a symbolic input for a projection path. */
@@ -838,6 +1010,9 @@ function betaReduce(fun, rawArgs, ctx, depth = 0) {
  */
 function translateBuiltinApp(builtin, args, ctx) {
   if (builtin === BF.ERROR) return T.abort('call to error');
+  // A fold is not a scalar operation: it becomes a node carrying one term per
+  // list length, which a bounded property instantiates. See translateFold.
+  if (builtin === BF.FOLDL || builtin === BF.FOLDR) return translateFold(builtin, args, ctx);
   if (ROUNDING.has(builtin)) ctx.rounding.push(builtinName(builtin));
 
   const translateArg = (a) => {
@@ -863,6 +1038,17 @@ function translateBuiltinApp(builtin, args, ctx) {
     return converted;
   }
 
+  // COERCE_CONTRACT_ID is the identity on the contract id it carries (only the
+  // phantom type changes), so `toInterfaceContractId cid` denotes the same
+  // contract as `cid`. Modelling it as the identity is exact, and it is what
+  // lets an archive loop be matched against the element it archives.
+  if (IDENTITY_BUILTIN.has(builtin)) {
+    if (!args.length) {
+      return T.unsupported(`${builtinName(builtin)} applied to no value`, ctx.label);
+    }
+    return translateArg(args[args.length - 1]);
+  }
+
   const op = BINOP.get(builtin);
   if (!op) return T.unsupported(`builtin ${builtinName(builtin)} is outside the fragment`, ctx.label);
 
@@ -876,7 +1062,13 @@ function translateBuiltinApp(builtin, args, ctx) {
     );
   }
   const term = T.app(op, valueArgs);
-  if (DIVISION.has(builtin)) ctx.divisions.push({ term, denominator: valueArgs[1] });
+  if (DIVISION.has(builtin)) {
+    // A denominator discovered while unrolling a fold step is an obligation
+    // about ONE element of a bounded instantiation, not about the whole list.
+    // Tagging it here is what lets division-safety say PROVED-BOUNDED instead
+    // of overclaiming a PROVED that never looked past element bound-1.
+    ctx.divisions.push({ term, denominator: valueArgs[1], ...(ctx.foldContext || {}) });
+  }
   return term;
 }
 
@@ -920,6 +1112,363 @@ function projectionPath(proj, ctx) {
   return null;
 }
 
+// ------------------------------------------------- naming the lists we fold
+
+/**
+ * The canonical name of a record-projection expression, WITHOUT registering a
+ * symbol for it (unlike the projection case in translateInner, which is about
+ * scalars). `arg.holdings` off the choice argument, `this.contractData.buckets`
+ * off the template record, and a projection off an already-registered symbol
+ * all resolve to the path a list element can be numbered against.
+ */
+function projectionName(expr, ctx) {
+  const proj = sub(expr, S.Expr.recProj);
+  if (!proj) return null;
+  const segments = [];
+  let node = proj;
+  for (let i = 0; i < 16 && node; i++) {
+    if (!has(node, S.RecProj.fieldInternedStr)) return null;
+    segments.unshift(ctx.pkg.str(int(node, S.RecProj.fieldInternedStr)));
+    const record = deref(sub(node, S.RecProj.record), ctx);
+    if (!record) return null;
+    const next = sub(record, S.Expr.recProj);
+    if (next && has(next, S.RecProj.fieldInternedStr)) {
+      node = next;
+      continue;
+    }
+    if (!has(record, S.Expr.varInternedStr)) return null;
+    const bound = ctx.env.get(ctx.pkg.str(int(record, S.Expr.varInternedStr)));
+    if (bound && bound.k === 'record') return `${bound.root}.${segments.join('.')}`;
+    if (bound && bound.k === 'var' && ctx.params.has(bound.name)) {
+      const pth = ctx.params.get(bound.name);
+      return `${pth.root}.${pth.path}.${segments.join('.')}`;
+    }
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Flatten an application spine to `{name, args}`, where `name` is the fully
+ * qualified name of the compiled value at the head (or null) and `args` are
+ * the value arguments in order, each tagged with the package its bytes must be
+ * read against.
+ *
+ * Following value references matters: the compiler wraps a partially applied
+ * stdlib function in a per-module shim (`$$sc_TransferableRecToken_23`, whose
+ * body is `mapA <dict>`), so the head is only visible after the shim is
+ * resolved, and the shim's own arguments belong to the shim's package.
+ */
+function flattenSpine(expr, ctx, depth = 0) {
+  if (!expr || depth > 32) return null;
+  const e = deref(expr, ctx);
+  if (!e) return null;
+
+  const app = sub(e, S.Expr.app);
+  if (app) {
+    const here = many(app, 2)
+      .filter((b) => b instanceof Uint8Array)
+      .map((b) => ({ bytes: b, pkg: ctx.pkg }));
+    const inner = flattenSpine(sub(app, 1), ctx, depth + 1);
+    if (!inner) return null;
+    return { name: inner.name, args: [...inner.args, ...here] };
+  }
+  const ta = sub(e, S.Expr.tyApp);
+  if (ta) return flattenSpine(sub(ta, 1), ctx, depth + 1);
+  const tb = sub(e, S.Expr.tyAbs);
+  if (tb) return flattenSpine(sub(tb, 2), ctx, depth + 1);
+
+  const vr = ctx.pkg.resolveValue(e);
+  if (vr) {
+    const inner = withPkg(ctx, vr.pkg, () => flattenSpine(vr.body, ctx, depth + 1));
+    if (inner && inner.name) return inner;
+    return { name: vr.name, args: [] };
+  }
+  return { name: null, args: [] };
+}
+
+/**
+ * Recognise `mapA f xs` / `mapA_ f xs` and friends (LIST_TRAVERSALS), giving
+ * back the function and the list as tagged raw arguments.
+ */
+function matchTraversal(expr, ctx) {
+  const spine = flattenSpine(expr, ctx);
+  if (!spine || !spine.name) return null;
+  const shape = LIST_TRAVERSALS.get(spine.name);
+  if (!shape) return null;
+  const n = spine.args.length;
+  const fn = spine.args[n + shape.fn];
+  const list = spine.args[n + shape.list];
+  if (!fn || !list) return null;
+  return { name: spine.name, fn, list };
+}
+
+/**
+ * The canonical name of a LIST-valued expression, or null when there is none.
+ *
+ * Refusing to name a list is the honest outcome: element symbols are keyed to
+ * the name, so inventing one would break the identity between a fold's
+ * elements and an archive loop's elements, which is the only thing that makes
+ * merge conservation a true statement rather than a comparison of two
+ * unrelated symbol families.
+ *
+ * Three ways to a name, and nothing else:
+ *   * a projection path (`arg.holdings`);
+ *   * a variable, chased through the expression it was bound to (a do-block
+ *     binder holds the RESULT of its action, which for a traversal is the
+ *     mapped list);
+ *   * an index-preserving traversal, named after its SOURCE list.
+ */
+function listNameOfExpr(expr, ctx, depth = 0) {
+  if (!expr || depth > 12) return null;
+  const e = deref(expr, ctx);
+  if (!e) return null;
+
+  const direct = projectionName(e, ctx);
+  if (direct) return direct;
+
+  if (has(e, S.Expr.varInternedStr)) {
+    const name = ctx.pkg.str(int(e, S.Expr.varInternedStr));
+    const entry = ctx.rawEnv.get(name);
+    if (!entry || !entry.expr) return null;
+    // guard against a binding that refers to itself
+    ctx.rawEnv.delete(name);
+    try {
+      return withPkg(ctx, entry.pkg, () => listNameOfExpr(entry.expr, ctx, depth + 1));
+    } finally {
+      ctx.rawEnv.set(name, entry);
+    }
+  }
+
+  const ta = sub(e, S.Expr.tyApp);
+  if (ta) return listNameOfExpr(sub(ta, 1), ctx, depth + 1);
+  const tb = sub(e, S.Expr.tyAbs);
+  if (tb) return listNameOfExpr(sub(tb, 2), ctx, depth + 1);
+
+  const tr = matchTraversal(e, ctx);
+  if (tr) {
+    return withPkg(ctx, tr.list.pkg, () =>
+      listNameOfExpr(decodeExpr(tr.list.bytes), ctx, depth + 1)
+    );
+  }
+  return null;
+}
+
+// ------------------------------------------------------------ folds, unrolled
+
+/**
+ * Apply a compiled function to IR TERMS, rather than to raw argument
+ * expressions the way betaReduce does.
+ *
+ * The fold unroller needs exactly this: the accumulator at step i is a term it
+ * built, and the element is a symbolic record it named - neither exists as an
+ * expression in the package, so there is nothing to hand betaReduce. The rest
+ * is the same small reducer (value references followed into their own package,
+ * type layers and lets stepped through, a partial application contributing its
+ * own arguments ahead of the terms), and it is TOTAL in the same sense:
+ * anything it cannot reduce becomes an explicit `unsupported`.
+ *
+ * `onBody`, when given, is called with the fully applied body INSTEAD of
+ * translating it, with the parameter bindings and the package still in place.
+ * That is how the archive-loop walker gets to run collectEffects under the
+ * traversal's parameter binding.
+ */
+function applyToTerms(fn, terms, ctx, depth = 0, onBody = null) {
+  if (!fn) return T.unsupported('function applied to terms is missing', ctx.label);
+  if (depth > 32) {
+    return T.unsupported('function nested deeper than the term-applier follows', ctx.label);
+  }
+  const e = deref(fn, ctx);
+  if (!e) return T.unsupported('function applied to terms is missing', ctx.label);
+
+  const vr = ctx.pkg.resolveValue(e);
+  if (vr) {
+    ctx.inlining = ctx.inlining || new Set();
+    if (ctx.inlining.has(vr.key)) {
+      return T.unsupported(`recursive value ${vr.name} applied to terms`, ctx.label);
+    }
+    ctx.inlining.add(vr.key);
+    try {
+      return withPkg(ctx, vr.pkg, () => applyToTerms(vr.body, terms, ctx, depth + 1, onBody));
+    } finally {
+      ctx.inlining.delete(vr.key);
+    }
+  }
+
+  const tb = sub(e, S.Expr.tyAbs);
+  if (tb) return applyToTerms(sub(tb, 2), terms, ctx, depth + 1, onBody);
+  const ta = sub(e, S.Expr.tyApp);
+  if (ta) return applyToTerms(sub(ta, 1), terms, ctx, depth + 1, onBody);
+
+  const block = sub(e, S.Expr.let);
+  if (block) {
+    const saved = bindBlock(block, ctx);
+    try {
+      return applyToTerms(sub(block, S.Block.body), terms, ctx, depth + 1, onBody);
+    } finally {
+      restore(saved, ctx);
+    }
+  }
+
+  const app = sub(e, S.Expr.app);
+  if (app) {
+    // a partial application in front of the lambda: its arguments are
+    // translated here (in their own package) and go ahead of the terms
+    const pre = many(app, 2)
+      .filter((b) => b instanceof Uint8Array)
+      .map((b) => translateExpr(decodeExpr(b), ctx));
+    return applyToTerms(sub(app, 1), [...pre, ...terms], ctx, depth + 1, onBody);
+  }
+
+  const abs = sub(e, S.Expr.abs);
+  if (!abs) {
+    if (has(e, S.Expr.builtin)) {
+      return T.unsupported(
+        `builtin ${builtinName(int(e, S.Expr.builtin))} used where a lambda was expected`,
+        ctx.label
+      );
+    }
+    return T.unsupported(
+      'function applied to terms is not a lambda the translation can reduce',
+      ctx.label
+    );
+  }
+
+  const params = subs(abs, 1);
+  const saved = [];
+  const savedRaw = [];
+  params.forEach((param, i) => {
+    const name = ctx.pkg.str(int(param, S.VarWithType.varInternedStr));
+    saved.push([name, ctx.env.has(name) ? ctx.env.get(name) : undefined]);
+    savedRaw.push([name, ctx.rawEnv.has(name) ? ctx.rawEnv.get(name) : undefined]);
+    ctx.env.set(
+      name,
+      i < terms.length
+        ? terms[i]
+        : T.unsupported(`parameter \`${name}\` applied to nothing`, ctx.label)
+    );
+    // a term-bound parameter has no raw expression behind it; a stale one
+    // would let recordFields chase the WRONG record
+    ctx.rawEnv.delete(name);
+  });
+  const undo = () => {
+    restore(saved, ctx);
+    for (const [name, prev] of savedRaw.reverse()) {
+      if (prev === undefined) ctx.rawEnv.delete(name);
+      else ctx.rawEnv.set(name, prev);
+    }
+  };
+  try {
+    const body = deref(sub(abs, 2), ctx);
+    const rest = terms.slice(params.length);
+    if (rest.length) return applyToTerms(body, rest, ctx, depth + 1, onBody);
+    return onBody ? onBody(body) : translateExpr(body, ctx);
+  } finally {
+    undo();
+  }
+}
+
+/**
+ * FOLDL / FOLDR over a NAMED list, unrolled at every list length 0..bound.
+ *
+ * The fold is instantiated at k = 0..bound and the step function is applied k
+ * times, threading the accumulator; element i is the record
+ * `<listName>$<i>`, so a projection inside the step yields
+ * `arg.holdings$0.amount` and the archive-loop detector, keying off the same
+ * list, yields the same symbol. That identity is the point of the whole
+ * exercise: model the archived contracts as unrelated symbols and merge
+ * conservation degenerates into `this + sum(A) = this + sum(B)`, which is
+ * satisfiable, and the report says DISPROVED about a transition that is
+ * perfectly correct.
+ *
+ * A bounded result is NOT a proof about arbitrary lists, and the verdict says
+ * so out loud (see verify.js: PROVED-BOUNDED).
+ *
+ * Refusals, all explicit:
+ *   * a list with no canonical name (elements could not be shared);
+ *   * a fold inside another fold's step (the unroller does not nest);
+ *   * the per-choice unrolling budget;
+ *   * a step body that leaves the fragment - the unrolled term carries the
+ *     `unsupported` node and the property refuses with its reason.
+ */
+function translateFold(builtin, args, ctx) {
+  const op = builtin === BF.FOLDL ? 'foldl' : 'foldr';
+  if (args.length < 3) {
+    return T.unsupported(
+      `${builtinName(builtin)} applied to ${args.length} argument(s); only a fully applied ` +
+        `fold is unrolled`,
+      ctx.label
+    );
+  }
+  const [fnArg, initArg, listArg] = args.slice(-3);
+  const listName = withPkg(ctx, listArg.pkg, () =>
+    listNameOfExpr(decodeExpr(listArg.bytes), ctx)
+  );
+  if (!listName) {
+    return T.unsupported(
+      `${builtinName(builtin)} over a list with no canonical name: its elements cannot be ` +
+        `identified with the contracts the choice archives, and inventing names for them ` +
+        `would relate unrelated symbols`,
+      ctx.label
+    );
+  }
+  if (ctx.foldDepth > 0) {
+    return T.unsupported(
+      `${builtinName(builtin)} over \`${listName}\` inside another fold's step; the unroller ` +
+        `does not nest`,
+      ctx.label
+    );
+  }
+  if (ctx.foldBudget <= 0) {
+    return T.unsupported(
+      `fold unrolling budget exhausted on this choice before ${builtinName(builtin)} over ` +
+        `\`${listName}\``,
+      ctx.label
+    );
+  }
+  ctx.foldBudget -= 1;
+
+  const init = withPkg(ctx, initArg.pkg, () => translateExpr(decodeExpr(initArg.bytes), ctx));
+  const element = (i) => {
+    ctx.listElements.push({ listName, index: i });
+    return T.record(`${listName}$${i}`);
+  };
+  const step = (terms, index) => {
+    const savedFoldContext = ctx.foldContext;
+    ctx.foldContext = { fold: listName, index };
+    try {
+      return withPkg(ctx, fnArg.pkg, () => applyToTerms(decodeExpr(fnArg.bytes), terms, ctx));
+    } finally {
+      ctx.foldContext = savedFoldContext;
+    }
+  };
+
+  const unrolled = [init];
+  ctx.foldDepth += 1;
+  try {
+    if (op === 'foldl') {
+      // foldl f z [e0..e(k-1)] = f (... (f z e0) ...) e(k-1): each prefix is
+      // the previous one extended, so k applications give every k at once.
+      let acc = init;
+      for (let i = 0; i < ctx.bound; i++) {
+        acc = step([acc, element(i)], i);
+        unrolled.push(acc);
+      }
+    } else {
+      // foldr f z [e0..e(k-1)] = f e0 (f e1 (... (f e(k-1) z))): the innermost
+      // application depends on k, so each length is built from the right.
+      for (let k = 1; k <= ctx.bound; k++) {
+        let acc = init;
+        for (let i = k - 1; i >= 0; i--) acc = step([element(i), acc], i);
+        unrolled.push(acc);
+      }
+    }
+  } finally {
+    ctx.foldDepth -= 1;
+  }
+  return T.fold(listName, op, unrolled);
+}
+
 function builtinName(n) {
   for (const [k, v] of Object.entries(BF)) if (v === n) return k;
   return `builtin#${n}`;
@@ -941,6 +1490,15 @@ export { BF, BINOP, ROUNDING, EXACT_CONVERSION, DIVISION, makeCtx, symbol };
  * @property {Array<{template: string, fields: Record<string, Term>, path: Term[]}>} creates
  * @property {Array<{denominator: Term, path: Term[]}>} divisions
  * @property {string[]} rounding    rounding/truncating builtins seen on the path
+ * @property {Array<{listName: string, effect: string}>} archivedInputs
+ *   contracts the choice consumes BESIDES `this`, identified as "every element
+ *   of listName". Their amounts are the same `<listName>$<i>.amount` symbols a
+ *   fold over the same list produces, which is what lets merge conservation be
+ *   stated instead of refused.
+ * @property {Array<{why: string}>} unmodelledLoopEffects  effects inside a
+ *   traversal that per-element modelling cannot carry; a refusal, not a gap.
+ * @property {Array<{listName: string, index: number}>} listElements
+ * @property {number} bound          list length the folds were unrolled to
  * @property {Array<{why: string}>} unsupported
  */
 
@@ -953,9 +1511,15 @@ export { BF, BINOP, ROUNDING, EXACT_CONVERSION, DIVISION, makeCtx, symbol };
  * else e` narrows the successful path to `not c` rather than being dropped.
  *
  * @param {{ctx: Object, modules: Array}} raw  from dalf.readDarRaw
+ * @param {{bound?: number}} [options]  list-length bound for fold and
+ *   traversal unrolling (verify.js `--bound N`, default DEFAULT_BOUND). It is
+ *   fixed at EXTRACTION time because unrolling a fold means reducing its step
+ *   function inside the translation context, which does not outlive this call.
  * @returns {Transition[]}
  */
-export function extractTransitions(raw) {
+export function extractTransitions(raw, options = {}) {
+  const bound =
+    Number.isInteger(options.bound) && options.bound >= 0 ? options.bound : DEFAULT_BOUND;
   const out = [];
   for (const mod of raw.modules) {
     for (const tpl of mod.templates) {
@@ -972,6 +1536,7 @@ export function extractTransitions(raw) {
         selfParam,
         argParam: null,
         label: `${template}.ensure`,
+        bound,
       });
       const precondExpr = sub(tpl, S.DefTemplate.precond);
       const precond = precondExpr ? translateExpr(precondExpr, precondCtx) : null;
@@ -984,7 +1549,7 @@ export function extractTransitions(raw) {
           ? raw.ctx.str(int(argBinder, S.VarWithType.varInternedStr))
           : null;
 
-        const ctx = makeCtx(raw.ctx, { selfParam, argParam, label: `${template}.${choice}` });
+        const ctx = makeCtx(raw.ctx, { selfParam, argParam, label: `${template}.${choice}`, bound });
         // carry the precondition's discovered symbols into this choice
         for (const [k, v] of precondCtx.params) ctx.params.set(k, v);
 
@@ -1009,10 +1574,17 @@ export function extractTransitions(raw) {
           params: [...ctx.params.values()],
           guards: [...ensureGuards],
           creates,
-          divisions: ctx.divisions.map((d) => ({ denominator: d.denominator })),
+          divisions: ctx.divisions.map((d) => ({
+            denominator: d.denominator,
+            ...(d.fold ? { fold: d.fold, index: d.index } : {}),
+          })),
           rounding: [...new Set(ctx.rounding)],
           symbolicElements: ctx.symbolicElements.slice(),
           consumesOthers: ctx.consumesOthers.slice(),
+          archivedInputs: dedupeArchived(ctx.archivedInputs),
+          unmodelledLoopEffects: ctx.unmodelledLoopEffects.slice(),
+          listElements: dedupeElements(ctx.listElements),
+          bound,
           unsupported,
           location: readLocation(choiceMsg, S.TemplateChoice.location, raw.ctx) || tplLocation,
         });
@@ -1031,6 +1603,7 @@ export function extractTransitions(raw) {
           ensureGuards,
           precondCtx,
           tplLocation,
+          bound,
           out,
         });
       }
@@ -1113,6 +1686,7 @@ function interfaceInstanceTransitions({
   ensureGuards,
   precondCtx,
   tplLocation,
+  bound,
   out,
 }) {
   const resolved = resolveInterfaceDef(implMsg, raw);
@@ -1147,6 +1721,10 @@ function interfaceInstanceTransitions({
       creates: [],
       divisions: [],
       rounding: [],
+      archivedInputs: [],
+      unmodelledLoopEffects: [],
+      listElements: [],
+      bound,
       unsupported: [{ why: resolved.error }],
       location: implLocation,
     });
@@ -1175,6 +1753,7 @@ function interfaceInstanceTransitions({
       argParam,
       label,
       dispatch: { methods },
+      bound,
     });
     // The template's own parameter names the same record once dispatch enters
     // the implementing package's method bodies.
@@ -1204,14 +1783,38 @@ function interfaceInstanceTransitions({
       params: [...ctx.params.values()],
       guards: [...ensureGuards],
       creates,
-      divisions: ctx.divisions.map((d) => ({ denominator: d.denominator })),
+      divisions: ctx.divisions.map((d) => ({
+        denominator: d.denominator,
+        ...(d.fold ? { fold: d.fold, index: d.index } : {}),
+      })),
       rounding: [...new Set(ctx.rounding)],
       symbolicElements: ctx.symbolicElements.slice(),
       consumesOthers: ctx.consumesOthers.slice(),
+      archivedInputs: dedupeArchived(ctx.archivedInputs),
+      unmodelledLoopEffects: ctx.unmodelledLoopEffects.slice(),
+      listElements: dedupeElements(ctx.listElements),
+      bound,
       unsupported,
       location: implLocation,
     });
   }
+}
+
+/**
+ * One entry per (list, effect): an archive loop is walked once and stands for
+ * every element, so repeating it would suggest a count the walk never made.
+ */
+function dedupeArchived(entries) {
+  const seen = new Map();
+  for (const e of entries || []) seen.set(`${e.listName}\u0000${e.effect}`, e);
+  return [...seen.values()];
+}
+
+/** One entry per (list, index) element record introduced by fold unrolling. */
+function dedupeElements(entries) {
+  const seen = new Map();
+  for (const e of entries || []) seen.set(`${e.listName}\u0000${e.index}`, e);
+  return [...seen.values()];
 }
 
 /**
@@ -1331,6 +1934,14 @@ function collectEffects(expr, ctx, path, creates, unsupported, depth = 0) {
     if (app) {
       const before = creates.length + unsupported.length;
 
+      // A traversal over a list WE CAN NAME is walked with its parameter bound
+      // to an element of that list, so a consuming effect inside it is
+      // recorded as archiving the elements of THAT list - the same symbols a
+      // fold over the same list produces. Tried before beta reduction, which
+      // would inline the traversal into an opaque dictionary application and
+      // lose the connection to the list.
+      if (collectTraversal(expr, ctx, path, creates, unsupported, depth)) return;
+
       // Beta reduce first: the choice body is a hoisted worker applied to
       // `this` / `self` / `arg`, so without this the creates are unreachable.
       const rawArgs = many(app, 2).filter((v) => v instanceof Uint8Array);
@@ -1419,12 +2030,125 @@ function collectEffects(expr, ctx, path, creates, unsupported, depth = 0) {
     if (has(update, field)) {
       unsupported.push({ why: `${label} in the choice body is outside the modelled fragment` });
       if (CONSUMING_EFFECTS.has(field) && ctx.consumesOthers) {
-        ctx.consumesOthers.push({ effect: label });
+        // Inside a traversal over a named list, an `Archive` exercise ON THE
+        // ELEMENT is an archived input we can state; anything else keeps the
+        // refusal. See ARCHIVING_CHOICE for why the choice name is checked
+        // rather than assumed.
+        const archived = archivedElement(update, field, ctx);
+        if (archived) ctx.archivedInputs.push({ listName: archived.listName, effect: label });
+        else ctx.consumesOthers.push({ effect: label });
       }
       return;
     }
   }
   unsupported.push({ why: 'unrecognised ledger effect' });
+}
+
+/**
+ * Walk a list traversal (`mapA f xs`, `mapA_ f xs`) whose list has a canonical
+ * name, with `f`'s parameter bound to an ELEMENT of that list.
+ *
+ * This is the archived-input half of the merge story. The compiled archive
+ * loop is `mapA_ (\cid -> exercise Archive (toInterfaceContractId cid))
+ * arg.holdings`; walked this way, the exercised contract id reduces to the
+ * element record `arg.holdings$*`, so the effect is recorded as "every element
+ * of arg.holdings is archived" rather than as an unidentified consuming
+ * effect. The amounts it contributes are then the same `arg.holdings$i.amount`
+ * symbols the fold over the same list produced.
+ *
+ * The element is a single marker rather than one record per index: the
+ * traversal applies f to EVERY element, so what the walk establishes is
+ * uniform in i, and the property expands it to indices 0..k-1 at each bound.
+ *
+ * Returns false (and changes nothing) when the shape is not a recognised
+ * traversal, when its list cannot be named, or when the function cannot be
+ * applied - in every one of those cases the caller falls back to the existing
+ * descent, which ends in the `consumesOthers` refusal.
+ *
+ * A create inside the loop is NOT modelled: there would be one per element,
+ * and no total over the created contracts could be stated. That is recorded
+ * as a refusal (`unmodelledLoopEffects`), never dropped.
+ */
+function collectTraversal(expr, ctx, path, creates, unsupported, depth) {
+  if (!ctx.archivedInputs) return false;
+  if (ctx.loopElement) return false; // one element family at a time
+  const tr = matchTraversal(expr, ctx);
+  if (!tr) return false;
+  const listName = withPkg(ctx, tr.list.pkg, () =>
+    listNameOfExpr(decodeExpr(tr.list.bytes), ctx)
+  );
+  if (!listName) return false;
+  const fnExpr = decodeExpr(tr.fn.bytes);
+  if (!fnExpr) return false;
+
+  // `$*` rather than an index: the walk establishes what happens to an
+  // ARBITRARY element, uniformly in i. Recorded as a symbolic element so a
+  // verdict that leaned on arithmetic inside the loop discloses the
+  // quantification, exactly as it does for an unapplied lambda's parameters.
+  const marker = `${listName}$*`;
+  ctx.symbolicElements.push({ param: `an element of ${listName}`, root: marker, at: ctx.label });
+  const loopCreates = [];
+  const loopUnsupported = [];
+  let entered = false;
+  const savedLoop = ctx.loopElement;
+  ctx.loopElement = { listName, marker };
+  try {
+    withPkg(ctx, tr.fn.pkg, () =>
+      applyToTerms(fnExpr, [T.record(marker)], ctx, 0, (body) => {
+        entered = true;
+        collectEffects(body, ctx, path, loopCreates, loopUnsupported, depth + 1);
+        return T.bool(true);
+      })
+    );
+  } finally {
+    ctx.loopElement = savedLoop;
+  }
+  if (!entered) return false;
+
+  for (const u of loopUnsupported) unsupported.push(u);
+  if (loopCreates.length) {
+    const why =
+      `${loopCreates.length} create(s) inside a traversal over \`${listName}\`: one create ` +
+      `PER ELEMENT is not modelled, so no total over the created contracts can be stated`;
+    ctx.unmodelledLoopEffects.push({ why });
+    unsupported.push({ why });
+  }
+  return true;
+}
+
+/**
+ * Is this consuming effect the archival of the element the enclosing traversal
+ * is walking? Returns `{listName}` when it is, null otherwise.
+ *
+ * Both halves are checked, because assuming either would be unsound:
+ *   * the exercised contract id must reduce to the loop's element (an exercise
+ *     on some other, fixed contract inside a loop archives one contract, not
+ *     one per element);
+ *   * the choice must be `Archive` (a nonconsuming choice archives nothing,
+ *     and counting it as archived would license minting the inputs' amounts
+ *     into the created contract - see ARCHIVING_CHOICE).
+ */
+function archivedElement(update, field, ctx) {
+  if (!ctx.loopElement) return null;
+  const caseMsg = sub(update, field);
+  if (!caseMsg) return null;
+  const spec = S.UPDATE_OPS[field];
+  const choiceField = spec && spec.choiceField;
+  if (choiceField === undefined || !has(caseMsg, choiceField)) return null;
+  if (ctx.pkg.str(int(caseMsg, choiceField)) !== ARCHIVING_CHOICE) return null;
+  // exerciseByKey names its target by key, not by contract id, so there is
+  // nothing to match the loop element against: it stays an unidentified
+  // consuming effect.
+  const CID_MESSAGE = {
+    [S.Update.exercise]: 'Update.Exercise',
+    [S.Update.exerciseInterface]: 'Update.ExerciseInterface',
+  };
+  if (!CID_MESSAGE[field]) return null;
+  const cidField = S.message(CID_MESSAGE[field]).cid;
+  if (cidField === undefined || !has(caseMsg, cidField)) return null;
+  const cid = translateExpr(sub(caseMsg, cidField), ctx);
+  if (!(cid && cid.k === 'record' && cid.root === ctx.loopElement.marker)) return null;
+  return { listName: ctx.loopElement.listName };
 }
 
 /**

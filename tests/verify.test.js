@@ -14,11 +14,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdtempSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { T, hasUnsupported, unsupportedReasons, divisors } from '../backend/lfir.js';
+import {
+  T,
+  hasUnsupported,
+  unsupportedReasons,
+  divisors,
+  instantiateFolds,
+  foldLists,
+  DEFAULT_BOUND,
+} from '../backend/lfir.js';
 import {
   termToSmt,
   inferSorts,
@@ -260,7 +268,7 @@ function runSolver(script) {
 
 import { decodeMessage } from '../backend/protobuf.js';
 import * as S from '../backend/lf2-schema.js';
-import { decodeDalfRaw } from '../backend/dalf.js';
+import { decodeDalfRaw, readDarRaw } from '../backend/dalf.js';
 import {
   guardConjuncts,
   translateExpr,
@@ -784,3 +792,649 @@ test('a self-contained split is unaffected by the consuming-others rule', () => 
   });
   assert.equal(amountConservation(t).applicable, true);
 });
+
+// ===========================================================================
+// Bounded folds, archived inputs, and the symbol identity they turn on
+// ===========================================================================
+//
+// The design point these tests exist to protect: merge conservation is
+// `sum(created) = this.amount + sum(archived)`, and it is only a TRUE
+// statement if the elements the fold sums and the elements the choice
+// archives are THE SAME SYMBOLS. Key them independently - A0..Ak for the fold,
+// B0..Bk for the archive loop - and the goal becomes `this + sum(A) =
+// this + sum(B)`, which is satisfiable, and a correct merge is reported
+// DISPROVED. Every test below is either about producing that identity or
+// about refusing when it cannot be produced.
+
+const fold = (listName, op, unrolled) => T.fold(listName, op, unrolled);
+
+test('instantiateFolds picks the unrolling for the list length asked for', () => {
+  const f = fold('arg.holdings', 'foldl', [
+    T.num('0'),
+    v('arg.holdings$0.amount'),
+    plus(v('arg.holdings$0.amount'), v('arg.holdings$1.amount')),
+  ]);
+  const term = plus(v('this.amount'), f);
+  assert.equal(termToSmt(instantiateFolds(term, 0)), '(+ |this.amount| 0)');
+  assert.equal(termToSmt(instantiateFolds(term, 1)), '(+ |this.amount| |arg.holdings$0.amount|)');
+  assert.equal(
+    termToSmt(instantiateFolds(term, 2)),
+    '(+ |this.amount| (+ |arg.holdings$0.amount| |arg.holdings$1.amount|))'
+  );
+  // beyond the unrolling: an explicit refusal, never a silently shorter list
+  const over = instantiateFolds(term, 3);
+  assert.equal(hasUnsupported(over), true);
+  assert.match(unsupportedReasons(over)[0].why, /does not cover list length 3/);
+});
+
+test('an uninstantiated fold counts as unsupported everywhere it could be asserted', () => {
+  // This is what keeps every property that does not opt into bounded
+  // reasoning behaving exactly as it did when a fold was `builtin FOLDL is
+  // outside the fragment`: dropped or skipped, with a reason, never asserted.
+  const f = fold('arg.xs', 'foldl', [T.num('0'), v('arg.xs$0.amount')]);
+  assert.equal(hasUnsupported(f), true);
+  assert.match(unsupportedReasons(f)[0].why, /foldl over `arg\.xs`/);
+  assert.throws(() => termToSmt(f), /uninstantiated foldl over `arg\.xs`/);
+
+  // a guard carrying one is dropped, and the drop is reported
+  const { used, dropped } = usableGuards(transition({ guards: [T.app('>', [f, T.num('0')])] }));
+  assert.deepEqual(used, []);
+  assert.match(dropped[0][0], /foldl over `arg\.xs`/);
+
+  // a denominator carrying one is skipped, not silently proved
+  const inst = divisionSafety(transition({ divisions: [{ denominator: f }] }));
+  assert.equal(inst.applicable, false);
+  assert.equal(inst.notModellable, true);
+});
+
+test('foldLists names the lists a term folds over', () => {
+  const f1 = fold('arg.a', 'foldl', [T.num('0')]);
+  const f2 = fold('arg.b', 'foldr', [T.num('0')]);
+  assert.deepEqual([...foldLists(plus(f1, f2))], ['arg.a', 'arg.b']);
+  assert.deepEqual([...foldLists(v('x'))], []);
+});
+
+// ------------------------------------------- the merge statement, synthetic
+
+/** `create this with amount = this.amount + foldl (+) 0 <list>`, archiving <list>. */
+function mergeTransition(overrides = {}) {
+  const listName = overrides.listName || 'arg.holdings';
+  const bound = overrides.bound ?? 3;
+  const unrolled = [T.num('0')];
+  for (let i = 0; i < bound; i++) {
+    unrolled.push(plus(unrolled[i], v(`${listName}$${i}.amount`)));
+  }
+  return transition({
+    bound,
+    creates: [
+      {
+        template: 'Tok',
+        base: 'this',
+        fields: { amount: plus(v('this.amount'), fold(listName, 'foldl', unrolled)) },
+        path: [],
+      },
+    ],
+    archivedInputs: [{ listName: overrides.archivedList || listName, effect: 'exercise (interface)' }],
+    unmodelledLoopEffects: [],
+    ...overrides,
+  });
+}
+
+test('conservation states the merge form: created = this.amount + the archived amounts', () => {
+  const inst = amountConservation(mergeTransition());
+  assert.equal(inst.applicable, true);
+  assert.equal(inst.bounded, true);
+  assert.equal(inst.bound, 3);
+  assert.equal(inst.listName, 'arg.holdings');
+  assert.equal(inst.instances.length, 4, 'one query per list length 0..3');
+  assert.deepEqual(inst.instances.map((i) => i.k), [0, 1, 2, 3]);
+
+  // k = 0: no elements on either side
+  assert.equal(termToSmt(inst.instances[0].goal), '(= (+ |this.amount| 0) |this.amount|)');
+  // k = 2: the fold's two elements on the left, the archived two on the right
+  assert.equal(
+    termToSmt(inst.instances[2].goal),
+    '(= (+ |this.amount| (+ (+ 0 |arg.holdings$0.amount|) |arg.holdings$1.amount|)) ' +
+      '(+ |this.amount| |arg.holdings$0.amount| |arg.holdings$1.amount|))'
+  );
+});
+
+/** Every `|...|` symbol in a rendered query, as a Set. */
+const symbolsOf = (smt) => new Set([...smt.matchAll(/\|([^|]+)\|/g)].map((m) => m[1]));
+
+test('the fold elements and the archived elements are THE SAME symbols', () => {
+  // THE test this whole design exists for. Not "the two sides are equal by
+  // some algebra" - they are the same free variables, so no model can make
+  // them differ, at any list length.
+  const inst = amountConservation(mergeTransition());
+  for (const i of inst.instances) {
+    const [lhs, rhs] = i.goal.args;
+    const left = [...symbolsOf(termToSmt(lhs))].filter((n) => n.includes('$'));
+    const right = [...symbolsOf(termToSmt(rhs))].filter((n) => n.includes('$'));
+    assert.deepEqual(
+      left.sort(),
+      right.sort(),
+      `at list length ${i.k} the two sides must name the same elements`
+    );
+    assert.equal(left.length, i.k, `list length ${i.k} must mention exactly ${i.k} element(s)`);
+    for (const n of left) assert.match(n, /^arg\.holdings\$\d+\.amount$/);
+  }
+});
+
+test('cvc5 proves the merge at every bounded list length', { skip: !SOLVER }, () => {
+  const inst = amountConservation(mergeTransition());
+  for (const i of inst.instances) {
+    const out = runSolver(buildQuery(i.guards, i.goal).script);
+    assert.match(out, /^unsat/m, `list length ${i.k} should be unsat`);
+  }
+});
+
+test('a mismatched-symbol model of the SAME merge is refuted by cvc5', { skip: !SOLVER }, () => {
+  // The bug the list-keyed naming prevents, written out. If the archived
+  // inputs were modelled as a second family of symbols (B0, B1) instead of
+  // the ones the fold produced (arg.holdings$i.amount), the goal is
+  // satisfiable and a correct merge comes back DISPROVED.
+  const shared = eq(
+    plus(v('this.amount'), plus(v('arg.holdings$0.amount'), v('arg.holdings$1.amount'))),
+    plus(v('this.amount'), plus(v('arg.holdings$0.amount'), v('arg.holdings$1.amount')))
+  );
+  assert.match(runSolver(buildQuery([], shared).script), /^unsat/m);
+
+  const mismatched = eq(
+    plus(v('this.amount'), plus(v('arg.holdings$0.amount'), v('arg.holdings$1.amount'))),
+    plus(v('this.amount'), plus(v('archived$0.amount'), v('archived$1.amount')))
+  );
+  const out = runSolver(buildQuery([], mismatched).script);
+  assert.match(out, /^sat/m, 'unrelated symbols must be satisfiable - i.e. a spurious DISPROVED');
+});
+
+test('conservation refuses an archived list the created amounts never fold over', () => {
+  // Adding `sum(L$i.amount)` for a list nothing else mentions would invent a
+  // family of unconstrained symbols (spurious DISPROVED); leaving it out would
+  // assume the archived contracts carry no amount (spurious PROVED).
+  const inst = amountConservation(
+    transition({
+      bound: 3,
+      creates: [{ template: 'Tok', base: 'this', fields: { amount: v('this.amount') }, path: [] }],
+      archivedInputs: [{ listName: 'arg.holdings', effect: 'exercise' }],
+    })
+  );
+  assert.equal(inst.applicable, false);
+  assert.equal(inst.notModellable, true);
+  assert.match(inst.why, /archives every element of `arg\.holdings`/);
+  assert.match(inst.why, /no created amount is built from a fold over that list/);
+});
+
+test('conservation refuses a mismatch between the folded list and the archived list', () => {
+  // The compiled-shape version of the same trap: the sum ranges over one list
+  // and the archive loop over another.
+  const inst = amountConservation(mergeTransition({ archivedList: 'arg.others' }));
+  assert.equal(inst.applicable, false);
+  assert.equal(inst.notModellable, true);
+  assert.match(inst.why, /arg\.others/);
+});
+
+test('conservation refuses a transition mixing two distinct lists', () => {
+  const inst = amountConservation(
+    transition({
+      bound: 3,
+      creates: [
+        {
+          template: 'Tok',
+          base: 'this',
+          fields: {
+            amount: plus(
+              fold('arg.a', 'foldl', [T.num('0'), v('arg.a$0.amount')]),
+              fold('arg.b', 'foldl', [T.num('0'), v('arg.b$0.amount')])
+            ),
+          },
+          path: [],
+        },
+      ],
+      archivedInputs: [],
+    })
+  );
+  assert.equal(inst.notModellable, true);
+  assert.match(inst.why, /2 distinct lists/);
+  assert.match(inst.why, /combinations of differing lengths/);
+});
+
+test('conservation refuses creates inside a per-element loop', () => {
+  const inst = amountConservation(
+    mergeTransition({
+      unmodelledLoopEffects: [{ why: '1 create(s) inside a traversal over `arg.holdings`' }],
+    })
+  );
+  assert.equal(inst.notModellable, true);
+  assert.match(inst.why, /create\(s\) inside a traversal/);
+});
+
+test('a transition with no lists keeps the exact, unbounded statement', () => {
+  // Today's verdicts must not become bounded just because the machinery exists.
+  const inst = amountConservation(
+    transition({
+      creates: [
+        { template: 'Tok', base: null, fields: { amount: v('arg.amount') }, path: [] },
+        {
+          template: 'Tok',
+          base: null,
+          fields: { amount: T.app('-', [v('this.amount'), v('arg.amount')]) },
+          path: [],
+        },
+      ],
+    })
+  );
+  assert.equal(inst.applicable, true);
+  assert.equal(inst.bounded, undefined, 'no list is involved, so nothing is bounded');
+  assert.equal(inst.instances, undefined);
+  assert.equal(
+    termToSmt(inst.goal),
+    '(= (+ |arg.amount| (- |this.amount| |arg.amount|)) |this.amount|)'
+  );
+});
+
+test('an unidentified consuming effect still refuses, and says why', () => {
+  const inst = amountConservation(
+    transition({
+      consumesOthers: [{ effect: 'exerciseByKey' }],
+      creates: [{ template: 'Tok', base: 'this', fields: {}, path: [] }],
+    })
+  );
+  assert.equal(inst.notModellable, true);
+  assert.match(inst.why, /consumes contracts besides `this`/);
+  assert.match(inst.why, /could not identify/);
+});
+
+test('division-safety is bounded when a denominator comes from an unrolled fold step', () => {
+  const inst = divisionSafety(
+    transition({
+      bound: 3,
+      divisions: [
+        { denominator: v('this.rate') },
+        { denominator: v('arg.xs$0.qty'), fold: 'arg.xs', index: 0 },
+      ],
+    })
+  );
+  assert.equal(inst.applicable, true);
+  assert.equal(inst.bounded, true);
+  assert.equal(inst.bound, 3);
+  assert.match(inst.boundedNote, /1 of 2 checked denominator\(s\) come from fold steps/);
+  assert.match(inst.boundedNote, /nothing is claimed about longer lists/);
+
+  // and a transition with no fold-derived denominator stays unbounded
+  const plain = divisionSafety(transition({ divisions: [{ denominator: v('this.rate') }] }));
+  assert.equal(plain.bounded, undefined);
+});
+
+// --------------------------------------------- the same shapes, COMPILED
+
+/**
+ * A one-package DAR fixture with the compiled MERGE shape, so the translator
+ * itself is exercised rather than hand-written IR:
+ *
+ *   template Tok, consuming choice Merge with arg:
+ *     [viaMapA] tokens <- DA.Internal.Prelude:mapA fetch arg.holdings
+ *     _        <- DA.Foldable:mapA_ (\cid -> exercise @Holding Archive cid) arg.holdings
+ *     create this with amount = this.amount + FOLDL (\acc t -> acc + t.amount) 0 <list>
+ *
+ * `<list>` is `arg.holdings` directly, or `tokens` when viaMapA - which is the
+ * shape a real merge compiles to, and the one that breaks if element symbols
+ * are keyed to anything but the source list.
+ *
+ * `archiveList` lets the archive loop range over a DIFFERENT field, which is
+ * the compiled form of the mismatch this design refuses.
+ */
+function buildMergeFixtureDalf({
+  viaMapA = false,
+  foldr = false,
+  archiveList = 'holdings',
+  doubleCount = false,
+} = {}) {
+  const strings = [
+    'this', 'self', 'arg', 'amount', 'holdings', 'others', 'acc', 't', 'cid', 'h',
+    'tokens', 'ignored', 'Archive', 'Merge', 'pkg', '1.0.0',
+    'Mod', 'Tok', 'Holding', 'DA', 'Foldable', 'mapA_', 'Internal', 'Prelude', 'mapA',
+  ];
+  const SI = Object.fromEntries(strings.map((s, i) => [s, i]));
+
+  // interned dotted names, each a packed list of string indices
+  const dotted = [
+    ['Mod'], ['Tok'], ['Holding'], ['DA', 'Foldable'], ['mapA_'],
+    ['DA', 'Internal', 'Prelude'], ['mapA'],
+  ];
+  const DN = { Mod: 0, Tok: 1, Holding: 2, DAFoldable: 3, mapA_: 4, DAPrelude: 5, mapA: 6 };
+  const dnameMsgs = dotted.map((segs) =>
+    bf(
+      S.Package.internedDottedNames,
+      bf(S.InternedDottedName.segmentsInternedStr, Buffer.concat(segs.map((x) => varint(SI[x]))))
+    )
+  );
+
+  const moduleRef = (dn) =>
+    msg(
+      bf(S.ModuleId.packageId, bf(S.SelfOrImportedPackageId.selfPackageId, Buffer.alloc(0))),
+      vf(S.ModuleId.moduleNameInternedDname, dn)
+    );
+  const tycon = (modDn, nameDn) =>
+    msg(bf(S.TypeConId.module, moduleRef(modDn)), vf(S.TypeConId.nameInternedDname, nameDn));
+  const valRef = (modDn, nameDn) =>
+    msg(bf(S.Expr.val, msg(bf(S.ValueId.module, moduleRef(modDn)), vf(S.ValueId.nameInternedDname, nameDn))));
+  const defValue = (nameDn, body) =>
+    msg(
+      bf(S.DefValue.nameWithType, msg(vf(S.NameWithType.nameInternedDname, nameDn))),
+      bf(S.DefValue.expr, body)
+    );
+
+  const pureUnit = msg(
+    bf(
+      S.Expr.update,
+      bf(S.Update.pure, msg(bf(S.message('Pure').expr, msg(vf(S.Expr.builtinCon, S.ENUMS.BuiltinCon.CON_UNIT)))))
+    )
+  );
+
+  // the two stdlib traversals, recognised by their fully qualified names
+  const traversalBody = exprAbs(SI.h, exprAbs(SI.cid, pureUnit));
+  const foldableModule = msg(
+    vf(S.Module.nameInternedDname, DN.DAFoldable),
+    bf(S.Module.values, defValue(DN.mapA_, traversalBody))
+  );
+  const preludeModule = msg(
+    vf(S.Module.nameInternedDname, DN.DAPrelude),
+    bf(S.Module.values, defValue(DN.mapA, traversalBody))
+  );
+
+  const EI = S.message('Update.ExerciseInterface');
+  const archiveFn = exprAbs(
+    SI.cid,
+    msg(
+      bf(
+        S.Expr.update,
+        bf(
+          S.Update.exerciseInterface,
+          msg(
+            bf(EI.interface, tycon(DN.Mod, DN.Holding)),
+            vf(EI.choiceInternedStr, SI.Archive),
+            bf(EI.cid, exprVar(SI.cid))
+          )
+        )
+      )
+    )
+  );
+  const fetchFn = exprAbs(SI.h, pureUnit);
+
+  const holdingsExpr = exprProj(exprVar(SI.arg), SI.holdings);
+  const archiveListExpr = exprProj(exprVar(SI.arg), SI[archiveList]);
+  // `doubleCount` adds each input's amount TWICE: a merge that really does
+  // violate conservation, and only from the first element onwards.
+  const contribution = doubleCount
+    ? exprApp(exprBuiltin(BF.ADD_NUMERIC), [exprProj(exprVar(SI.t), SI.amount), exprProj(exprVar(SI.t), SI.amount)])
+    : exprProj(exprVar(SI.t), SI.amount);
+  const step = foldr
+    ? exprAbs(SI.t, exprAbs(SI.acc, exprApp(exprBuiltin(BF.ADD_NUMERIC), [contribution, exprVar(SI.acc)])))
+    : exprAbs(SI.acc, exprAbs(SI.t, exprApp(exprBuiltin(BF.ADD_NUMERIC), [exprVar(SI.acc), contribution])));
+  const foldedList = viaMapA ? exprVar(SI.tokens) : holdingsExpr;
+  const foldExpr = exprApp(exprBuiltin(foldr ? BF.FOLDR : BF.FOLDL), [step, exprInt(0), foldedList]);
+
+  const CREATE = S.message('Update.Create');
+  const createTok = msg(
+    bf(
+      S.Expr.update,
+      bf(
+        S.Update.create,
+        msg(
+          bf(CREATE.template, tycon(DN.Mod, DN.Tok)),
+          bf(
+            CREATE.expr,
+            msg(
+              bf(
+                S.Expr.recUpd,
+                msg(
+                  vf(S.RecUpd.fieldInternedStr, SI.amount),
+                  bf(S.RecUpd.record, exprVar(SI.this)),
+                  bf(
+                    S.RecUpd.update,
+                    exprApp(exprBuiltin(BF.ADD_NUMERIC), [exprProj(exprVar(SI.this), SI.amount), foldExpr])
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  );
+
+  const binding = (nameSi, bound) =>
+    msg(bf(S.Binding.binder, msg(vf(S.VarWithType.varInternedStr, nameSi))), bf(S.Binding.bound, bound));
+  const bindings = [];
+  if (viaMapA) {
+    bindings.push(
+      bf(S.Block.bindings, binding(SI.tokens, exprApp(exprApp(valRef(DN.DAPrelude, DN.mapA), [fetchFn]), [holdingsExpr])))
+    );
+  }
+  bindings.push(
+    bf(S.Block.bindings, binding(SI.ignored, exprApp(exprApp(valRef(DN.DAFoldable, DN.mapA_), [archiveFn]), [archiveListExpr])))
+  );
+  const body = msg(
+    bf(S.Expr.update, bf(S.Update.block, msg(...bindings, bf(S.Block.body, createTok))))
+  );
+
+  const choiceMsg = msg(
+    vf(S.TemplateChoice.nameInternedStr, SI.Merge),
+    vf(S.TemplateChoice.consuming, 1),
+    vf(S.TemplateChoice.selfBinderInternedStr, SI.self),
+    bf(S.TemplateChoice.argBinder, msg(vf(S.VarWithType.varInternedStr, SI.arg))),
+    bf(S.TemplateChoice.update, body)
+  );
+  const template = msg(
+    vf(S.DefTemplate.tyconInternedDname, DN.Tok),
+    vf(S.DefTemplate.paramInternedStr, SI.this),
+    bf(S.DefTemplate.choices, choiceMsg)
+  );
+  const module = msg(vf(S.Module.nameInternedDname, DN.Mod), bf(S.Module.templates, template));
+
+  const pkg = msg(
+    bf(S.Package.modules, module),
+    bf(S.Package.modules, foldableModule),
+    bf(S.Package.modules, preludeModule),
+    ...strings.map((s) => sf(S.Package.internedStrings, s)),
+    ...dnameMsgs,
+    bf(
+      S.Package.metadata,
+      msg(vf(S.PackageMetadata.nameInternedStr, SI.pkg), vf(S.PackageMetadata.versionInternedStr, SI['1.0.0']))
+    )
+  );
+  const payload = msg(sf(S.ArchivePayload.minor, '3'), bf(S.ArchivePayload.damlLf2, pkg));
+  return msg(bf(S.Archive.payload, payload), sf(S.Archive.hash, 'deadbeef'));
+}
+
+const mergeFixture = (opts, bound = 3) =>
+  extractTransitions(decodeDalfRaw(buildMergeFixtureDalf(opts)), { bound }).find(
+    (t) => t.choice === 'Merge'
+  );
+
+test('a compiled FOLDL is unrolled, keyed to the list it ranges over', () => {
+  const t = mergeFixture({});
+  const amount = t.creates[0].fields.amount;
+  assert.deepEqual([...foldLists(amount)], ['arg.holdings']);
+  assert.equal(
+    termToSmt(instantiateFolds(amount, 2)),
+    '(+ |this.amount| (+ (+ 0 |arg.holdings$0.amount|) |arg.holdings$1.amount|))'
+  );
+  assert.deepEqual(
+    t.listElements,
+    [
+      { listName: 'arg.holdings', index: 0 },
+      { listName: 'arg.holdings', index: 1 },
+      { listName: 'arg.holdings', index: 2 },
+    ]
+  );
+});
+
+test('a compiled FOLDR unrolls from the right, element first', () => {
+  // foldr f z [e0,e1] = f e0 (f e1 z): the element order the unroller has to
+  // get right, and the one a left-to-right unrolling would silently invert.
+  const t = mergeFixture({ foldr: true });
+  assert.equal(
+    termToSmt(instantiateFolds(t.creates[0].fields.amount, 2)),
+    '(+ |this.amount| (+ |arg.holdings$0.amount| (+ |arg.holdings$1.amount| 0)))'
+  );
+});
+
+test('a compiled archive loop is recorded as archiving the elements of its list', () => {
+  const t = mergeFixture({});
+  assert.deepEqual(t.archivedInputs, [{ listName: 'arg.holdings', effect: 'exercise (interface)' }]);
+  assert.deepEqual(t.consumesOthers, [], 'an identified archive loop is not an unidentified one');
+  assert.deepEqual(t.unmodelledLoopEffects, []);
+});
+
+test('a fold over a mapA RESULT is named after the source list, not the binder', () => {
+  // The shape that makes or breaks the whole property: the sum ranges over
+  // `tokens <- mapA fetch arg.holdings` while the archive loop ranges over
+  // `arg.holdings`. Naming the fold's elements `tokens$i` would leave the two
+  // sides talking about different symbols, and the merge would come back
+  // DISPROVED for no reason at all.
+  const t = mergeFixture({ viaMapA: true });
+  assert.deepEqual([...foldLists(t.creates[0].fields.amount)], ['arg.holdings']);
+  assert.deepEqual(t.archivedInputs, [{ listName: 'arg.holdings', effect: 'exercise (interface)' }]);
+
+  const inst = amountConservation(t);
+  assert.equal(inst.applicable, true);
+  assert.equal(inst.bounded, true);
+  for (const i of inst.instances) {
+    const [lhs, rhs] = i.goal.args;
+    const left = [...symbolsOf(termToSmt(lhs))].filter((n) => n.includes('$')).sort();
+    const right = [...symbolsOf(termToSmt(rhs))].filter((n) => n.includes('$')).sort();
+    assert.deepEqual(left, right, `list length ${i.k}: same elements on both sides`);
+  }
+});
+
+test('cvc5 proves the COMPILED merge at every bounded list length', { skip: !SOLVER }, () => {
+  const inst = amountConservation(mergeFixture({ viaMapA: true }));
+  assert.equal(inst.instances.length, 4);
+  for (const i of inst.instances) {
+    assert.match(runSolver(buildQuery(i.guards, i.goal).script), /^unsat/m, `k=${i.k}`);
+  }
+});
+
+test('a compiled archive loop over a DIFFERENT list is refused, not proved', () => {
+  // Same merge, but the loop archives `arg.others` while the sum ranges over
+  // `arg.holdings`. There is no honest statement relating them, so refuse.
+  const t = mergeFixture({ archiveList: 'others' });
+  assert.deepEqual(t.archivedInputs, [{ listName: 'arg.others', effect: 'exercise (interface)' }]);
+  const inst = amountConservation(t);
+  assert.equal(inst.applicable, false);
+  assert.equal(inst.notModellable, true);
+  assert.match(inst.why, /arg\.others/);
+});
+
+test('--bound decides how far the compiled fold is unrolled', () => {
+  for (const bound of [0, 1, 5]) {
+    const t = mergeFixture({}, bound);
+    assert.equal(t.bound, bound);
+    const inst = amountConservation(t);
+    assert.equal(inst.instances.length, bound + 1, `bound ${bound} gives ${bound + 1} queries`);
+    assert.equal(inst.bound, bound);
+  }
+  assert.equal(DEFAULT_BOUND, 3);
+});
+
+// ---------------------------------------------- the real thing, end to end
+
+const TOKENS_DAR =
+  '/private/tmp/claude-501/-Users-vijay-Downloads-carbon-core/713989a1-4f06-45ac-823b-b4ec40f8b2b8/scratchpad/canton/dlt-canton-main/daml/canton-tokens.dar';
+const HAVE_TOKENS_DAR = existsSync(TOKENS_DAR);
+
+test(
+  'a real compiled merge: the fold and the archive loop agree on `arg.holdings`',
+  { skip: !HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}` },
+  () => {
+    // TransferableRecToken.Merge_Utxo, whose compiled body is
+    //   tokens <- mapA (fetch+validate) arg.holdings
+    //   let total = this.amount + foldl (\acc t -> acc + t.amount) 0.0 tokens
+    //   mapA_ archive arg.holdings; create this with amount = total
+    const t = extractTransitions(readDarRaw(TOKENS_DAR), { bound: 3 }).find(
+      (x) => x.choice === 'Merge_Utxo'
+    );
+    assert.ok(t, 'expected a Merge_Utxo transition');
+    assert.equal(t.consuming, true);
+    assert.deepEqual([...foldLists(t.creates[0].fields.amount)], ['arg.holdings']);
+    assert.deepEqual(t.archivedInputs, [
+      { listName: 'arg.holdings', effect: 'exercise (interface)' },
+    ]);
+    assert.deepEqual(t.consumesOthers, []);
+
+    const inst = amountConservation(t);
+    assert.equal(inst.applicable, true, inst.why);
+    assert.equal(inst.bounded, true);
+    assert.equal(inst.listName, 'arg.holdings');
+    assert.deepEqual(inst.instances.map((i) => i.k), [0, 1, 2, 3]);
+    for (const i of inst.instances) {
+      const [lhs, rhs] = i.goal.args;
+      const left = [...symbolsOf(termToSmt(lhs))].filter((n) => n.includes('$')).sort();
+      const right = [...symbolsOf(termToSmt(rhs))].filter((n) => n.includes('$')).sort();
+      assert.deepEqual(left, right, `k=${i.k}: the fold and the archive name the same elements`);
+      assert.equal(left.length, i.k);
+    }
+  }
+);
+
+test(
+  'cvc5 proves the real merge at every bounded list length',
+  { skip: (!SOLVER && 'no cvc5') || (!HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}`) },
+  () => {
+    const t = extractTransitions(readDarRaw(TOKENS_DAR), { bound: 3 }).find(
+      (x) => x.choice === 'Merge_Utxo'
+    );
+    const inst = amountConservation(t);
+    for (const i of inst.instances) {
+      assert.match(runSolver(buildQuery(i.guards, i.goal).script), /^unsat/m, `k=${i.k}`);
+    }
+  }
+);
+
+test(
+  'a merge that double counts its inputs fails, and the FIRST failing length is 1',
+  { skip: !SOLVER },
+  () => {
+    // The counterexample side of bounded checking: k = 0 is still fine (an
+    // empty list conserves trivially), and the property breaks as soon as
+    // there is one element. Reporting "somewhere at or below 3" would be
+    // strictly less useful than "already at 1", which is what verify.js
+    // prints because it stops at the first sat.
+    const inst = amountConservation(mergeFixture({ doubleCount: true }));
+    assert.equal(inst.bounded, true);
+    const verdicts = inst.instances.map(
+      (i) => (/^unsat/m.test(runSolver(buildQuery(i.guards, i.goal).script)) ? 'unsat' : 'sat')
+    );
+    assert.deepEqual(verdicts, ['unsat', 'sat', 'sat', 'sat']);
+  }
+);
+
+test(
+  'the CLI prints a bounded proof as its own status, carrying the bound',
+  { skip: (!SOLVER && 'no cvc5') || (!HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}`) },
+  () => {
+    const cli = new URL('../backend/verify.js', import.meta.url).pathname;
+    const run = (extra) =>
+      JSON.parse(
+        execFileSync(
+          'node',
+          [cli, TOKENS_DAR, '--property', 'amount-conservation', '--choice', 'Merge_Utxo', '--json', ...extra],
+          { encoding: 'utf8' }
+        )
+      ).results[0];
+
+    const dflt = run([]);
+    assert.equal(dflt.status, 'PROVED-BOUNDED (lists up to length 3)');
+    assert.notEqual(dflt.status, 'PROVED', 'a bounded proof must never print as PROVED');
+    assert.equal(dflt.bound, 3);
+    assert.equal(dflt.queries, 4);
+    assert.match(dflt.note, /the archived inputs are the same `arg\.holdings\$<i>\.amount` symbols/);
+
+    // --bound changes the claim, and the status says so in words
+    const narrow = run(['--bound', '1']);
+    assert.equal(narrow.status, 'PROVED-BOUNDED (lists up to length 1)');
+    assert.equal(narrow.queries, 2);
+  }
+);
