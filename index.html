@@ -10,8 +10,9 @@
     <header class="app-header">
       <h1>Daml Access Graph</h1>
       <p class="subtitle">
-        Prototype visualizer of the access structure of Daml templates —
-        signatories, observers, choices, controllers, and ledger operations.
+        Prototype visualizer of the access structure of Daml templates -
+        signatories, observers, choices, controllers, interfaces, contract
+        keys, and ledger operations.
         <strong>Heuristic parser: results are best-effort, not sound.</strong>
       </p>
     </header>
@@ -22,9 +23,9 @@
           <label for="examples">Example:</label>
           <select id="examples"></select>
           <button id="analyze" type="button">Analyze ▶</button>
-          <button id="load-daml" type="button" class="btn-secondary" title="Open a .daml file and visualize it directly">Load .daml file</button>
+          <button id="load-daml" type="button" class="btn-secondary" title="Open one .daml file, or select several to parse them as one project (cross-module targets, interfaces, and helper functions resolve against the whole set)">Load .daml file(s)</button>
           <button id="load-json" type="button" class="btn-secondary" title="Load a normalized graph JSON produced by the Daml-LF backend (backend/extract-dar.js)">Load graph JSON</button>
-          <input id="daml-file" type="file" accept=".daml,text/plain" hidden />
+          <input id="daml-file" type="file" accept=".daml,text/plain" multiple hidden />
           <input id="json-file" type="file" accept=".json,application/json" hidden />
         </div>
         <textarea

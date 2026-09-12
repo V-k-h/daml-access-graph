@@ -1,7 +1,7 @@
 // src/renderer.js
 //
 // A tiny dependency-free SVG renderer with a basic force-directed layout.
-// Not a real graph library — just enough to make the access structure legible.
+// Not a real graph library - just enough to make the access structure legible.
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -9,6 +9,8 @@ const NODE_STYLE = {
   template: { r: 26, fill: '#2563eb', stroke: '#1e3a8a' },
   party: { r: 18, fill: '#16a34a', stroke: '#14532d' },
   choice: { r: 20, fill: '#d97706', stroke: '#7c2d12' },
+  interface: { r: 24, fill: '#9333ea', stroke: '#581c87' },
+  key: { r: 14, fill: '#0f766e', stroke: '#134e4a' },
 };
 
 const EDGE_STYLE = {
@@ -16,6 +18,10 @@ const EDGE_STYLE = {
   signatory: { color: '#dc2626', dash: '0' },
   observer: { color: '#0891b2', dash: '4 3' },
   controller: { color: '#d97706', dash: '0' },
+  'view-controller': { color: '#9333ea', dash: '5 2' },
+  implements: { color: '#9333ea', dash: '0' },
+  'keyed-by': { color: '#0f766e', dash: '0' },
+  maintainer: { color: '#0f766e', dash: '3 2' },
   create: { color: '#16a34a', dash: '0' },
   createAndExercise: { color: '#16a34a', dash: '2 2' },
   exercise: { color: '#7c3aed', dash: '0' },
@@ -23,6 +29,7 @@ const EDGE_STYLE = {
   fetch: { color: '#64748b', dash: '4 3' },
   fetchByKey: { color: '#64748b', dash: '4 3' },
   lookupByKey: { color: '#64748b', dash: '1 3' },
+  lookupAllByKey: { color: '#0f766e', dash: '1 3' },
   archive: { color: '#334155', dash: '6 3' },
 };
 
@@ -84,7 +91,7 @@ export function renderGraph(svg, graph) {
       'marker-end': `url(#${markerId(style.color)})`,
     });
     const title = el('title');
-    title.textContent = `${l.s.label} —${l.kind}→ ${l.t.label}`;
+    title.textContent = `${l.s.label} -${l.kind}→ ${l.t.label}`;
     line.appendChild(title);
     linkLayer.appendChild(line);
     return { l, line };

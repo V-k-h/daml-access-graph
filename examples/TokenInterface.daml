@@ -1,0 +1,102 @@
+-- examples/TokenInterface.daml
+--
+-- Exercises the features the original prototype could not model: an interface
+-- declaration with a view-projected controller, a template implementing it via
+-- `interface instance`, a multi-line contract key with a positional
+-- maintainer, a non-unique key read, and a thin choice whose real ledger
+-- effect happens inside a helper function.
+module TokenInterface where
+
+interface Utxo where
+  viewtype UtxoView
+
+  splitImpl : ContractId Utxo -> Decimal -> Update [ContractId Utxo]
+
+  choice Split_Utxo : [ContractId Utxo]
+    with
+      amount : Decimal
+    controller (view this).admin
+    do
+      splitImpl this self amount
+
+  nonconsuming choice View_Utxo : Decimal
+    controller (view this).admin
+    do
+      return (view this).amount
+
+data UtxoView = UtxoView with
+    admin : Party
+    amount : Decimal
+  deriving (Eq, Show)
+
+template Token
+  with
+    admin : Party
+    owner : Party
+    tokenId : Text
+    amount : Decimal
+  where
+    signatory admin
+    observer owner
+
+    key (admin, tokenId) : (Party, Text)
+    maintainer key._1
+
+    choice Lock : ContractId LockedToken
+      with locker : Party
+      controller this.admin
+      do
+        create LockedToken with
+          admin = admin
+          owner = owner
+          tokenId = tokenId
+          amount = amount
+          locker = locker
+
+    -- A thin choice: the ledger effect lives in `mintFor`, one call away.
+    nonconsuming choice Mint : ContractId Token
+      with
+        newOwner : Party
+        newTokenId : Text
+        newAmount : Decimal
+      controller admin
+      do
+        mintFor admin newOwner newTokenId newAmount
+
+    nonconsuming choice Siblings : Int
+      controller owner
+      do
+        others <- lookupAllByKey @Token (admin, tokenId)
+        return (length others)
+
+    interface instance Utxo for Token where
+      view = UtxoView with admin = admin, amount = amount
+      splitImpl _ _ = return []
+
+template LockedToken
+  with
+    admin : Party
+    owner : Party
+    tokenId : Text
+    amount : Decimal
+    locker : Party
+  where
+    signatory admin
+    observer owner, locker
+
+    choice Unlock : ContractId Token
+      controller locker
+      do
+        create Token with
+          admin = admin
+          owner = owner
+          tokenId = tokenId
+          amount = amount
+
+mintFor : Party -> Party -> Text -> Decimal -> Update (ContractId Token)
+mintFor admin newOwner newTokenId newAmount =
+  create Token with
+    admin = admin
+    owner = newOwner
+    tokenId = newTokenId
+    amount = newAmount
