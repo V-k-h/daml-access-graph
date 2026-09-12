@@ -23,6 +23,9 @@
 // Verdict vocabulary, chosen so that silence cannot be mistaken for safety:
 //
 //   PROVED           unsat: no counterexample exists in the model
+//   PROVED-PARTIAL   unsat, but only some of the property's obligations
+//                    were inside the fragment; the rest are UNKNOWN, and
+//                    the coverage split is printed
 //   DISPROVED        sat: a concrete counterexample, printed
 //   NOT-MODELLABLE   the transition or property leaves the translated fragment;
 //                    the reason is printed
@@ -190,10 +193,25 @@ function main() {
           `${t.unsupported.length} untranslated part(s) in the body (effects beyond the recovered creates may exist), e.g.: ${t.unsupported[0].why}`
         );
       }
+      // A property checked over only SOME of its obligations (19 of 20
+      // division denominators, say, one being untranslatable) must never print
+      // as a bare PROVED: the unchecked ones are unknown, not safe.
+      // PROVED-PARTIAL is a distinct status carrying the coverage split.
+      const cov = inst.coverage;
+      const partial = !!(cov && cov.checked < cov.total);
+      if (partial) {
+        notes.push(
+          `${cov.checked} of ${cov.total} obligation(s) checked; ` +
+            `${cov.total - cov.checked} outside the fragment: ${cov.skipped.join('; ')}`
+        );
+      }
+
       const note = notes.length ? notes.join('; ') : null;
       if (solved.verdict === 'unsat') {
         results.push({
-          property: propName, transition: label, status: 'PROVED',
+          property: propName, transition: label,
+          status: partial ? 'PROVED-PARTIAL' : 'PROVED',
+          ...(cov ? { coverage: cov } : {}),
           ...(note ? { note } : {}),
           ...loc,
           smt2: solved.file,
@@ -221,7 +239,7 @@ function main() {
       `${raw.name} ${raw.version || ''} (LF 2.${raw.lfMinor}) - ${transitions.length} transition(s)\n` +
       `verdicts: ${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(' ')}\n\n`
     );
-    const order = { DISPROVED: 0, PROVED: 1, 'SOLVER-UNKNOWN': 2, 'SOLVER-ERROR': 3, 'NOT-MODELLABLE': 4, 'NOT-APPLICABLE': 5 };
+    const order = { DISPROVED: 0, PROVED: 1, 'PROVED-PARTIAL': 1.5, 'SOLVER-UNKNOWN': 2, 'SOLVER-ERROR': 3, 'NOT-MODELLABLE': 4, 'NOT-APPLICABLE': 5 };
     for (const r of [...results].sort((a, b) => order[a.status] - order[b.status])) {
       if (r.status === 'NOT-APPLICABLE') continue; // summarized above, noise below
       process.stdout.write(`[${r.status}] ${r.property} :: ${r.transition}\n`);

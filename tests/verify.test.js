@@ -649,3 +649,68 @@ test('cvc5 handles String-sorted guards', { skip: !SOLVER }, () => {
   const out = runSolver(script);
   assert.match(out, /^unsat/m);
 });
+
+// ---------------------------------------------------------------------------
+// Exact conversions and partial coverage
+// ---------------------------------------------------------------------------
+
+test('INT64_TO_NUMERIC is an exact conversion, not a rounding builtin', async () => {
+  // Misfiling it as rounding made amountConservation refuse every transition
+  // whose arithmetic touched a scaled constant, and made every scaled division
+  // denominator untranslatable. The conversion itself loses nothing; its only
+  // partiality is overflow, which aborts rather than rounds.
+  const { ROUNDING, EXACT_CONVERSION, BF } = await import('../backend/lfir.js');
+  assert.equal(ROUNDING.has(BF.INT64_TO_NUMERIC), false, 'exact, must not be in ROUNDING');
+  assert.equal(EXACT_CONVERSION.has(BF.INT64_TO_NUMERIC), true);
+  // the truncating direction stays flagged
+  assert.equal(ROUNDING.has(BF.NUMERIC_TO_INT64), true, 'truncation is real value loss');
+  assert.equal(ROUNDING.has(BF.ROUND_NUMERIC), true);
+});
+
+test('division-safety adjudicates per denominator instead of refusing wholesale', () => {
+  // One untranslatable denominator must not hide the ones that do translate:
+  // on a real perb calculation this was 19 provable obligations hidden by 1.
+  const t = transition({
+    divisions: [
+      { denominator: v('arg.fx') },
+      { denominator: T.unsupported('helper call', 'x') },
+      { denominator: T.num('1000') },
+    ],
+  });
+  const inst = divisionSafety(t);
+  assert.equal(inst.applicable, true, 'must still produce a goal');
+  assert.equal(inst.coverage.checked, 2);
+  assert.equal(inst.coverage.total, 3);
+  assert.deepEqual(inst.coverage.skipped, ['helper call']);
+  // the goal covers exactly the checkable denominators
+  const smt = termToSmt(inst.goal);
+  assert.match(smt, /arg\.fx/);
+  assert.match(smt, /1000/);
+});
+
+test('division-safety still refuses when NO denominator is translatable', () => {
+  const t = transition({
+    divisions: [{ denominator: T.unsupported('opaque', 'x') }],
+  });
+  const inst = divisionSafety(t);
+  assert.equal(inst.applicable, false);
+  assert.equal(inst.notModellable, true);
+  assert.match(inst.why, /all 1 denominator\(s\) are outside the fragment/);
+});
+
+test('a zero-capable denominator is refuted, a constant one is proved', { skip: !SOLVER }, () => {
+  // the shape of the real perb finding: dividing by a scaled balance field
+  const unsafe = divisionSafety(
+    transition({ divisions: [{ denominator: T.app('/', [v('this.balance'), T.num('1000000000')]) }] })
+  );
+  assert.match(runSolver(buildQuery(unsafe.guards, unsafe.goal).script), /^sat/m);
+
+  // guarded by a precondition, the same denominator is safe
+  const guarded = divisionSafety(
+    transition({
+      guards: [T.app('>', [v('this.balance'), T.num('0')])],
+      divisions: [{ denominator: T.app('/', [v('this.balance'), T.num('1000000000')]) }],
+    })
+  );
+  assert.match(runSolver(buildQuery(guarded.guards, guarded.goal).script), /^unsat/m);
+});

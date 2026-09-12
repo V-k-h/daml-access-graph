@@ -66,11 +66,31 @@ const BINOP = new Map([
  * Builtins that round, truncate or change scale. Their presence does not stop
  * translation, but it is recorded, because the exact-rational abstraction stops
  * being sound for value equalities once one of them is on the path.
+ *
+ * INT64_TO_NUMERIC is deliberately NOT here, though its inverse is. The
+ * conversion Int64 -> Numeric is EXACT: every Int64 maps to a rational with
+ * no loss. Its only partiality is overflow, when the integer does not fit the
+ * target scale, and overflow ABORTS the transaction rather than producing a
+ * rounded value. An aborted transaction is not a reachable post-state, so
+ * ignoring the overflow case shrinks the state space we quantify over, which
+ * is sound for proving universal properties (the same direction as dropping
+ * a guard; see the note in smt.js). Treating it as rounding cost real
+ * verdicts: it is how `intToDecimal` builds the constant denominators that
+ * every scaled division in a Canton perb calculation divides by, so one
+ * misfiled builtin made all 104 division sites unadjudicable.
+ *
+ * NUMERIC_TO_INT64 stays: it truncates, and that is genuine value loss.
  */
 const ROUNDING = new Set([
   BF.ROUND_NUMERIC, BF.CAST_NUMERIC, BF.SHIFT_NUMERIC,
-  BF.NUMERIC_TO_INT64, BF.INT64_TO_NUMERIC, BF.DIV_INT64, BF.MOD_INT64,
+  BF.NUMERIC_TO_INT64, BF.DIV_INT64, BF.MOD_INT64,
 ]);
+
+/**
+ * Builtins translated as the identity on the underlying rational value.
+ * Exact conversions only: see the INT64_TO_NUMERIC argument above.
+ */
+const EXACT_CONVERSION = new Set([BF.INT64_TO_NUMERIC]);
 
 const DIVISION = new Set([BF.DIV_NUMERIC, BF.DIV_INT64, BF.MOD_INT64]);
 
@@ -777,10 +797,8 @@ function betaReduce(fun, rawArgs, ctx, depth = 0) {
 function translateBuiltinApp(builtin, args, ctx) {
   if (builtin === BF.ERROR) return T.abort('call to error');
   if (ROUNDING.has(builtin)) ctx.rounding.push(builtinName(builtin));
-  const op = BINOP.get(builtin);
-  if (!op) return T.unsupported(`builtin ${builtinName(builtin)} is outside the fragment`, ctx.label);
 
-  const terms = args.map((a) => {
+  const translateArg = (a) => {
     const expr = decodeExpr(a.bytes);
     if (!expr) return T.unsupported('unreadable argument', ctx.label);
     const prev = ctx.pkg;
@@ -790,7 +808,23 @@ function translateBuiltinApp(builtin, args, ctx) {
     } finally {
       ctx.pkg = prev;
     }
-  });
+  };
+
+  // An exact conversion is the identity on the rational value: translate the
+  // single value argument and pass it through. Like the numeric binops, it
+  // carries scale/dictionary arguments ahead of the value, so take the last.
+  if (EXACT_CONVERSION.has(builtin)) {
+    const converted = args.length ? translateArg(args[args.length - 1]) : null;
+    if (!converted) {
+      return T.unsupported(`${builtinName(builtin)} applied to no value`, ctx.label);
+    }
+    return converted;
+  }
+
+  const op = BINOP.get(builtin);
+  if (!op) return T.unsupported(`builtin ${builtinName(builtin)} is outside the fragment`, ctx.label);
+
+  const terms = args.map(translateArg);
   // Numeric builtins carry dictionary/scale arguments ahead of the two values.
   const valueArgs = terms.slice(-2);
   if (valueArgs.length !== 2) {
@@ -849,7 +883,7 @@ function builtinName(n) {
   return `builtin#${n}`;
 }
 
-export { BF, BINOP, ROUNDING, DIVISION, makeCtx, symbol };
+export { BF, BINOP, ROUNDING, EXACT_CONVERSION, DIVISION, makeCtx, symbol };
 
 // ---------------------------------------------------------------------------
 // Transitions

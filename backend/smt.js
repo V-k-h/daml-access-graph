@@ -230,25 +230,57 @@ export function amountConservation(transition) {
  */
 export function divisionSafety(transition) {
   if (!transition.divisions.length) return { applicable: false, why: 'no division on this transition' };
-  const bad = transition.divisions.find((d) => hasUnsupported(d.denominator));
-  if (bad) {
+
+  // Adjudicate PER DENOMINATOR rather than refusing the whole transition.
+  //
+  // The all-or-nothing form of this check was hiding real results: on a
+  // Canton perb calculation, 19 of 20 denominators translate cleanly and one
+  // does not, and refusing the transition reported all 20 as unadjudicated.
+  // Each denominator is an independent obligation, so the honest thing is to
+  // prove the ones we can and name the ones we cannot. `coverage` carries
+  // that split to the report, which never prints a bare PROVED when some
+  // denominator went unchecked.
+  const checkable = [];
+  const skipped = [];
+  for (const d of transition.divisions) {
+    if (hasUnsupported(d.denominator)) {
+      skipped.push(unsupportedReasons(d.denominator).map((u) => u.why).join('; '));
+    } else {
+      checkable.push(d);
+    }
+  }
+
+  if (checkable.length === 0) {
     return {
       applicable: false,
       notModellable: true,
-      why: `a denominator is outside the fragment: ${unsupportedReasons(bad.denominator).map((u) => u.why).join('; ')}`,
+      why:
+        `all ${skipped.length} denominator(s) are outside the fragment: ` +
+        `${[...new Set(skipped)].join('; ')}`,
     };
   }
+
   const goal = {
     k: 'app',
     op: 'and',
-    args: transition.divisions.map((d) => ({
+    args: checkable.map((d) => ({
       k: 'app',
       op: 'not',
       args: [{ k: 'app', op: '=', args: [d.denominator, { k: 'num', v: '0' }] }],
     })),
   };
   const { used, dropped } = usableGuards(transition);
-  return { applicable: true, guards: used, goal: goal.args.length === 1 ? goal.args[0] : goal, dropped };
+  return {
+    applicable: true,
+    guards: used,
+    goal: goal.args.length === 1 ? goal.args[0] : goal,
+    dropped,
+    coverage: {
+      checked: checkable.length,
+      total: transition.divisions.length,
+      skipped: [...new Set(skipped)],
+    },
+  };
 }
 
 export const PROPERTIES = {
