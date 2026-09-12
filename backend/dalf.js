@@ -1,0 +1,966 @@
+// backend/dalf.js
+//
+// Decode a compiled Daml package (.dalf, or the main package of a .dar) into
+// the SAME structural model `src/graph.js` consumes, so a built package and a
+// source tree produce the same normalized graph.
+//
+// Why this replaces scraping `damlc inspect`:
+//
+//   * No Daml SDK required. The old backend shelled out to `damlc`, so it
+//     could not read a DAR on a machine without the toolchain - which is most
+//     CI images, and was the case here.
+//   * The textual output of `damlc inspect` is not a stable API and drifts
+//     between LF versions. This reads the protobuf against transcribed field
+//     numbers from the official daml_lf2.proto (see lf2-schema.js).
+//   * It sees things the text form obscures: interfaces, their choices and
+//     controllers, contract keys and maintainers, and `interface instance`
+//     view bodies.
+//
+// Honest limits, all reported rather than hidden:
+//   * Party extraction walks an expression for record projections
+//     (`this.issuer`), which is how signatory/observer/controller expressions
+//     are compiled. A party computed some other way (a helper call, a list
+//     built at runtime) yields no field name, and the template is reported as
+//     having an unresolved stakeholder expression.
+//   * Only LF 2 is handled. An LF 1 package is rejected with a clear message
+//     rather than decoded into nonsense.
+
+import { readFileSync } from 'node:fs';
+
+import {
+  decodeMessage,
+  readPackedVarints,
+  one,
+  many,
+  sub,
+  subs,
+  int,
+  bool,
+  has,
+} from './protobuf.js';
+import * as S from './lf2-schema.js';
+import { listEntries, readEntry, readByName, parseManifest } from './zip.js';
+
+/**
+ * @typedef {Object} DecodedPackage
+ * @property {string|null} packageId
+ * @property {string|null} name
+ * @property {string|null} version
+ * @property {string|null} lfMinor
+ * @property {string[]} modules
+ * @property {Object[]} templates
+ * @property {Object[]} interfaces
+ * @property {Object[]} functions    always empty: compiled code has no
+ *                                   source-level helper indirection to follow
+ * @property {Object[]} diagnostics
+ */
+
+// ---------------------------------------------------------------------------
+// DAR / DALF entry points
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a .dar and decode its MAIN package.
+ *
+ * Dependency packages are listed but not decoded: their templates are not part
+ * of this package's access structure, and decoding daml-prim/daml-stdlib would
+ * bury the graph. `dependencies` is returned so a caller can decode them
+ * selectively (that is how project mode resolves an interface declared in an
+ * imported package).
+ *
+ * @param {string} path
+ * @returns {DecodedPackage & {dependencies: Array<{name: string, entry: object}>}}
+ */
+export function readDar(path) {
+  const buf = readFileSync(path);
+  const entries = listEntries(buf);
+
+  const manifestBuf = readByName(buf, entries, 'META-INF/MANIFEST.MF');
+  if (!manifestBuf) throw new Error(`${path}: not a DAR (no META-INF/MANIFEST.MF)`);
+  const manifest = parseManifest(manifestBuf.toString('utf8'));
+
+  const mainName = manifest['Main-Dalf'];
+  const dalfEntries = entries.filter((e) => e.name.endsWith('.dalf'));
+  const mainEntry =
+    (mainName && dalfEntries.find((e) => e.name === mainName)) ||
+    // Fall back to the only dalf that is not a well-known runtime package.
+    dalfEntries.find((e) => !/\/(daml-prim|daml-stdlib)[-.]/.test(e.name));
+  if (!mainEntry) throw new Error(`${path}: could not identify the main DALF`);
+
+  const decoded = decodeDalf(readEntry(buf, mainEntry));
+  decoded.diagnostics.unshift({
+    severity: 'info',
+    code: 'dar-read',
+    message:
+      `Read ${path.split('/').pop()}: main package ${decoded.name || '?'} ` +
+      `${decoded.version || ''} (LF 2.${decoded.lfMinor || '?'}), ` +
+      `${dalfEntries.length - 1} dependency package(s) not decoded.`,
+  });
+
+  return {
+    ...decoded,
+    sdkVersion: manifest['Sdk-Version'] || null,
+    dependencies: dalfEntries
+      .filter((e) => e !== mainEntry)
+      .map((e) => ({ name: e.name.split('/').pop(), entry: e })),
+    /** Decode one dependency on demand. */
+    readDependency: (entry) => decodeDalf(readEntry(buf, entry)),
+  };
+}
+
+/**
+ * Decode a DAR down to the RAW definition messages plus the interning context,
+ * for consumers that need the expressions themselves rather than the access
+ * structure - specifically the verification frontend in `lfir.js`.
+ *
+ * The access graph only needs to know THAT a choice performs a create; a proof
+ * needs the arithmetic inside it, so this returns the undigested protobuf.
+ *
+ * @param {string} path
+ */
+export function readDarRaw(path) {
+  const buf = readFileSync(path);
+  const entries = listEntries(buf);
+  const manifestBuf = readByName(buf, entries, 'META-INF/MANIFEST.MF');
+  if (!manifestBuf) throw new Error(`${path}: not a DAR (no META-INF/MANIFEST.MF)`);
+  const manifest = parseManifest(manifestBuf.toString('utf8'));
+  const dalfEntries = entries.filter((e) => e.name.endsWith('.dalf'));
+  const mainEntry =
+    (manifest['Main-Dalf'] && dalfEntries.find((e) => e.name === manifest['Main-Dalf'])) ||
+    dalfEntries.find((e) => !/\/(daml-prim|daml-stdlib)[-.]/.test(e.name));
+  if (!mainEntry) throw new Error(`${path}: could not identify the main DALF`);
+
+  // Index every DALF in the archive by its package id, reading only the
+  // Archive envelope (two fields), not the package inside it. Dependency
+  // packages are decoded LAZILY and cached: the verification frontend follows
+  // cross-package value references (an `ensure` calling a daml-stdlib helper,
+  // an interface declared in a sibling package), and this is what lets it
+  // resolve them against the actual compiled dependency instead of giving up.
+  const entryByPackageId = new Map();
+  for (const e of dalfEntries) {
+    const archive = decodeMessage(readEntry(buf, e));
+    const hash = one(archive, S.Archive.hash);
+    if (hash instanceof Uint8Array) {
+      entryByPackageId.set(Buffer.from(hash).toString('utf8'), e);
+    }
+  }
+  const cache = new Map();
+  const getPackage = (pkgId) => {
+    if (cache.has(pkgId)) return cache.get(pkgId);
+    const entry = entryByPackageId.get(pkgId);
+    // Cache the miss too, so an id that is not in the DAR is not re-searched.
+    const decoded = entry ? decodeDalfRaw(readEntry(buf, entry), getPackage) : null;
+    cache.set(pkgId, decoded);
+    return decoded;
+  };
+
+  const main = decodeDalfRaw(readEntry(buf, mainEntry), getPackage);
+  cache.set(main.packageId, main);
+  return { ...main, getPackage };
+}
+
+/**
+ * Raw decode: interning tables, the value table, and the undigested
+ * template/interface definition messages.
+ */
+export function decodeDalfRaw(bytes, getPackage = null) {
+  const archive = decodeMessage(bytes);
+  const payloadBytes = one(archive, S.Archive.payload);
+  if (!(payloadBytes instanceof Uint8Array)) throw new Error('DALF: no ArchivePayload');
+  const hashBytes = one(archive, S.Archive.hash);
+  const packageId =
+    hashBytes instanceof Uint8Array ? Buffer.from(hashBytes).toString('utf8') : null;
+  const payload = decodeMessage(payloadBytes);
+  const pkgBytes = one(payload, S.ArchivePayload.damlLf2);
+  if (!(pkgBytes instanceof Uint8Array)) {
+    throw new Error('DALF: not a Daml-LF 2 package; this decoder handles LF 2 only.');
+  }
+  const pkg = decodeMessage(pkgBytes);
+  const ctx = buildContext(pkg);
+  ctx.selfPackageId = packageId;
+  // Cross-package resolution hook: package id -> the decoded raw package (with
+  // its OWN interning context), or null when the id is not in the DAR. Wired by
+  // readDarRaw; absent for a bare decodeDalfRaw call, in which case external
+  // value references stay unresolved (and are reported, not guessed at).
+  ctx.getImportedPackage = getPackage ? (pkgId) => (getPackage(pkgId) || {}).ctx || null : null;
+
+  const modules = [];
+  for (const mod of subs(pkg, S.Package.modules)) {
+    modules.push({
+      name: ctx.dname(int(mod, S.Module.nameInternedDname)),
+      templates: subs(mod, S.Module.templates),
+      interfaces: subs(mod, S.Module.interfaces),
+    });
+  }
+
+  const minorBytes = one(payload, S.ArchivePayload.minor);
+  return {
+    ctx,
+    modules,
+    packageId,
+    name: ctx.packageName,
+    version: ctx.packageVersion,
+    lfMinor: minorBytes instanceof Uint8Array ? Buffer.from(minorBytes).toString('utf8') : null,
+  };
+}
+
+/**
+ * Decode a DALF byte buffer (an `Archive`) into a structural model.
+ * @param {Buffer} bytes
+ * @returns {DecodedPackage}
+ */
+export function decodeDalf(bytes) {
+  const archive = decodeMessage(bytes);
+  const payloadBytes = one(archive, S.Archive.payload);
+  const hashBytes = one(archive, S.Archive.hash);
+  const packageId = hashBytes instanceof Uint8Array ? Buffer.from(hashBytes).toString('utf8') : null;
+
+  if (!(payloadBytes instanceof Uint8Array)) {
+    throw new Error('DALF: no ArchivePayload found (field 3)');
+  }
+  const payload = decodeMessage(payloadBytes);
+
+  const minorBytes = one(payload, S.ArchivePayload.minor);
+  const lfMinor =
+    minorBytes instanceof Uint8Array ? Buffer.from(minorBytes).toString('utf8') : null;
+
+  const pkgBytes = one(payload, S.ArchivePayload.damlLf2);
+  if (!(pkgBytes instanceof Uint8Array)) {
+    throw new Error(
+      'DALF: no Daml-LF 2 package in the archive payload. ' +
+        'This decoder handles LF 2 only (SDK 3.x); an LF 1 package needs the LF 1 schema.'
+    );
+  }
+
+  return decodePackage(decodeMessage(pkgBytes), { packageId, lfMinor });
+}
+
+// ---------------------------------------------------------------------------
+// Package
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the interning context: the string, dotted-name, type and expression
+ * tables, plus the hoisted-value table. Shared by the structural decode and
+ * the raw decode, so both resolve names identically.
+ */
+function buildContext(pkg, diagnostics = []) {
+  const strings = many(pkg, S.Package.internedStrings).map((b) =>
+    b instanceof Uint8Array ? Buffer.from(b).toString('utf8') : String(b)
+  );
+  const dottedNames = subs(pkg, S.Package.internedDottedNames).map((dn) =>
+    readPackedVarints(dn, S.InternedDottedName.segmentsInternedStr)
+      .map((i) => strings[i] ?? `<str:${i}>`)
+      .join('.')
+  );
+  const internedTypes = many(pkg, S.Package.internedTypes).map((b) =>
+    b instanceof Uint8Array ? decodeMessage(b) : null
+  );
+  const internedExprs = many(pkg, S.Package.internedExprs).map((b) =>
+    b instanceof Uint8Array ? decodeMessage(b) : null
+  );
+  const importedPackages = (() => {
+    const pi = sub(pkg, S.Package.packageImports);
+    if (!pi) return [];
+    return many(pi, S.PackageImports.importedPackages).map((b) =>
+      b instanceof Uint8Array ? Buffer.from(b).toString('utf8') : String(b)
+    );
+  })();
+
+  const meta = sub(pkg, S.Package.metadata);
+  const name = meta ? strings[int(meta, S.PackageMetadata.nameInternedStr)] ?? null : null;
+  const version = meta ? strings[int(meta, S.PackageMetadata.versionInternedStr)] ?? null : null;
+
+  const ctx = {
+    packageName: name,
+    packageVersion: version,
+    strings,
+    dottedNames,
+    internedTypes,
+    internedExprs,
+    importedPackages,
+    diagnostics,
+    /** "Module:name" (and bare name) -> the value's body expression. */
+    values: new Map(),
+    str: (i) => strings[i] ?? `<str:${i}>`,
+    dname: (i) => dottedNames[i] ?? `<dname:${i}>`,
+  };
+
+  const modules = subs(pkg, S.Package.modules);
+
+  // The compiler HOISTS choice controller / signatory / observer expressions
+  // into top-level values, so a choice's `controllers` field is usually just a
+  // ValueId reference. Without this table every stakeholder expression looks
+  // empty. Keyed by "Module:name" and by bare name for same-package lookups.
+  for (const mod of modules) {
+    const moduleName = ctx.dname(int(mod, S.Module.nameInternedDname));
+    for (const val of subs(mod, S.Module.values)) {
+      const nwt = sub(val, S.DefValue.nameWithType);
+      if (!nwt) continue;
+      const vname = ctx.dname(int(nwt, S.NameWithType.nameInternedDname));
+      const body = sub(val, S.DefValue.expr);
+      if (!body) continue;
+      ctx.values.set(`${moduleName}:${vname}`, body);
+      if (!ctx.values.has(vname)) ctx.values.set(vname, body);
+    }
+  }
+
+  // Bound form, so consumers outside this module (the verification frontend)
+  // can follow a ValueId without reaching for internals.
+  ctx.resolveValue = (expr) => resolveValue(expr, ctx);
+
+  return ctx;
+}
+
+/**
+ * Decode a package into the structural model the access graph consumes.
+ */
+function decodePackage(pkg, { packageId, lfMinor }) {
+  const diagnostics = [];
+  const ctx = buildContext(pkg, diagnostics);
+  const name = ctx.packageName;
+  const version = ctx.packageVersion;
+
+  const templates = [];
+  const interfaces = [];
+  const moduleNames = [];
+  const modules = subs(pkg, S.Package.modules);
+
+  for (const mod of modules) {
+    const moduleName = ctx.dname(int(mod, S.Module.nameInternedDname));
+    moduleNames.push(moduleName);
+
+    for (const tpl of subs(mod, S.Module.templates)) {
+      templates.push(decodeTemplate(tpl, moduleName, ctx));
+    }
+    for (const iface of subs(mod, S.Module.interfaces)) {
+      interfaces.push(decodeInterface(iface, moduleName, ctx));
+    }
+  }
+
+  if (templates.length === 0 && interfaces.length === 0) {
+    diagnostics.push({
+      severity: 'warning',
+      code: 'dalf-empty',
+      message:
+        `Package ${name || '?'} decoded cleanly but declares no templates or interfaces. ` +
+        `If that is unexpected, the package may be LF 1 or use a schema revision this decoder ` +
+        `has not been checked against (checked: LF 2.${S.CHECKED_AGAINST_MINOR.join(', 2.')}).`,
+    });
+  }
+
+  if (lfMinor && !S.CHECKED_AGAINST_MINOR.includes(lfMinor)) {
+    diagnostics.push({
+      severity: 'warning',
+      code: 'lf-minor-unchecked',
+      message:
+        `Package is Daml-LF 2.${lfMinor}; this decoder's field numbers were verified against ` +
+        `2.${S.CHECKED_AGAINST_MINOR.join(', 2.')}. Field numbers are additive within LF 2, so ` +
+        `this usually decodes correctly, but treat surprising results with suspicion.`,
+    });
+  }
+
+  return {
+    module: moduleNames.length === 1 ? moduleNames[0] : null,
+    modules: moduleNames,
+    packageId,
+    name,
+    version,
+    lfMinor,
+    templates,
+    interfaces,
+    functions: [],
+    referencedTemplates: [],
+    referencedInterfaces: [],
+    diagnostics,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Templates and interfaces
+// ---------------------------------------------------------------------------
+
+function decodeTemplate(tpl, moduleName, ctx) {
+  const name = ctx.dname(int(tpl, S.DefTemplate.tyconInternedDname));
+  const param = ctx.str(int(tpl, S.DefTemplate.paramInternedStr));
+
+  const signatories = exprParties(sub(tpl, S.DefTemplate.signatories), ctx, {
+    what: `${name} signatory`,
+  });
+  const observers = exprParties(sub(tpl, S.DefTemplate.observers), ctx, {
+    what: `${name} observer`,
+  });
+
+  const choices = subs(tpl, S.DefTemplate.choices).map((c) =>
+    decodeChoice(c, name, ctx, false, param)
+  );
+
+  // Contract key: the maintainer expression is a function from the key to
+  // [Party], so its record projections name the maintaining fields.
+  let key = null;
+  const keyMsg = sub(tpl, S.DefTemplate.key);
+  if (keyMsg) {
+    const maintainers = exprParties(sub(keyMsg, S.DefKey.maintainers), ctx, {
+      what: `${name} key maintainer`,
+    });
+    const keyType = typeName(sub(keyMsg, S.DefKey.type), ctx);
+    key = {
+      expr: keyType || '<key expression not rendered from compiled form>',
+      type: keyType,
+      parties: maintainers,
+      maintainers,
+      line: 0,
+    };
+    if (maintainers.length === 0) {
+      ctx.diagnostics.push({
+        severity: 'info',
+        code: 'key-maintainer-unrecovered',
+        message:
+          `${name}: the contract key was found, but its maintainer expression yielded no field ` +
+          `name from the compiled form. The source parser recovers these (\`maintainer key._1\`); ` +
+          `prefer project mode when maintainer analysis matters.`,
+      });
+    }
+  }
+
+  // `interface instance` blocks, including the view body. The view expression
+  // is a record construction whose fields map view field -> template
+  // expression, which is what resolves a `(view this).admin` controller.
+  const implementsList = [];
+  const interfaceInstances = [];
+  for (const impl of subs(tpl, S.DefTemplate.implements)) {
+    const ifaceRef = typeConName(sub(impl, S.Implements.interface), ctx);
+    if (!ifaceRef) continue;
+    implementsList.push(ifaceRef.name);
+    const body = sub(impl, S.Implements.body);
+    const viewExpr = body ? sub(body, S.InterfaceInstanceBody.view) : undefined;
+    interfaceInstances.push({
+      interface: ifaceRef.name,
+      forTemplate: name,
+      viewType: null,
+      viewBindings: viewExpr ? recordBindings(viewExpr, ctx) : {},
+      nestedViewFields: [],
+      line: 0,
+    });
+  }
+
+  return {
+    name,
+    module: moduleName,
+    param,
+    fields: [],
+    // In compiled code every stakeholder reference is a projection off the
+    // template parameter, so the projected names ARE the party fields.
+    partyFields: [...new Set([...signatories, ...observers])],
+    signatories,
+    observers,
+    choices,
+    implements: [...new Set(implementsList)],
+    interfaceInstances,
+    key,
+    line: 0,
+  };
+}
+
+function decodeInterface(iface, moduleName, ctx) {
+  const name = ctx.dname(int(iface, S.DefInterface.tyconInternedDname));
+  const methods = subs(iface, S.DefInterface.methods).map((m) =>
+    ctx.str(int(m, S.InterfaceMethod.methodInternedName))
+  );
+  const ifaceParam = ctx.str(int(iface, S.DefInterface.paramInternedStr));
+  const choices = subs(iface, S.DefInterface.choices).map((c) =>
+    decodeChoice(c, name, ctx, true, ifaceParam)
+  );
+  const requires = subs(iface, S.DefInterface.requires)
+    .map((r) => typeConName(r, ctx))
+    .filter(Boolean)
+    .map((r) => r.name);
+
+  return {
+    name,
+    module: moduleName,
+    viewtype: typeName(sub(iface, S.DefInterface.view), ctx) || null,
+    methods,
+    choices,
+    requires,
+    line: 0,
+  };
+}
+
+function decodeChoice(choice, ownerName, ctx, onInterface = false, selfParam = null) {
+  const name = ctx.str(int(choice, S.TemplateChoice.nameInternedStr));
+  const consuming = bool(choice, S.TemplateChoice.consuming);
+
+  const argBinder = sub(choice, S.TemplateChoice.argBinder);
+  const argParam = argBinder ? ctx.str(int(argBinder, S.VarWithType.varInternedStr)) : null;
+
+  const controllers = exprParties(sub(choice, S.TemplateChoice.controllers), ctx, {
+    what: `${ownerName}.${name} controller`,
+    // On an interface, stakeholders are reached through the view, so mark
+    // param-rooted projections view-relative to match the source parser's
+    // `view.x` form. Argument-rooted ones are tagged `#arg` instead.
+    viewRelative: onInterface,
+    selfParam,
+    argParam,
+  });
+
+  const operations = [];
+  collectOperations(sub(choice, S.TemplateChoice.update), ctx, operations, new Set());
+
+  return {
+    name,
+    consuming,
+    controllers,
+    operations,
+    refs: [],
+    line: 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Expression walking
+// ---------------------------------------------------------------------------
+
+/**
+ * Dereference the two kinds of indirection an expression can hide behind, so
+ * walks see the real node:
+ *
+ *   * `Expr.interned_expr` - an index into Package.interned_exprs
+ *   * `Expr.val`           - a reference to a top-level value, which is where
+ *                            the compiler puts hoisted stakeholder expressions
+ */
+function deref(expr, ctx, seen = new Set()) {
+  if (!expr) return undefined;
+
+  if (has(expr, S.Expr.internedExpr)) {
+    const idx = int(expr, S.Expr.internedExpr);
+    const key = `e${idx}`;
+    if (seen.has(key)) return undefined;
+    seen.add(key);
+    const target = ctx.internedExprs[idx];
+    if (target) return deref(target, ctx, seen);
+    ctx.diagnostics.push({
+      severity: 'warning',
+      code: 'interned-expr-missing',
+      message: `Expression references interned expression ${idx}, which is not in the table.`,
+    });
+    return undefined;
+  }
+
+  const valRef = resolveValue(expr, ctx);
+  if (valRef) {
+    if (seen.has(valRef.key)) return undefined;
+    seen.add(valRef.key);
+    return deref(valRef.body, ctx, seen);
+  }
+
+  return expr;
+}
+
+/**
+ * Resolve `Expr.val` (a ValueId) against the package's value table, following
+ * the reference into an IMPORTED package when the ValueId carries one and the
+ * context has a cross-package hook (readDarRaw wires it; decodeDalf does not).
+ *
+ * The returned `pkg` is the interning context the BODY must be read against:
+ * a body that lives in daml-stdlib resolves its interned strings and interned
+ * expressions in daml-stdlib's tables, not the referrer's.
+ *
+ * @returns {{key: string, name: string, body: Object, pkg: Object}|undefined}
+ */
+function resolveValue(expr, ctx) {
+  const val = sub(expr, S.Expr.val);
+  if (!val) return undefined;
+  // Name indices resolve in the REFERRING package's tables; the resulting
+  // strings are then looked up in the target package's value map.
+  const name = ctx.dname(int(val, S.ValueId.nameInternedDname));
+  if (!name || name.startsWith('<dname:')) return undefined;
+  const moduleRef = sub(val, S.ValueId.module);
+  const moduleName = moduleRef
+    ? ctx.dname(int(moduleRef, S.ModuleId.moduleNameInternedDname))
+    : null;
+  const qualified = moduleName ? `${moduleName}:${name}` : null;
+
+  // Which package does the reference point at?
+  let externalPkgId = null;
+  const pkgRef = moduleRef ? sub(moduleRef, S.ModuleId.packageId) : null;
+  if (pkgRef) {
+    if (has(pkgRef, S.SelfOrImportedPackageId.importedPackageIdInternedStr)) {
+      externalPkgId = ctx.str(int(pkgRef, S.SelfOrImportedPackageId.importedPackageIdInternedStr));
+    } else if (has(pkgRef, S.SelfOrImportedPackageId.packageImportId)) {
+      const idx = int(pkgRef, S.SelfOrImportedPackageId.packageImportId);
+      externalPkgId = ctx.importedPackages[idx] ?? null;
+    }
+    // `selfPackageId` (or no package ref at all) means this package.
+  }
+
+  if (externalPkgId && externalPkgId !== ctx.selfPackageId) {
+    if (!ctx.getImportedPackage || !qualified) return undefined;
+    const target = ctx.getImportedPackage(externalPkgId);
+    if (!target) return undefined;
+    const body = target.values.get(qualified);
+    if (!body) return undefined;
+    // No bare-name fallback across packages: a same-named local value must not
+    // stand in for the imported one.
+    return { key: `v${externalPkgId}:${qualified}`, name: qualified, body, pkg: target };
+  }
+
+  const body = (qualified && ctx.values.get(qualified)) || ctx.values.get(name);
+  if (!body) return undefined;
+  return {
+    key: `v${ctx.selfPackageId || 'self'}:${qualified || name}`,
+    name: qualified || name,
+    body,
+    pkg: ctx,
+  };
+}
+
+/**
+ * Collect the record-projection field names in an expression: the party fields
+ * of a signatory / observer / controller / maintainer expression.
+ *
+ * A projection chain (`this.data.owner`) yields the OUTERMOST field joined to
+ * the inner path, matching the source parser's `contractData.owner` form, so
+ * the two frontends produce comparable party labels.
+ */
+function exprParties(expr, ctx, { what, viewRelative = false, selfParam, argParam } = {}) {
+  const e = deref(expr, ctx);
+  if (!e) return [];
+
+  const found = [];
+  let sawSignatoryRef = false;
+  walkExpr(e, ctx, {
+    recProj: (path, rootVar) => found.push({ path, rootVar }),
+    signatoryRef: () => {
+      sawSignatoryRef = true;
+    },
+  });
+
+  // Label each projection by what it is rooted in, mirroring the source
+  // parser so both frontends produce comparable party labels:
+  //   rooted in the template/interface param -> a field (or `view.` field)
+  //   rooted in the choice argument          -> a choice argument, not a field
+  const parties = [];
+  const seen = new Set();
+  let unattributed = 0;
+  for (const { path, rootVar } of found) {
+    let label;
+    if (argParam && rootVar === argParam) {
+      label = `${path}#arg`;
+    } else if (rootVar === selfParam) {
+      label = viewRelative ? `view.${path}` : path;
+    } else {
+      // The chain bottoms out in a compiler-introduced let-binding (the
+      // optimizer hoists `view this` into `let ds1 = ... in ds1.x`), so
+      // whether this is a view field or a choice argument is not derivable
+      // here. Emit the bare path rather than guessing a prefix.
+      label = path;
+      unattributed++;
+    }
+    if (seen.has(label)) continue;
+    seen.add(label);
+    parties.push(label);
+  }
+
+  if (unattributed > 0 && what) {
+    ctx.diagnostics.push({
+      severity: 'info',
+      code: 'party-root-unattributed',
+      message:
+        `${what}: ${unattributed} projection path(s) are rooted in a compiler-introduced ` +
+        `let-binding rather than the parameter or the choice argument, so they are reported as ` +
+        `bare field paths without a \`view.\`/\`#arg\` attribution.`,
+    });
+  }
+
+  // `choice Archive` and any `controller signatory this` compile to a
+  // signatory reference with no projection of their own. That is not a failure
+  // to resolve: the controllers ARE the stakeholders, so say so.
+  if (parties.length === 0 && sawSignatoryRef) return ['<signatories>'];
+
+  if (parties.length === 0 && what) {
+    ctx.diagnostics.push({
+      severity: 'info',
+      code: 'unresolved-party-expr',
+      message:
+        `${what}: the compiled expression contains no record projection, so no party field name ` +
+        `could be recovered (it is computed, e.g. by a helper call or a runtime list).`,
+    });
+  }
+  return parties;
+}
+
+/**
+ * The bindings of a record-construction expression: field name -> a readable
+ * rendering of the bound expression. Used for `interface instance` view bodies.
+ */
+function recordBindings(expr, ctx) {
+  const e = deref(expr, ctx);
+  if (!e) return {};
+  /** @type {Record<string,string>} */
+  const out = {};
+  // The view body is typically a lambda over `this` wrapping the record.
+  const rec = findRecCon(e, ctx, 0);
+  if (!rec) return out;
+  for (const f of subs(rec, S.RecCon.fields)) {
+    const field = ctx.str(int(f, S.FieldWithExpr.fieldInternedStr));
+    const valueExpr = deref(sub(f, S.FieldWithExpr.expr), ctx);
+    if (!valueExpr) continue;
+    const projections = [];
+    walkExpr(valueExpr, ctx, { recProj: (p) => projections.push(p) });
+    // A view field bound to exactly one projection is a direct pass-through,
+    // which is the case the access graph can resolve. Anything else is left
+    // out rather than guessed at.
+    if (projections.length === 1) out[field] = projections[0];
+  }
+  return out;
+}
+
+function findRecCon(expr, ctx, depth) {
+  if (depth > 10) return undefined;
+  // The view body is commonly a hoisted top-level value, so look through the
+  // indirection before searching for the record construction.
+  const e = deref(expr, ctx) || expr;
+  if (e !== expr) {
+    const viaRef = findRecCon(e, ctx, depth + 1);
+    if (viaRef) return viaRef;
+  }
+  const rec = sub(expr, S.Expr.recCon);
+  if (rec) return rec;
+  for (const fn of [S.Expr.abs, S.Expr.tyAbs, S.Expr.let, S.Expr.tyApp]) {
+    const inner = sub(expr, fn);
+    if (!inner) continue;
+    // body is field 2 for Abs/TyAbs/Block, field 1 for TyApp
+    for (const bodyField of [2, 1]) {
+      const body = deref(sub(inner, bodyField), ctx);
+      if (!body) continue;
+      const found = findRecCon(body, ctx, depth + 1);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Walk an expression tree, reporting record projections.
+ *
+ * Descent is GENERIC (every length-delimited subfield is followed) because Expr
+ * is a 40-case oneof and the access graph only cares about a couple of leaves.
+ * To keep that from misreading unrelated bytes, a candidate is only accepted
+ * when it has the right SHAPE: a RecProj must carry both a field index and a
+ * record subexpression.
+ */
+function walkExpr(expr, ctx, visit, depth = 0, seen = new Set()) {
+  if (!expr || depth > 60) return;
+
+  if (visit.signatoryRef) {
+    for (const fn of [S.Expr.signatoryInterface, S.Expr.observerInterface]) {
+      if (has(expr, fn)) visit.signatoryRef();
+    }
+  }
+
+  const proj = sub(expr, S.Expr.recProj);
+  if (proj && has(proj, S.RecProj.fieldInternedStr) && has(proj, S.RecProj.record)) {
+    const chain = projectionChain(proj, ctx, depth);
+    if (chain) {
+      if (visit.recProj) visit.recProj(chain.path, chain.rootVar);
+      return;
+    }
+  }
+
+  const valRef = resolveValue(expr, ctx);
+  if (valRef && !seen.has(valRef.key)) {
+    seen.add(valRef.key);
+    walkExpr(valRef.body, ctx, visit, depth + 1, seen);
+  }
+
+  for (const [fieldNumber, values] of expr) {
+    if (fieldNumber === S.Expr.internedExpr) {
+      const idx = int(expr, S.Expr.internedExpr);
+      if (seen.has(`e${idx}`)) continue;
+      seen.add(`e${idx}`);
+      walkExpr(ctx.internedExprs[idx], ctx, visit, depth + 1, seen);
+      continue;
+    }
+    if (fieldNumber === S.Expr.val) continue; // handled above
+    for (const v of values) {
+      if (!(v instanceof Uint8Array) || v.length === 0) continue;
+      let child;
+      try {
+        child = decodeMessage(v);
+      } catch (_) {
+        continue; // not a submessage: a string or opaque bytes
+      }
+      walkExpr(child, ctx, visit, depth + 1, seen);
+    }
+  }
+}
+
+/**
+ * Flatten a RecProj chain into a dotted path plus the variable it is rooted in.
+ *
+ *   this.issuer                  -> {path: 'issuer',            rootVar: 'this'}
+ *   this.contractData.owner      -> {path: 'contractData.owner', rootVar: 'this'}
+ *   (view this).transfer.sender  -> {path: 'transfer.sender',    rootVar: 'this'}
+ *   arg.newOwner                 -> {path: 'newOwner',           rootVar: 'arg'}
+ *
+ * The root matters: a projection off the choice argument is supplied by the
+ * exercising party, not a field of the contract, and conflating the two was
+ * the biggest false-positive source in the source parser too.
+ */
+function projectionChain(proj, ctx, depth) {
+  const segments = [];
+  let node = proj;
+  for (let i = 0; i < 12 && node; i++) {
+    if (!has(node, S.RecProj.fieldInternedStr)) return null;
+    segments.unshift(ctx.str(int(node, S.RecProj.fieldInternedStr)));
+    const record = deref(sub(node, S.RecProj.record), ctx);
+    if (!record) return { path: segments.join('.'), rootVar: null };
+
+    const next = sub(record, S.Expr.recProj);
+    if (next && has(next, S.RecProj.fieldInternedStr)) {
+      node = next;
+      continue;
+    }
+    // Bottom of the chain. `view this` wraps the variable, so look through it.
+    const rootVar = rootVariable(record, ctx, 0);
+    return { path: segments.join('.'), rootVar };
+  }
+  return { path: segments.join('.'), rootVar: null };
+}
+
+/** The variable a (possibly wrapped) expression bottoms out in. */
+function rootVariable(expr, ctx, depth) {
+  if (!expr || depth > 6) return null;
+  if (has(expr, S.Expr.varInternedStr)) return ctx.str(int(expr, S.Expr.varInternedStr));
+  for (const fn of [
+    S.Expr.viewInterface,
+    S.Expr.toInterface,
+    S.Expr.fromInterface,
+    S.Expr.unsafeFromInterface,
+  ]) {
+    const inner = sub(expr, fn);
+    if (!inner) continue;
+    for (const f of [2, 3, 4]) {
+      const e = deref(sub(inner, f), ctx);
+      const v = e ? rootVariable(e, ctx, depth + 1) : null;
+      if (v) return v;
+    }
+  }
+  return null;
+}
+
+/**
+ * Collect ledger operations from a choice body.
+ *
+ * Same validated generic descent as walkExpr: an `Update` candidate is only
+ * accepted when one of its operation cases carries a TypeConId that resolves
+ * to a real name, which makes a coincidental field-number match very unlikely.
+ */
+function collectOperations(expr, ctx, out, seen, depth = 0) {
+  if (!expr || depth > 60) return;
+
+  const update = sub(expr, S.Expr.update);
+  if (update) {
+    for (const [fieldNumber, spec] of Object.entries(S.UPDATE_OPS)) {
+      const opMsg = sub(update, Number(fieldNumber));
+      if (!opMsg) continue;
+      const target = typeConName(sub(opMsg, spec.targetField), ctx);
+      if (!target) continue;
+      out.push({
+        kind: spec.kind,
+        target: target.name,
+        inferred: true,
+        ...(spec.byInterface ? { targetKind: 'interface' } : {}),
+        ...(target.external ? { targetExternal: true, targetPackage: target.packageRef } : {}),
+        ...(spec.choiceField && has(opMsg, spec.choiceField)
+          ? { choice: ctx.str(int(opMsg, spec.choiceField)) }
+          : {}),
+        resolvedVia: 'daml-lf',
+        line: 0,
+      });
+    }
+  }
+
+  const valRef = resolveValue(expr, ctx);
+  if (valRef && !seen.has(valRef.key)) {
+    seen.add(valRef.key);
+    collectOperations(valRef.body, ctx, out, seen, depth + 1);
+  }
+
+  for (const [fieldNumber, values] of expr) {
+    if (fieldNumber === S.Expr.internedExpr) {
+      const idx = int(expr, S.Expr.internedExpr);
+      if (seen.has(`e${idx}`)) continue;
+      seen.add(`e${idx}`);
+      collectOperations(ctx.internedExprs[idx], ctx, out, seen, depth + 1);
+      continue;
+    }
+    if (fieldNumber === S.Expr.val) continue; // handled above
+    for (const v of values) {
+      if (!(v instanceof Uint8Array) || v.length === 0) continue;
+      let child;
+      try {
+        child = decodeMessage(v);
+      } catch (_) {
+        continue;
+      }
+      collectOperations(child, ctx, out, seen, depth + 1);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Names
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a TypeConId to its bare name, and say whether it lives in this
+ * package or an imported one.
+ * @returns {{name: string, module: string|null, external: boolean, packageRef: string|null}|undefined}
+ */
+function typeConName(tycon, ctx) {
+  if (!tycon) return undefined;
+  if (!has(tycon, S.TypeConId.nameInternedDname) && !has(tycon, S.TypeConId.module)) return undefined;
+  const name = ctx.dname(int(tycon, S.TypeConId.nameInternedDname));
+  if (!name || name.startsWith('<dname:')) return undefined;
+
+  const moduleRef = sub(tycon, S.TypeConId.module);
+  let module = null;
+  let external = false;
+  let packageRef = null;
+  if (moduleRef) {
+    module = ctx.dname(int(moduleRef, S.ModuleId.moduleNameInternedDname));
+    const pkgRef = sub(moduleRef, S.ModuleId.packageId);
+    if (pkgRef) {
+      if (has(pkgRef, S.SelfOrImportedPackageId.importedPackageIdInternedStr)) {
+        external = true;
+        packageRef = ctx.str(int(pkgRef, S.SelfOrImportedPackageId.importedPackageIdInternedStr));
+      } else if (has(pkgRef, S.SelfOrImportedPackageId.packageImportId)) {
+        external = true;
+        const idx = int(pkgRef, S.SelfOrImportedPackageId.packageImportId);
+        packageRef = ctx.importedPackages[idx] ?? `<import:${idx}>`;
+      }
+    }
+  }
+  return { name, module, external, packageRef };
+}
+
+/** A readable rendering of a Type, for view types and key types. */
+function typeName(type, ctx, depth = 0) {
+  if (!type || depth > 6) return null;
+  if (has(type, S.Type.internedType)) {
+    return typeName(ctx.internedTypes[int(type, S.Type.internedType)], ctx, depth + 1);
+  }
+  const con = sub(type, S.Type.con);
+  if (con) {
+    const ref = typeConName(sub(con, S.TypeCon.tycon), ctx);
+    if (ref) {
+      const args = subs(con, S.TypeCon.args)
+        .map((a) => typeName(a, ctx, depth + 1))
+        .filter(Boolean);
+      return args.length ? `${ref.name} ${args.join(' ')}` : ref.name;
+    }
+  }
+  return null;
+}

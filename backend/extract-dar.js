@@ -13,25 +13,33 @@
 // with meta.source = "daml-lf". Requires the Daml SDK (`daml` / `damlc`) on
 // PATH. Usage:
 //
-//   node backend/extract-dar.js path/to/foo.dar [--out graph.json] [--lf out.lf]
-//   node backend/extract-dar.js --lf-file dump.lf   # skip the SDK, parse a saved LF dump
+//   node backend/extract-dar.js path/to/foo.dar [--out graph.json] [--analyze]
+//   node backend/extract-dar.js path/to/foo.dar --damlc   # legacy text-scraping path
+//   node backend/extract-dar.js --lf-file dump.lf         # parse a saved LF dump
+//
+// The DEFAULT path now decodes the DAR's Daml-LF protobuf directly (see
+// dalf.js), which needs no SDK and recovers interfaces, contract keys and
+// `implements` relationships that the `damlc inspect` text form does not
+// expose. `--damlc` keeps the old behaviour for comparison.
 //
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 
 import { parseLfPretty } from './lf-parser.js';
+import { readDar } from './dalf.js';
 import { readDarManifest } from './dar.js';
 import { buildGraph } from '../src/graph.js';
 import { analyzeAll } from '../src/analysis.js';
 
 function parseArgs(argv) {
-  const args = { _: [], out: null, lf: null, lfFile: null, analyze: false };
+  const args = { _: [], out: null, lf: null, lfFile: null, analyze: false, damlc: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--out') args.out = argv[++i];
     else if (a === '--lf') args.lf = argv[++i];
     else if (a === '--lf-file') args.lfFile = argv[++i];
     else if (a === '--analyze') args.analyze = true;
+    else if (a === '--damlc') args.damlc = true;
     else if (a === '-h' || a === '--help') args.help = true;
     else args._.push(a);
   }
@@ -101,19 +109,26 @@ function main() {
   if (args.help || (!args.lfFile && args._.length === 0)) {
     process.stdout.write(
       'Usage:\n' +
-        '  node backend/extract-dar.js <foo.dar> [--out graph.json] [--lf dump.lf]\n' +
-        '  node backend/extract-dar.js --lf-file dump.lf [--out graph.json]\n'
+        '  node backend/extract-dar.js <foo.dar> [--out graph.json] [--analyze]\n' +
+        '      Decodes the DAR protobuf directly. No Daml SDK required.\n' +
+        '  node backend/extract-dar.js <foo.dar> --damlc [--lf dump.lf]\n' +
+        '      Legacy path: scrape `damlc inspect` text (needs the SDK on PATH).\n' +
+        '  node backend/extract-dar.js --lf-file dump.lf [--out graph.json]\n' +
+        '      Parse a previously saved LF text dump.\n'
     );
     process.exit(args.help ? 0 : 1);
   }
 
   try {
     let graph;
+    let diagnostics = [];
     if (args.lfFile) {
       if (!existsSync(args.lfFile)) throw new Error(`No such file: ${args.lfFile}`);
       const lfText = readFileSync(args.lfFile, 'utf8');
       graph = extract({ lfText });
-    } else {
+    } else if (args.damlc) {
+      // Legacy path: scrape `damlc inspect` text. Kept for comparison, and as
+      // a fallback if a package will not decode.
       const darPath = args._[0];
       if (!existsSync(darPath)) throw new Error(`No such DAR: ${darPath}`);
       const lf = inspectDar(darPath);
@@ -121,9 +136,28 @@ function main() {
       graph = extract({ lfText: lf });
       const manifest = readDarManifest(darPath);
       if (manifest.name) graph.meta.package = manifest.name;
+    } else {
+      // Default: decode the DAR's protobuf directly. No SDK needed, and it
+      // sees interfaces, keys and `implements` that the text form does not.
+      const darPath = args._[0];
+      if (!existsSync(darPath)) throw new Error(`No such DAR: ${darPath}`);
+      const pkg = readDar(darPath);
+      diagnostics = pkg.diagnostics;
+      graph = buildGraph(pkg, { source: 'daml-lf', module: pkg.module });
+      graph.meta.package = pkg.name;
+      graph.meta.packageVersion = pkg.version;
+      graph.meta.packageId = pkg.packageId;
+      graph.meta.lfVersion = pkg.lfMinor ? `2.${pkg.lfMinor}` : null;
+      graph.meta.sdkVersion = pkg.sdkVersion;
+      graph.meta.modules = pkg.modules;
+      graph.meta.warnings = [
+        ...graph.meta.warnings,
+        ...diagnostics.filter((d) => d.severity !== 'info').map((d) => d.message),
+      ];
     }
 
-    const payload = args.analyze ? { ...graph, analysis: analyzeAll(graph) } : graph;
+    const payload = args.analyze ? { ...graph, analysis: analyzeAll(graph) } : { ...graph };
+    if (diagnostics.length) payload.diagnostics = diagnostics;
     const json = JSON.stringify(payload, null, 2);
     if (args.out) {
       writeFileSync(args.out, json);
