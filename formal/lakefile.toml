@@ -1,0 +1,7 @@
+# Lake configuration for the machine-checked VC layer.
+# Core Lean 4 only: no mathlib, no external dependencies, builds offline.
+name = "formal"
+defaultTargets = ["Formal"]
+
+[[lean_lib]]
+name = "Formal"
