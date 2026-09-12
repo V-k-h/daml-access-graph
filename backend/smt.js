@@ -175,6 +175,23 @@ export function usableGuards(transition) {
  */
 export function amountConservation(transition) {
   if (!transition.consuming) return { applicable: false, why: 'nonconsuming choice' };
+
+  // A choice that consumes contracts BESIDES `this` does not satisfy
+  // `sum(created) = this.amount`; the true statement adds the consumed
+  // contracts' amounts, which needs the archived inputs modelled. Answering
+  // the misstated question would yield a spurious DISPROVED, so refuse.
+  if ((transition.consumesOthers || []).length) {
+    const kinds = [...new Set(transition.consumesOthers.map((c) => c.effect))];
+    return {
+      applicable: false,
+      notModellable: true,
+      why:
+        `the choice consumes contracts besides \`this\` (${kinds.join(', ')}), so plain ` +
+        `conservation is the wrong statement: it would have to account for the consumed ` +
+        `contracts' amounts. Modelling archived inputs is not implemented.`,
+    };
+  }
+
   if (transition.creates.length === 0) {
     // No creates AND untranslated parts of the body is a refusal, not a pass:
     // the archive may well have successors the walker could not see.

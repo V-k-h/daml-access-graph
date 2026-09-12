@@ -272,6 +272,8 @@ function makeCtx(pkg, { selfParam, argParam, label, dispatch = null }) {
      */
     symbolicElements: [],
     elementCount: 0,
+    /** Effects consuming contracts other than `this` (see collectEffects). */
+    consumesOthers: [],
     depth: 0,
   };
 }
@@ -1010,6 +1012,7 @@ export function extractTransitions(raw) {
           divisions: ctx.divisions.map((d) => ({ denominator: d.denominator })),
           rounding: [...new Set(ctx.rounding)],
           symbolicElements: ctx.symbolicElements.slice(),
+          consumesOthers: ctx.consumesOthers.slice(),
           unsupported,
           location: readLocation(choiceMsg, S.TemplateChoice.location, raw.ctx) || tplLocation,
         });
@@ -1203,6 +1206,8 @@ function interfaceInstanceTransitions({
       creates,
       divisions: ctx.divisions.map((d) => ({ denominator: d.denominator })),
       rounding: [...new Set(ctx.rounding)],
+      symbolicElements: ctx.symbolicElements.slice(),
+      consumesOthers: ctx.consumesOthers.slice(),
       unsupported,
       location: implLocation,
     });
@@ -1386,6 +1391,20 @@ function collectEffects(expr, ctx, path, creates, unsupported, depth = 0) {
   }
 
   // any other ledger effect: named, not silently dropped
+  //
+  // `consumesOthers` is tracked separately from the general unsupported list
+  // because it changes WHICH PROPERTY is true, not just how much of the body
+  // we saw. A choice that exercises or archives contracts besides `this` (a
+  // merge consuming its inputs) does not satisfy `sum(created) = this.amount`
+  // at all; the correct statement adds the consumed contracts' amounts. Left
+  // undistinguished, such a choice gets a spurious DISPROVED against a
+  // property nobody claimed. Conservation therefore refuses it outright (see
+  // smt.js) rather than answering the wrong question.
+  const CONSUMING_EFFECTS = new Set([
+    S.Update.exercise,
+    S.Update.exerciseInterface,
+    S.Update.exerciseByKey,
+  ]);
   for (const [field, label] of [
     [S.Update.exercise, 'exercise'],
     [S.Update.exerciseInterface, 'exercise (interface)'],
@@ -1399,6 +1418,9 @@ function collectEffects(expr, ctx, path, creates, unsupported, depth = 0) {
   ]) {
     if (has(update, field)) {
       unsupported.push({ why: `${label} in the choice body is outside the modelled fragment` });
+      if (CONSUMING_EFFECTS.has(field) && ctx.consumesOthers) {
+        ctx.consumesOthers.push({ effect: label });
+      }
       return;
     }
   }

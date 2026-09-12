@@ -746,3 +746,41 @@ test('an arbitrary element with an unconstrained divisor is refuted', { skip: !S
   );
   assert.match(runSolver(buildQuery(guarded.guards, guarded.goal).script), /^unsat/m);
 });
+
+test('conservation refuses a choice that consumes contracts besides `this`', () => {
+  // A merge consumes its inputs, so `sum(created) = this.amount` is simply the
+  // wrong statement: the true one adds the consumed amounts. Answering the
+  // misstated question would produce a spurious DISPROVED.
+  const t = transition({
+    consumesOthers: [{ effect: 'exercise (interface)' }],
+    creates: [{ template: 'Tok', base: null, fields: { amount: v('this.amount') }, path: [] }],
+  });
+  const inst = amountConservation(t);
+  assert.equal(inst.applicable, false);
+  assert.equal(inst.notModellable, true);
+  assert.match(inst.why, /consumes contracts besides/);
+  assert.match(inst.why, /wrong statement/);
+});
+
+test('the wrong-property refusal dominates a mere translation gap', () => {
+  // Both problems present: the refusal must name the property error, which is
+  // fundamental, not the FOLDL gap, which is incidental.
+  const t = transition({
+    consumesOthers: [{ effect: 'exercise' }],
+    creates: [
+      { template: 'Tok', base: null, fields: { amount: T.unsupported('builtin FOLDL', 'x') }, path: [] },
+    ],
+  });
+  assert.match(amountConservation(t).why, /consumes contracts besides/);
+});
+
+test('a self-contained split is unaffected by the consuming-others rule', () => {
+  const t = transition({
+    consumesOthers: [],
+    creates: [
+      { template: 'Tok', base: null, fields: { amount: v('arg.amount') }, path: [] },
+      { template: 'Tok', base: null, fields: { amount: T.app('-', [v('this.amount'), v('arg.amount')]) }, path: [] },
+    ],
+  });
+  assert.equal(amountConservation(t).applicable, true);
+});
