@@ -496,6 +496,98 @@ function buildTypedRecordDalf() {
   return msg(bf(S.Archive.payload, payload), sf(S.Archive.hash, 'typedfixture'));
 }
 
+/**
+ * A package whose data types are an ENUM and a VARIANT alongside a record:
+ *
+ *   data Color  = Red | Green | Blue          -- enum, no payloads
+ *   data Result = Ok Int64 | Err Text         -- variant, payloads
+ *   data Token  = Token with amount : Int64
+ *
+ * The point of the fixture is the CONSTRUCTOR LISTS: they become the
+ * constructor lists of SMT datatype sorts, and a short one is unsound for
+ * PROVED (see dalf.js).
+ */
+function buildEnumVariantDalf() {
+  const strings = ['Tok', 'Color', 'Result', 'Token', 'Red', 'Green', 'Blue', 'Ok', 'Err', 'amount', 'pkg', '1.0.0'];
+  const SI = Object.fromEntries(strings.map((s, i) => [s, i]));
+  const dnameOrder = ['Tok', 'Color', 'Result', 'Token'];
+  const DN = Object.fromEntries(dnameOrder.map((n, i) => [n, i]));
+  const dnameMsgs = dnameOrder.map((n) =>
+    bf(S.Package.internedDottedNames, bf(S.InternedDottedName.segmentsInternedStr, varint(SI[n])))
+  );
+  const BT = S.ENUMS.BuiltinType;
+  const builtinType = (code) => bf(S.Type.builtin, vf(S.TypeBuiltin.builtin, code));
+  const field = (nameSi, typeBuf) =>
+    bf(
+      S.DataTypeFields.fields,
+      msg(bf(S.FieldWithType.type, typeBuf), vf(S.FieldWithType.fieldInternedStr, nameSi))
+    );
+
+  const module = msg(
+    vf(S.Module.nameInternedDname, DN.Tok),
+    bf(
+      S.Module.dataTypes,
+      msg(
+        vf(S.DefDataType.nameInternedDname, DN.Color),
+        bf(
+          S.DefDataType.enum,
+          // repeated int32, written UNPACKED here; readPackedVarints takes both
+          msg(
+            vf(S.DataTypeEnumConstructors.constructorsInternedStr, SI.Red),
+            vf(S.DataTypeEnumConstructors.constructorsInternedStr, SI.Green),
+            vf(S.DataTypeEnumConstructors.constructorsInternedStr, SI.Blue)
+          )
+        )
+      )
+    ),
+    bf(
+      S.Module.dataTypes,
+      msg(
+        vf(S.DefDataType.nameInternedDname, DN.Result),
+        // a variant's constructors are encoded exactly like record fields
+        bf(
+          S.DefDataType.variant,
+          msg(field(SI.Ok, builtinType(BT.INT64)), field(SI.Err, builtinType(BT.TEXT)))
+        )
+      )
+    ),
+    bf(
+      S.Module.dataTypes,
+      msg(
+        vf(S.DefDataType.nameInternedDname, DN.Token),
+        bf(S.DefDataType.record, msg(field(SI.amount, builtinType(BT.INT64))))
+      )
+    )
+  );
+
+  const pkg = msg(
+    bf(S.Package.modules, module),
+    ...strings.map((str) => sf(S.Package.internedStrings, str)),
+    ...dnameMsgs,
+    bf(
+      S.Package.metadata,
+      msg(
+        vf(S.PackageMetadata.nameInternedStr, SI.pkg),
+        vf(S.PackageMetadata.versionInternedStr, SI['1.0.0'])
+      )
+    )
+  );
+  const payload = msg(sf(S.ArchivePayload.minor, '3'), bf(S.ArchivePayload.damlLf2, pkg));
+  return msg(bf(S.Archive.payload, payload), sf(S.Archive.hash, 'enumvariantfixture'));
+}
+
+/** The decoded TypeConId naming `Tok:<name>` in the enum/variant fixture. */
+function tyconOf(raw, name) {
+  const order = ['Tok', 'Color', 'Result', 'Token'];
+  const selfModule = msg(
+    bf(S.ModuleId.packageId, bf(S.SelfOrImportedPackageId.selfPackageId, Buffer.alloc(0))),
+    vf(S.ModuleId.moduleNameInternedDname, 0)
+  );
+  return decodeMessage(
+    msg(bf(S.TypeConId.module, selfModule), vf(S.TypeConId.nameInternedDname, order.indexOf(name)))
+  );
+}
+
 test('dalf: DefDataType records decode to coarse field sorts', () => {
   const raw = decodeDalfRaw(buildTypedRecordDalf());
   // Exposed on the raw result, which is what the verification frontend reads.
@@ -513,15 +605,19 @@ test('dalf: DefDataType records decode to coarse field sorts', () => {
       when: 'time',
       ref: 'cid',
       flag: 'bool',
-      // `Optional Int64` is NOT numeric: the head of the application decides,
-      // and the IR models an Optional field as a $some/$value pair anyway.
-      opt: 'unknown',
+      // `Optional Int64` is an OPTIONAL, not a number: the head of the
+      // application decides, and the IR models an Optional field as a
+      // $some/$value pair the plain path denotes neither half of. The
+      // ELEMENT's classification is carried alongside so the resolver can
+      // answer for the synthetic segments.
+      opt: 'optional',
       // a type PARAMETER: its instantiation is not visible here, and anything
       // but `unknown` would be inventing a fact.
       poly: 'unknown',
       data_: 'record',
     }
   );
+  assert.equal(token.fields.get('opt').elem.sort, 'numeric');
   // A nested record carries the qualified name the path walk continues at.
   assert.deepEqual(
     { module: token.fields.get('data_').ref.module, name: token.fields.get('data_').ref.name },
@@ -558,12 +654,61 @@ test('dalf: a nested record path is followed; an unfollowable one yields null', 
   // a partial or guessed sort.
   assert.equal(resolveFieldSort(raw.ctx, start, ['nosuchfield']), null, 'unknown field');
   assert.equal(resolveFieldSort(raw.ctx, start, ['label', 'x']), null, 'step through a non-record');
-  assert.equal(resolveFieldSort(raw.ctx, start, ['opt']), null, 'unknown sort reports as null');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['poly']), null, 'unknown sort reports as null');
   assert.equal(resolveFieldSort(raw.ctx, start, ['data_', 'rate', 'x']), null, 'past the end');
   assert.equal(resolveFieldSort(raw.ctx, start, []), null, 'empty path');
   assert.equal(resolveFieldSort(raw.ctx, { module: 'Tok', name: 'Color' }, ['x']), null, 'enum');
   assert.equal(resolveFieldSort(raw.ctx, { module: 'Nope', name: 'Token' }, ['amount']), null);
-  // The $some/$value segments the IR's Optional encoding introduces are not
-  // declared fields, so they resolve to nothing rather than to the element sort.
-  assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$value']), null);
+});
+
+test('dalf: the Optional encoding\'s synthetic segments resolve from the declaration', () => {
+  // The IR does not model an `Optional T` field as a value: it models it as
+  // the pair `<path>.$some : Bool` / `<path>.$value : T` (lfir.js). Those
+  // segments are not declared fields, and before they were understood here a
+  // property could not tell an `Optional Numeric` it failed to read from a
+  // field whose type the archive does not carry.
+  const raw = decodeDalfRaw(buildTypedRecordDalf());
+  const start = { module: 'Tok', name: 'Token' };
+  // `opt` is `Optional Int64`. The path itself denotes NEITHER half of the
+  // pair, so it answers `optional:<element>` and never `numeric` - answering
+  // `numeric` would tell a property that an unreadable field is a number.
+  assert.equal(resolveFieldSort(raw.ctx, start, ['opt']), 'optional:numeric');
+  // The presence flag is a Bool whatever the element is: a fact about the
+  // encoding, not about T.
+  assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$some']), 'bool');
+  // The payload is answered only for a NUMERIC element, which is the case
+  // whose consequences are worked through; see the note on resolveFieldSort.
+  assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$value']), 'numeric');
+  // Nothing is walked THROUGH the payload, and no other synthetic segment is
+  // invented.
+  assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$value', 'x']), null);
+  assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$nope']), null);
+  assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$some', 'x']), null);
+});
+
+test('dalf: enum and variant declarations carry their COMPLETE constructor list', () => {
+  // The list becomes the constructor list of an SMT datatype sort, so a short
+  // one would make the sort's variables range over fewer values than the Daml
+  // type has - which can turn a satisfiable query unsat and yield a spurious
+  // PROVED. It is therefore read off the declaration, never assembled from the
+  // constructors a `case` happens to name.
+  const raw = decodeDalfRaw(buildEnumVariantDalf());
+  assert.deepEqual(raw.dataTypes.get('Tok:Color').constructors, ['Red', 'Green', 'Blue']);
+  assert.equal(raw.dataTypes.get('Tok:Color').kind, 'enum');
+  assert.deepEqual(raw.dataTypes.get('Tok:Result').constructors, ['Ok', 'Err']);
+  assert.equal(raw.dataTypes.get('Tok:Result').kind, 'variant');
+
+  // The sort name IDENTIFIES the declaring package's type, the way a UF symbol
+  // identifies a function: two types sharing one sort would assert that their
+  // values are drawn from one set.
+  const ref = raw.ctx.dataConRefOfTycon(tyconOf(raw, 'Color'));
+  assert.equal(ref.kind, 'enum');
+  assert.deepEqual(ref.constructors, ['Red', 'Green', 'Blue']);
+  assert.match(ref.sortName, /^enum Tok:Color@/);
+  assert.notEqual(
+    raw.ctx.dataConRefOfTycon(tyconOf(raw, 'Result')).sortName,
+    ref.sortName
+  );
+  // A RECORD is not a datatype case: nothing to enumerate, so nothing given.
+  assert.equal(raw.ctx.dataConRefOfTycon(tyconOf(raw, 'Token')), null);
 });

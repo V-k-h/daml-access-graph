@@ -68,6 +68,8 @@ import {
   eucMod,
   evalTerm,
   party,
+  dcon,
+  isDcon,
 } from '../backend/ir-eval.js';
 
 // ------------------------------------------------------------ solver gating
@@ -918,3 +920,160 @@ test(
     assert.equal(failures.length, 0, failures.join('\n\n'));
   }
 );
+
+// ==================================== differential: declared datatype sorts
+//
+// A Daml enum (and a variant's discriminant) becomes an SMT ALGEBRAIC DATATYPE
+// declared with exactly the constructors the package declares, and the only
+// operation on it is equality. Unlike an uninterpreted function there is
+// nothing to pin: SMT-LIB fixes the meaning of a datatype's nullary
+// constructors - they are pairwise distinct and they exhaust the sort - so the
+// emitter and the evaluator must agree with no interpretation supplied at all.
+//
+// Both of those facts are exercised here, and the second one is the load-
+// bearing half: the EXHAUSTIVENESS of the declared list is what makes a
+// `_ ->` catch-all sound as the negation of the alternatives above it. If the
+// sort admitted a value outside the declaration, `not C1 and not C2 => C3`
+// would be false in the solver and true in the evaluator, and this test would
+// say so.
+
+const COLOR = 'enum M:Color@diffpkg';
+const COLOR_CTORS = ['Red', 'Green', 'Blue'];
+const TAG = 'variant M:Result@diffpkg';
+const TAG_CTORS = ['Ok', 'Err'];
+
+const dc = (sort, ctors) => (ctor) => T.dcon(sort, ctor, ctors);
+const color = dc(COLOR, COLOR_CTORS);
+const tag = dc(TAG, TAG_CTORS);
+
+/** The SMT symbol a datatype value renders as, matching smt.js's dconSymbol. */
+const dconSmt = (v) => smtSym(`${v.dconSort}#${v.ctor}`);
+
+/**
+ * A self-contained differential script for a term over datatype sorts.
+ * Declares every sort the term mentions from the term's OWN constructor lists
+ * (which is what buildQuery does), binds each variable to its value, and asks
+ * whether the emitted term can differ from what the evaluator computed.
+ */
+function datatypeScript(term, env, expected) {
+  const expectedSort =
+    typeof expected === 'boolean' ? 'Bool' : isDcon(expected) ? expected.dconSort : 'Real';
+  const { sorts, conflicts, datatypes } = inferSorts([{ term, sort: expectedSort }]);
+  assert.deepEqual(conflicts, [], 'a differential case must be well sorted');
+  const sortText = (name) => (datatypes.has(name) ? smtSym(name) : name);
+  const lines = ['(set-logic ALL)'];
+  for (const [name, ctors] of [...datatypes.entries()].sort()) {
+    lines.push(
+      `(declare-datatypes ((${smtSym(name)} 0)) ((${ctors
+        .map((c) => `(${smtSym(`${name}#${c}`)})`)
+        .join(' ')})))`
+    );
+  }
+  for (const [name, sort] of [...sorts.entries()].sort()) {
+    lines.push(`(declare-const ${smtSym(name)} ${sortText(sort)})`);
+    const value = env[name];
+    lines.push(
+      `(assert (= ${smtSym(name)} ${isDcon(value) ? dconSmt(value) : valueToSmt(value, sort)}))`
+    );
+  }
+  const expectedSmt = isDcon(expected)
+    ? dconSmt(expected)
+    : valueToSmt(expected, expectedSort === 'Bool' ? 'Bool' : 'Real');
+  lines.push(`(assert (not (= ${termToSmt(term, true)} ${expectedSmt})))`);
+  lines.push('(check-sat)');
+  return lines.join('\n') + '\n';
+}
+
+test(
+  'differential: datatype equality and case chains agree with the evaluator',
+  { skip: !SOLVER && NO_SOLVER_MSG },
+  (t) => {
+    const rnd = mulberry32(SEED ^ 0xda7a);
+    const failures = [];
+    let checked = 0;
+
+    // A case chain over a scrutinee variable, with a catch-all: exactly the
+    // shape translateDataCase builds.
+    const chain = (scrut, ctors, bodies, fallback) => {
+      let out = fallback;
+      for (let i = ctors.length - 1; i >= 0; i--) {
+        out = T.ite(T.app('=', [scrut, color(ctors[i])]), bodies[i], out);
+      }
+      return out;
+    };
+
+    for (let i = 0; i < 60; i++) {
+      const cv = pick(rnd, COLOR_CTORS);
+      const tv = pick(rnd, TAG_CTORS);
+      const env = { 'this.shade': dcon(COLOR, cv), 'this.status': dcon(TAG, tv) };
+      const shade = T.varRef('this.shade', 'Real');
+      const status = T.varRef('this.status', 'Real');
+
+      // 1. plain equality, both against a constant and between two variables
+      const terms = [
+        T.app('=', [shade, color(pick(rnd, COLOR_CTORS))]),
+        T.app('=', [status, tag(pick(rnd, TAG_CTORS))]),
+        T.app('not', [T.app('=', [shade, color(pick(rnd, COLOR_CTORS))])]),
+        // 2. an EXHAUSTIVE chain with the last test dropped - the step whose
+        //    soundness rests on the sort being closed over the declared list
+        chain(shade, ['Red', 'Green'], [T.num('1'), T.num('2')], T.num('3')),
+        // 3. a chain with a catch-all, i.e. the negation of what is above it
+        chain(shade, ['Blue'], [T.num('7')], T.num('9')),
+        // 4. a datatype-VALUED conditional: the branches share the sort
+        T.ite(T.app('=', [status, tag('Ok')]), color('Red'), shade),
+      ];
+
+      for (const term of terms) {
+        const expected = evalTerm(term, env);
+        const script = datatypeScript(term, env, expected);
+        const out = runSolver(script);
+        checked++;
+        if (!/^unsat/m.test(out)) {
+          failures.push(
+            `env ${JSON.stringify({ shade: cv, status: tv })} expected ` +
+              `${isDcon(expected) ? expected.ctor : showValue(expected)}\n${script}\nsolver said:\n${out}`
+          );
+        }
+      }
+    }
+    t.diagnostic(`datatype differential: ${checked} case(s)`);
+    assert.equal(failures.length, 0, failures.slice(0, 2).join('\n\n'));
+  }
+);
+
+test('evalTerm: datatype constants need no interpretation, and never mix sorts', () => {
+  // Distinctness of nullary constructors is part of the theory, so the term
+  // alone fixes the value - unlike a uf, which throws without one.
+  assert.deepEqual(evalTerm(color('Red'), {}), dcon(COLOR, 'Red'));
+  assert.equal(evalTerm(T.app('=', [color('Red'), color('Red')]), {}), true);
+  assert.equal(evalTerm(T.app('=', [color('Red'), color('Green')]), {}), false);
+  // A variable of the sort takes its value from the environment, like a party.
+  const env = { x: dcon(COLOR, 'Blue') };
+  assert.equal(evalTerm(T.app('=', [T.varRef('x', 'Real'), color('Blue')]), env), true);
+  assert.equal(evalTerm(T.app('=', [T.varRef('x', 'Real'), color('Red')]), env), false);
+  // Comparing across sorts is not a well-sorted question and must throw rather
+  // than answer false - a silent false would agree with the emitter for the
+  // wrong reason, exactly what the party sort's own rule exists to prevent.
+  assert.throws(
+    () => evalTerm(T.app('=', [color('Red'), tag('Ok')]), {}),
+    /two different datatype sorts/
+  );
+  assert.throws(
+    () => evalTerm(T.app('=', [color('Red'), T.varRef('p', 'Real')]), { p: party('p1') }),
+    /mixes a datatype constructor with another sort/
+  );
+  assert.throws(
+    () => evalTerm(T.app('+', [color('Red'), T.num('1')]), {}),
+    /expected numeric/
+  );
+});
+
+test('evalTerm: an Optional VALUE is a pair, not a scalar', () => {
+  // The emitter's matching refusal is pinned in tests/verify.test.js. Keeping
+  // both means neither side can start treating half the pair as a value
+  // without the other noticing.
+  assert.throws(
+    () => evalTerm(T.opt(T.bool(true), T.num('1')), {}),
+    /\$some\/\$value pair, not a scalar/
+  );
+});

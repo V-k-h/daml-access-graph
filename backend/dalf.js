@@ -341,9 +341,28 @@ function buildContext(pkg, diagnostics = []) {
           const fname = ctx.str(int(f, S.FieldWithType.fieldInternedStr));
           entry.fields.set(fname, classifyType(sub(f, S.FieldWithType.type), ctx));
         }
-      } else if (has(dt, S.DefDataType.variant)) entry.kind = 'variant';
-      else if (has(dt, S.DefDataType.enum)) entry.kind = 'enum';
-      else if (has(dt, S.DefDataType.interface)) entry.kind = 'interface';
+      } else if (has(dt, S.DefDataType.variant)) {
+        entry.kind = 'variant';
+        // A variant's CONSTRUCTORS are encoded exactly like record fields
+        // (name + payload type). Only the names are kept: the discriminant is
+        // what the translator models (see lfir.js: translateCase), and the
+        // payload types belong to values the IR has no term for.
+        entry.constructors = subs(sub(dt, S.DefDataType.variant), S.DataTypeFields.fields).map(
+          (f) => ctx.str(int(f, S.FieldWithType.fieldInternedStr))
+        );
+      } else if (has(dt, S.DefDataType.enum)) {
+        entry.kind = 'enum';
+        // The COMPLETE constructor list, and completeness is load-bearing: it
+        // becomes the constructor list of an SMT datatype sort, so a list with
+        // a constructor missing would shrink the set of values the sort's
+        // variables range over - which can turn a satisfiable query unsat and
+        // make a PROVED spurious. It is therefore read off the declaration and
+        // never assembled from the constructors a `case` happens to name.
+        entry.constructors = readPackedVarints(
+          sub(dt, S.DefDataType.enum),
+          S.DataTypeEnumConstructors.constructorsInternedStr
+        ).map((i) => ctx.str(i));
+      } else if (has(dt, S.DefDataType.interface)) entry.kind = 'interface';
       ctx.dataTypes.set(`${moduleName}:${dname}`, entry);
     }
   }
@@ -363,6 +382,13 @@ function buildContext(pkg, diagnostics = []) {
     const e = ctx.dataTypes.get(`${module}:${name}`);
     return e && e.kind === 'record' ? { pkg: ctx, module, name } : null;
   };
+  /**
+   * The ENUM or VARIANT a TypeConId names, with its complete constructor list
+   * and the SMT sort name the emitter will declare it under - or null when the
+   * type is not one of those, or is declared in a package this archive does
+   * not carry.
+   */
+  ctx.dataConRefOfTycon = (tycon) => dataConRefOfTycon(tycon, ctx);
 
   // Bound form, so consumers outside this module (the verification frontend)
   // can follow a ValueId without reaching for internals.
@@ -1076,7 +1102,15 @@ function classifyType(type, ctx, depth = 0) {
 
   const builtin = sub(type, S.Type.builtin);
   if (builtin) {
-    return { sort: BUILTIN_SORT.get(int(builtin, S.TypeBuiltin.builtin)) || 'unknown' };
+    const bt = int(builtin, S.TypeBuiltin.builtin);
+    if (bt === BT.OPTIONAL) {
+      // `Type.Builtin` carries its arguments inline. An OPTIONAL with no
+      // argument is not a field type (it is the unapplied constructor), and
+      // its element is then unknown rather than assumed.
+      const args = subs(builtin, S.TypeBuiltin.args);
+      return optionalOf(args.length ? classifyType(args[0], ctx, depth + 1) : { sort: 'unknown' });
+    }
+    return { sort: BUILTIN_SORT.get(bt) || 'unknown' };
   }
 
   const con = sub(type, S.Type.con);
@@ -1086,9 +1120,32 @@ function classifyType(type, ctx, depth = 0) {
   }
 
   const tapp = sub(type, S.Type.tapp);
-  if (tapp) return classifyType(sub(tapp, S.TypeApp.lhs), ctx, depth + 1);
+  if (tapp) {
+    const head = classifyType(sub(tapp, S.TypeApp.lhs), ctx, depth + 1);
+    // `Optional T` written as a TApp spine: the HEAD classifies as an
+    // unapplied Optional and the RIGHT-HAND side is the element. Every other
+    // application still takes its sort from the head alone, which is what
+    // keeps `Numeric 10` numeric.
+    if (head.sort === 'optional' && head.elem && head.elem.sort === 'unknown') {
+      return optionalOf(classifyType(sub(tapp, S.TypeApp.rhs), ctx, depth + 1));
+    }
+    return head;
+  }
 
   return { sort: 'unknown' };
+}
+
+/**
+ * The classification of an `Optional T`, carrying T's own classification.
+ *
+ * Kept as a distinct sort rather than folded into T's: the IR does not model
+ * an Optional field as a value at all, it models it as the SYMBOL PAIR
+ * `<path>.$some : Bool` / `<path>.$value : T` (see lfir.js: translateCase), so
+ * the plain field path denotes neither and answering `T` here would tell a
+ * property that a field it cannot read is a number.
+ */
+function optionalOf(elem) {
+  return { sort: 'optional', elem: elem || { sort: 'unknown' } };
 }
 
 /**
@@ -1098,10 +1155,37 @@ function classifyType(type, ctx, depth = 0) {
  * cannot be followed to the end. Null is the whole point of the function: it
  * is returned for a field of a type declared in a package the archive does not
  * contain, for a step through something that is not a record, and for a field
- * name the record does not declare (which is what `this.maybeRate.$value`, the
- * IR's Optional encoding, looks like from here). In every one of those cases
- * the caller records nothing, so an unfollowable path costs coverage and never
- * produces a wrong sort.
+ * name the record does not declare. In every one of those cases the caller
+ * records nothing, so an unfollowable path costs coverage and never produces a
+ * wrong sort.
+ *
+ * THE SYNTHETIC OPTIONAL SEGMENTS. The IR does not model an `Optional T` field
+ * as a value; it models it as the symbol pair `<path>.$some : Bool` /
+ * `<path>.$value : T` (lfir.js: translateCase), and those two segments are not
+ * declared record fields. They used to fall off the end of this walk, which is
+ * why `Optional Numeric` fields were indistinguishable from fields whose type
+ * the archive could not read. They are now answered from the Optional's own
+ * declaration:
+ *
+ *   `<path>`         ->  `optional:<T's sort>`, or null when T is unknown.
+ *                        Deliberately NOT `<T's sort>`: the plain path denotes
+ *                        neither half of the pair, and answering `numeric`
+ *                        there would tell a property that an unreadable field
+ *                        is a number.
+ *   `<path>.$some`   ->  `bool`. A fact about the encoding, not about T, so it
+ *                        is answered whatever T is.
+ *   `<path>.$value`  ->  T's sort, and ONLY when T is NUMERIC. A non-numeric
+ *                        or unknown T answers null: the payload symbol is the
+ *                        one that reaches arithmetic positions and seeds the
+ *                        sort inference, and the numeric case is the one whose
+ *                        consequences have been worked through. Nothing is
+ *                        lost by the restriction - a property that needs to
+ *                        know the field is not a number reads the `optional:`
+ *                        sort of the path itself.
+ *
+ * Nothing is walked THROUGH `$value`: `<path>.$value.<field>` answers null
+ * rather than descending into the payload's record, because the payload is a
+ * value the walk has no declaration-level handle on beyond its own type.
  *
  * @param {Object} ctx     the interning context `start` is expressed against
  * @param {{module: string, name: string}} start  the record to begin at
@@ -1117,6 +1201,16 @@ export function resolveFieldSort(ctx, start, segments) {
     if (!entry || entry.kind !== 'record' || !entry.fields) return null;
     const field = entry.fields.get(segments[i]);
     if (!field) return null;
+
+    if (field.sort === 'optional') {
+      const elem = (field.elem && field.elem.sort) || 'unknown';
+      const rest = segments.length - (i + 1);
+      if (rest === 0) return elem === 'unknown' ? null : `optional:${elem}`;
+      if (rest === 1 && segments[i + 1] === '$some') return 'bool';
+      if (rest === 1 && segments[i + 1] === '$value') return elem === 'numeric' ? 'numeric' : null;
+      return null;
+    }
+
     if (i === segments.length - 1) return field.sort === 'unknown' ? null : field.sort;
     // Not the last segment: the only thing we can step THROUGH is a record.
     if (field.sort !== 'record' || !field.ref || !field.ref.module) return null;
@@ -1157,6 +1251,39 @@ function recordTypeRef(type, ctx) {
  */
 function recordRefOfTycon(tycon, ctx) {
   return resolveConRef(typeConName(tycon, ctx), ctx);
+}
+
+/**
+ * The enum/variant a TypeConId names: `{pkg, module, name, kind, constructors,
+ * sortName}`, or null.
+ *
+ * `sortName` IDENTIFIES the type the way lfir.js's `ufName` identifies a
+ * function, and for the same reason: it becomes an SMT sort declared with a
+ * fixed constructor list, and two different Daml types sharing one sort would
+ * assert that their values are drawn from one set - an assumption, not a
+ * relaxation, and assumptions can make an unsat spurious. The id of the
+ * DECLARING package is therefore part of the name.
+ */
+function dataConRefOfTycon(tycon, ctx) {
+  const ref = typeConName(tycon, ctx);
+  if (!ref || !ref.module) return null;
+  let target = ctx;
+  if (ref.external) {
+    target = ctx.getImportedPackage ? ctx.getImportedPackage(ref.packageRef) : null;
+    if (!target) return null;
+  }
+  const entry = target.dataTypes && target.dataTypes.get(`${ref.module}:${ref.name}`);
+  if (!entry || (entry.kind !== 'enum' && entry.kind !== 'variant')) return null;
+  if (!Array.isArray(entry.constructors) || entry.constructors.length === 0) return null;
+  const pid = String(target.selfPackageId || 'self').slice(0, 8);
+  return {
+    pkg: target,
+    module: ref.module,
+    name: ref.name,
+    kind: entry.kind,
+    constructors: entry.constructors.slice(),
+    sortName: `${entry.kind} ${ref.module}:${ref.name}@${pid}`,
+  };
 }
 
 /** Shared tail of the two above: hop to the declaring package, check the kind. */

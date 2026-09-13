@@ -77,6 +77,36 @@
 // the position pins. A Bool position can only arise where the real expression
 // was a Bool, since the position comes from the compiled code's own use of it.
 
+// ---------------------------------------------------------------------------
+// DATATYPE SORTS, and why they are exact where uninterpreted functions are not.
+//
+// A Daml ENUM becomes an SMT-LIB algebraic datatype with exactly the
+// constructors the package declares (`declare-datatypes`, which cvc5 supports
+// in logic ALL), and a `case` over it becomes a chain of equality tests. This
+// is not an abstraction at all: an enum value IS its constructor, the sort is
+// closed over the declared constructors, and the theory makes distinct
+// constructors distinct. Both directions of the proof survive it, so an enum
+// verdict needs no caveat of any kind.
+//
+// The completeness of the constructor list is what carries that claim, and it
+// is why the list travels on every term and a disagreement is a refusal rather
+// than a merge. A sort declared with one constructor MISSING would make its
+// variables range over fewer values than the Daml type has, which can turn a
+// satisfiable query unsat - a spurious PROVED, the one failure this pipeline
+// must not have. It is also what makes a `_ ->` catch-all sound as the
+// negation of the alternatives above it: `not C1 and not C2` implies `C3` only
+// because the sort has no fourth value.
+//
+// A VARIANT is different and the difference is stated on the verdict rather
+// than blurred: only its DISCRIMINANT is modelled, as a free symbol of a tag
+// sort, and each payload binder becomes an explicit `unsupported` node (see
+// lfir.js). That is a relaxation in the same safe direction as the Optional
+// `$some`/`$value` pair - the tag is a free symbol, so the solver ranges over
+// every tag the type has, including the one the real value carries - so it is
+// sound for PROVED, and a projection off a payload is refused with its reason
+// rather than guessed at.
+// ---------------------------------------------------------------------------
+
 import {
   T,
   hasUnsupported,
@@ -136,6 +166,11 @@ export function termToSmt(t, realNumerals = false) {
       // An uninterpreted constant of the `Party` sort: a bare symbol, exactly
       // like a nullary declare-fun.
       return sym(t.name);
+    case 'dcon':
+      // A constructor of a declared datatype sort. Nullary, so it is written
+      // as a bare symbol; the name carries the sort so that two types with a
+      // constructor of the same NAME never collide.
+      return sym(dconSymbol(t));
     case 'app': {
       if (!OPS.has(t.op)) throw new Error(`smt: unknown operator ${t.op}`);
       return `(${t.op} ${t.args.map(rec).join(' ')})`;
@@ -158,12 +193,32 @@ export function termToSmt(t, realNumerals = false) {
       throw new Error(
         `smt: an uninstantiated ${t.op} over \`${t.listName}\` reached the emitter`
       );
+    case 'opt':
+      // An Optional VALUE is a (presence, payload) PAIR, not a scalar, and the
+      // emitter has no product sort. Reaching here means a property built a
+      // query without destructuring it - a bug in the property, and one that
+      // must fail loudly rather than emit one half of the pair.
+      throw new Error(
+        'smt: an Optional value reached the emitter; the $some/$value pair has to be ' +
+          'destructured into a guarded obligation first'
+      );
     case 'unsupported':
       throw new Error(`smt: unsupported term reached the emitter: ${t.why}`);
     default:
       throw new Error(`smt: unknown term kind ${t.k}`);
   }
 }
+
+/**
+ * The SMT symbol a datatype constructor is written as.
+ *
+ * The SORT is part of it because SMT-LIB datatype constructors live in ONE
+ * global namespace: two Daml enums each declaring a `Pending` would otherwise
+ * declare the same symbol twice, and the second declaration would be an error
+ * rather than a silent merge - but relying on the solver to notice is not the
+ * same as not colliding.
+ */
+const dconSymbol = (t) => `${t.sort}#${t.ctor}`;
 
 /**
  * Infer sorts by UNIFICATION over positions.
@@ -208,6 +263,24 @@ export function inferSorts(terms, seeds = []) {
   // equality. Nothing else in the emitter produces a Party-sorted position, so
   // adding it here cannot move any position that used to resolve to Real.
   const CONCRETE = new Set(['Bool', 'Real', 'Int', 'String', 'Party']);
+  /**
+   * DATATYPE SORTS discovered in the terms: sort name -> its constructor list.
+   *
+   * A Daml enum (and a variant's discriminant) becomes an SMT algebraic
+   * datatype, declared on demand exactly as `Party` is - a query that mentions
+   * none is byte-for-byte the script it was before. The constructor list comes
+   * off the compiled package's declaration and travels on every `dcon` term
+   * (see lfir.js), so it is a fact rather than an accumulation of whatever the
+   * code happened to mention.
+   *
+   * Two occurrences of one sort name DISAGREEING about the list is a CONFLICT,
+   * not something to reconcile by union or by taking the longer list: the sort
+   * name identifies the declaring package's type, so a disagreement means the
+   * translation attached one name to two different types, and declaring either
+   * list would be an assumption about values the other type does not have.
+   * The same rule an uninterpreted symbol used at two signatures gets.
+   */
+  const datatypes = new Map();
   /** union-find parent pointers; a concrete sort name is its own root */
   const parent = new Map();
   const conflicts = [];
@@ -271,6 +344,36 @@ export function inferSorts(terms, seeds = []) {
         }
         union(`v:${t.name}`, 'Party');
         union(id, `v:${t.name}`);
+        return;
+      case 'dcon': {
+        const prev = datatypes.get(t.sort);
+        const here = Array.isArray(t.ctors) ? t.ctors : [];
+        if (here.length === 0) {
+          conflicts.push(`datatype sort \`${t.sort}\` used with no constructor list`);
+        } else if (!here.includes(t.ctor)) {
+          conflicts.push(
+            `constructor \`${t.ctor}\` is not among the ones declared for sort \`${t.sort}\``
+          );
+        } else if (prev === undefined) {
+          datatypes.set(t.sort, here.slice());
+          CONCRETE.add(t.sort);
+        } else if (prev.length !== here.length || prev.some((c, i) => c !== here[i])) {
+          conflicts.push(
+            `datatype sort \`${t.sort}\` declared with two different constructor lists ` +
+              `(${prev.join(', ')} and ${here.join(', ')})`
+          );
+        }
+        union(id, t.sort);
+        return;
+      }
+      case 'opt':
+        // Not a scalar: it has no sort of its own. Its PAYLOAD does, and it is
+        // the payload that reaches an arithmetic position, so the pair's class
+        // is the payload's class and the flag is a Bool. Walking it here is
+        // what lets a property that destructures the pair read positional
+        // evidence off the payload exactly as if it had been assigned directly.
+        walk(t.some, 'Bool');
+        if (t.value) walk(t.value, id);
         return;
       case 'num':
         union(id, 'Real');
@@ -369,7 +472,7 @@ export function inferSorts(terms, seeds = []) {
       ret: resolve(`u:${name}`),
     });
   }
-  return { sorts, conflicts, ufs, pinned };
+  return { sorts, conflicts, ufs, pinned, datatypes };
 }
 
 /**
@@ -380,11 +483,17 @@ export function inferSorts(terms, seeds = []) {
  * @returns {{script: string, vars: string[]}}
  */
 export function buildQuery(guards, goal) {
-  const { sorts, conflicts, ufs } = inferSorts([
+  const { sorts, conflicts, ufs, datatypes } = inferSorts([
     ...guards.map((g) => ({ term: g, sort: 'Bool' })),
     { term: goal, sort: 'Bool' },
   ]);
   if (conflicts.length) throw new Error(`smt: sort conflicts: ${conflicts.join('; ')}`);
+
+  // A datatype sort name is not an SMT-LIB simple symbol (it carries the
+  // module, the type and the package id), so it is quoted wherever it is used
+  // as a sort. Built-in sorts are written plain, which keeps every script that
+  // mentions no datatype byte-for-byte what it was.
+  const sortText = (name) => (datatypes.has(name) ? sym(name) : name);
 
   const lines = [];
   lines.push('(set-logic ALL)');
@@ -392,14 +501,25 @@ export function buildQuery(guards, goal) {
   // The uninterpreted sort, declared only when the query actually uses it, so
   // every script this pipeline used to emit is byte-for-byte what it was.
   if ([...sorts.values()].includes('Party')) lines.push('(declare-sort Party 0)');
+  // Daml enums (and variant discriminants) as SMT ALGEBRAIC DATATYPES,
+  // declared on demand for the same reason. The declaration carries the
+  // COMPLETE constructor list, which is what makes a `_ ->` catch-all sound as
+  // the negation of the alternatives above it: with the sort closed over
+  // exactly these constructors, `not C1 and not C2` really does imply `C3`.
+  for (const [name, ctors] of [...datatypes.entries()].sort()) {
+    const cons = ctors.map((c) => `(${sym(`${name}#${c}`)})`).join(' ');
+    lines.push(`(declare-datatypes ((${sym(name)} 0)) ((${cons})))`);
+  }
   for (const [name, sort] of [...sorts.entries()].sort()) {
-    lines.push(`(declare-const ${sym(name)} ${sort})`);
+    lines.push(`(declare-const ${sym(name)} ${sortText(sort)})`);
   }
   // Uninterpreted symbols: declared, never constrained. See the header for
   // why an unsat over these still proves the property and a sat does not
   // refute it.
   for (const [name, sig] of [...ufs.entries()].sort()) {
-    lines.push(`(declare-fun ${sym(name)} (${sig.args.join(' ')}) ${sig.ret})`);
+    lines.push(
+      `(declare-fun ${sym(name)} (${sig.args.map(sortText).join(' ')}) ${sortText(sig.ret)})`
+    );
   }
   for (const g of guards) lines.push(`(assert ${termToSmt(g, true)})`);
   lines.push(`(assert (not ${termToSmt(goal, true)}))`);
@@ -892,6 +1012,76 @@ function numericEvidence(term, isRealVar) {
 const NON_NUMERIC_SORTS = new Set(['party', 'text', 'time', 'cid', 'bool', 'record']);
 
 /**
+ * Is `>= 0` NOT A QUESTION about a field of this declared sort?
+ *
+ * `optional:<T>` is the sort the field-type resolver gives an `Optional T`
+ * (dalf.js). An `Optional Time` is no more a numeric question than a `Time` is:
+ * the only number such a field could be asked about is a payload it does not
+ * have. So the Optional's ELEMENT decides, and the same table decides it - the
+ * one place the answer is written down.
+ *
+ * `optional:numeric` is deliberately NOT excluded: it IS a question, just a
+ * guarded one (`$some => $value >= 0`), and it is adjudicated below.
+ */
+function notNumericQuestion(sort) {
+  if (!sort) return false;
+  if (NON_NUMERIC_SORTS.has(sort)) return true;
+  return sort.startsWith('optional:') && NON_NUMERIC_SORTS.has(sort.slice('optional:'.length));
+}
+
+/**
+ * The (presence, payload) pair behind a field the create assigns an OPTIONAL.
+ *
+ * Three shapes carry one, and nothing else does:
+ *
+ *   * an Optional VALUE the translation built - `Some e` is
+ *     `opt(true, e)` and `None` is `opt(false, null)` (lfir.js);
+ *   * a SYMBOL the package declares `Optional Numeric`, whose pair is the two
+ *     symbols `<name>.$some` and `<name>.$value` - the SAME names
+ *     translateCase gives the field, so an obligation stated here and a guard
+ *     recovered there speak about one flag and one payload rather than about
+ *     two unrelated families;
+ *   * a CONDITIONAL assignment of two of those.
+ *
+ * For the conditional case a branch that is `None` contributes no payload, so
+ * the other branch's payload is used on both sides. That is exact rather than
+ * a fudge: under the None branch `some` is false, and the obligation is
+ * guarded by `some`, so whatever stands in the payload position there is never
+ * read.
+ *
+ * @returns {{some: Object, value: Object|null}|null}
+ */
+function optionalParts(term, declared, sort) {
+  if (!term || typeof term !== 'object') return null;
+  switch (term.k) {
+    case 'opt':
+      return { some: term.some, value: term.value || null };
+    case 'var': {
+      const s = sort || (declared && declared.get(term.name));
+      if (s !== 'optional:numeric') return null;
+      return {
+        some: { k: 'var', name: `${term.name}.$some`, sort: 'Bool' },
+        value: { k: 'var', name: `${term.name}.$value`, sort: 'Real' },
+      };
+    }
+    case 'ite': {
+      const a = optionalParts(term.a, declared, sort);
+      const b = optionalParts(term.b, declared, sort);
+      if (!a || !b) return null;
+      return {
+        some: { k: 'ite', c: term.c, a: a.some, b: b.some },
+        value:
+          a.value && b.value
+            ? { k: 'ite', c: term.c, a: a.value, b: b.value }
+            : a.value || b.value,
+      };
+    }
+    default:
+      return null;
+  }
+}
+
+/**
  * The one thing excluding a field can hide, said on every verdict that excludes
  * one. See `nestedRecords`.
  */
@@ -1082,26 +1272,80 @@ export function nonNegativeFields(transition) {
       // readability test. Whether the translation could read a Party field's
       // value does not matter - `>= 0` is not a question about it either way,
       // so it is not counted as an obligation in any state.
-      if (sort && NON_NUMERIC_SORTS.has(sort)) {
+      if (notNumericQuestion(sort)) {
         excluded.push(`${at} (${sort})`);
-        if (sort === 'record') nestedRecords++;
+        // An `Optional <record>` assigned whole hides its payload's numeric
+        // fields exactly the way a bare record does, so it carries the same
+        // caveat.
+        if (sort === 'record' || sort === 'optional:record') nestedRecords++;
         continue;
       }
 
       total++;
+
+      // An OPTIONAL numeric field. The obligation is GUARDED: an absent value
+      // has no number to be non-negative, so the statement is
+      // `$some => $value >= 0` and not `$value >= 0`. Getting that implication
+      // the other way round would make every `None` a violation, which is a
+      // fabricated finding about a field that holds nothing.
+      const parts = optionalParts(term, declared, sort);
+      if (parts && !hasUnsupported(parts.some)) {
+        const numeric =
+          sort === 'optional:numeric' ||
+          (parts.value && !hasUnsupported(parts.value) && numericEvidence(parts.value, isRealVar));
+        if (numeric) {
+          if (!parts.value) {
+            // A definitely-ABSENT Optional. The obligation holds with nothing
+            // to check: there is no payload, so `$some => $value >= 0` is
+            // vacuously true - and it is vacuous because the field is empty,
+            // not because the check was skipped. Counted as checked and said
+            // to be so, never asserted about.
+            checkable.push({ at, term, path: usablePath, droppedPath, goal: TRUE, absent: true });
+            continue;
+          }
+          if (!hasUnsupported(parts.value)) {
+            checkable.push({
+              at,
+              term,
+              path: usablePath,
+              droppedPath,
+              goal: implies(parts.some, {
+                k: 'app',
+                op: '>=',
+                args: [parts.value, { k: 'num', v: '0' }],
+              }),
+              optional: true,
+            });
+            continue;
+          }
+        }
+      }
+
       if (hasUnsupported(term)) {
         // NOT assumed non-negative: an unreadable field is an unanswered
         // question, and it is reported as one.
         const why = unsupportedReasons(term).map((u) => u.why).join('; ');
-        if (sort === 'numeric') {
+        if (sort === 'numeric' || sort === 'optional:numeric') {
           skippedNumeric++;
           skipped.push(
-            `${at} is declared numeric by the package but its value is outside the fragment: ${why}`
+            `${at} is declared ${sort === 'numeric' ? 'numeric' : '`Optional Numeric`'} by the ` +
+              `package but its value is outside the fragment: ${why}`
           );
         } else {
           skippedUnreadable++;
           skipped.push(`${at} is outside the fragment: ${why}`);
         }
+        continue;
+      }
+      if (sort === 'optional:numeric') {
+        // Readable, declared an Optional number, but not a shape whose pair
+        // the translation can name. A real gap, not an unknown.
+        skippedNumeric++;
+        skipped.push(
+          `${at} is declared \`Optional Numeric\` by the package but the value assigned is not a ` +
+            `shape whose \`$some\`/\`$value\` pair the translation can name, so the guarded ` +
+            `obligation \`$some => $value >= 0\` cannot be stated`
+        );
         continue;
       }
       if (sort === 'numeric' || numericEvidence(term, isRealVar)) {
@@ -1152,7 +1396,10 @@ export function nonNegativeFields(transition) {
 
   const goal = allOf(
     checkable.map((o) =>
-      implies(allOf(o.path), { k: 'app', op: '>=', args: [o.term, { k: 'num', v: '0' }] })
+      implies(
+        allOf(o.path),
+        o.goal || { k: 'app', op: '>=', args: [o.term, { k: 'num', v: '0' }] }
+      )
     )
   );
   const { used, dropped } = usableGuards(transition);
@@ -1183,6 +1430,19 @@ export function nonNegativeFields(transition) {
         `${shown.length > 6 ? `, and ${shown.length - 6} more` : ''}). They are excluded from ` +
         `the coverage denominator rather than reported as unchecked, which they never were` +
         (nestedRecords ? `; ${NESTED_RECORD_CAVEAT}` : '')
+    );
+  }
+  const optionalChecked = checkable.filter((o) => o.optional || o.absent);
+  if (optionalChecked.length) {
+    const absent = optionalChecked.filter((o) => o.absent);
+    notes.push(
+      `${optionalChecked.length} checked field(s) are OPTIONAL numerics, stated as ` +
+        `\`$some => $value >= 0\`: an absent value has no number to constrain, so a \`None\` ` +
+        `satisfies the obligation rather than violating it` +
+        (absent.length
+          ? `; ${absent.length} of them (${absent.map((o) => o.at).join(', ')}) are assigned ` +
+            `\`None\` outright, so the obligation holds with nothing to check`
+          : '')
     );
   }
   if (skippedNumeric) {

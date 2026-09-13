@@ -59,6 +59,13 @@ const TOKENS_DAR =
   '/private/tmp/claude-501/-Users-vijay-Downloads-carbon-core/713989a1-4f06-45ac-823b-b4ec40f8b2b8/scratchpad/canton/dlt-canton-main/daml/canton-tokens.dar';
 const HAVE_TOKENS_DAR = existsSync(TOKENS_DAR);
 
+// A second compiled package, the one whose `ensure` clauses match on
+// `DA.Validation.Types:Validation` - the only VARIANT shape the corpus has,
+// and one that is only reachable after a cross-package beta reduction.
+const VARIANT_DAR =
+  '/private/tmp/claude-501/-Users-vijay-Downloads-carbon-core/713989a1-4f06-45ac-823b-b4ec40f8b2b8/scratchpad/calc-build/repo/daml/fees/fee-record/v1/.daml/dist/fee-record-v021-1.0.0.dar';
+const HAVE_VARIANT_DAR = existsSync(VARIANT_DAR);
+
 // ------------------------------------------------------------------ helpers
 
 test('hasUnsupported sees through app and ite nesting', () => {
@@ -278,7 +285,7 @@ function runSolver(script) {
 // Guard conjuncts, aborts, text, Optional, interface-instance transitions
 // ---------------------------------------------------------------------------
 
-import { decodeMessage } from '../backend/protobuf.js';
+import { decodeMessage, int } from '../backend/protobuf.js';
 import * as S from '../backend/lf2-schema.js';
 import { decodeDalfRaw, readDarRaw } from '../backend/dalf.js';
 import {
@@ -2836,11 +2843,33 @@ test(
       [...new Set(run([]).map((r) => r.property))].sort(),
       ['amount-conservation', 'create-authority', 'division-safety', 'non-negative-fields']
     );
-    // a partial answer never prints as a bare PROVED, and it carries the split
-    const partial = one.find((r) => r.status === 'PROVED-PARTIAL');
-    assert.ok(partial, `expected a PROVED-PARTIAL, got ${one.map((r) => r.status).join(', ')}`);
-    assert.ok(partial.coverage.checked < partial.coverage.total);
-    assert.match(partial.note, /obligation\(s\) checked/);
+    // A PARTIAL answer must never print as a bare PROVED. Stated as an
+    // INVARIANT over the whole run rather than by finding one transition that
+    // happens to be partial: once the Optional field types were decoded, the
+    // fields that used to go unread here are either checked (a guarded
+    // `$some => $value >= 0`) or excluded as non-numeric, and this choice
+    // proves outright. An invariant keeps the guarantee pinned whichever way
+    // the coverage moves.
+    const all = run([]);
+    for (const r of all) {
+      const partial = !!(r.coverage && r.coverage.checked < r.coverage.total);
+      if (partial) {
+        assert.equal(r.status, 'PROVED-PARTIAL', `partial coverage must not print as ${r.status}`);
+        assert.match(r.note, /obligation\(s\) checked/);
+      } else if (r.status === 'PROVED-PARTIAL') {
+        assert.fail('PROVED-PARTIAL without a partial coverage split');
+      }
+    }
+    // ...and the proof this choice does yield discloses what it did not have
+    // to ask: the fields the package declares non-numeric are excluded from
+    // the denominator rather than counted as unanswered.
+    const nn = one.find((r) => r.property === 'non-negative-fields' && r.status === 'PROVED');
+    assert.ok(nn, `expected a PROVED, got ${one.map((r) => r.status).join(', ')}`);
+    assert.equal(nn.coverage.checked, nn.coverage.total);
+    assert.ok(
+      nn.coverage.excludedFields.some((f) => /optional:time/.test(f)),
+      'an `Optional Time` field is not a numeric question and must be excluded, not skipped'
+    );
   }
 );
 
@@ -2873,5 +2902,565 @@ test(
       DISPROVED: 3,
       'NOT-APPLICABLE': 116,
     });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Optional-typed numeric fields
+//
+// The IR does not model an `Optional T` as a value: it models it as the pair
+// `<path>.$some : Bool` / `<path>.$value : T`. These tests pin the two halves
+// of making that pair adjudicable - the TERM for an Optional value, and the
+// GUARDED obligation the property states from it - and above all the DIRECTION
+// of the implication, because the wrong direction turns every empty field into
+// a fabricated finding.
+// ---------------------------------------------------------------------------
+
+test('an Optional VALUE is the (presence, payload) pair, never a scalar', () => {
+  const some = T.opt(T.bool(true), v('x'));
+  const none = T.opt(T.bool(false), null);
+  // Like an uninstantiated fold, it counts as unsupported everywhere, so every
+  // property that does not destructure it drops the term with a reason rather
+  // than asserting half of it.
+  assert.equal(hasUnsupported(some), true);
+  assert.equal(hasUnsupported(none), true);
+  assert.ok(unsupportedReasons(some)[0].why.includes('`$some`/`$value` pair'));
+  // And it must never reach the emitter as if it were a value. (The
+  // evaluator's matching refusal is pinned in tests/differential.test.js,
+  // where ir-eval is under test.)
+  assert.throws(() => termToSmt(some), /Optional value reached the emitter/);
+  assert.throws(() => termToSmt(none), /Optional value reached the emitter/);
+});
+
+test('non-negative-fields: an Optional numeric field is GUARDED by its presence', () => {
+  // `Some (this.amount - arg.qty)`: the payload is a number, and the
+  // obligation is about the payload only when there IS one.
+  const inst = nonNegativeFields(
+    transition({
+      creates: [
+        {
+          template: 'T',
+          base: null,
+          fieldSorts: { limit: 'optional:numeric' },
+          fields: { limit: T.opt(T.bool(true), T.app('-', [v('this.amount'), v('arg.qty')])) },
+          path: [],
+        },
+      ],
+    })
+  );
+  assert.equal(inst.applicable, true);
+  assert.equal(inst.coverage.checked, 1);
+  assert.equal(inst.coverage.total, 1);
+  // `$some => $value >= 0`, written with the operators the emitter speaks.
+  // A statically PRESENT Optional needs no guard: `implies` drops an
+  // antecedent that is true, so the obligation is the plain one.
+  assert.equal(termToSmt(inst.goal), '(>= (- |this.amount| |arg.qty|) 0)');
+  assert.ok(inst.notes.some((n) => /\$some => \$value >= 0/.test(n)));
+});
+
+test('non-negative-fields: an ABSENT Optional cannot make the property fail', () => {
+  // THE DIRECTION TEST. `None` carries no number, so there is nothing for
+  // `>= 0` to be false of. Stating the obligation the other way round - or
+  // asserting `>= 0` of a payload that does not exist - would report every
+  // empty field as a negative one, which is a fabricated finding rather than
+  // a weak check.
+  const inst = nonNegativeFields(
+    transition({
+      creates: [
+        {
+          template: 'T',
+          base: null,
+          fieldSorts: { limit: 'optional:numeric', amount: 'numeric' },
+          fields: { limit: T.opt(T.bool(false), null), amount: v('arg.qty') },
+          path: [],
+        },
+      ],
+    })
+  );
+  assert.equal(inst.applicable, true);
+  // Both fields are obligations; the absent one is CHECKED, not skipped - we
+  // read it exactly and it holds - and it contributes nothing to the goal.
+  assert.equal(inst.coverage.checked, 2);
+  assert.equal(inst.coverage.total, 2);
+  assert.deepEqual(inst.coverage.skipped, []);
+  assert.equal(termToSmt(inst.goal), '(>= |arg.qty| 0)');
+  assert.ok(
+    inst.notes.some((n) => /assigned \`None\` outright/.test(n)),
+    'an absent Optional is disclosed, not silently counted as a pass'
+  );
+  // And the goal is genuinely unfalsifiable on the empty side: with the
+  // numeric field removed there is nothing left to prove at all.
+  const onlyNone = nonNegativeFields(
+    transition({
+      creates: [
+        {
+          template: 'T',
+          base: null,
+          fieldSorts: { limit: 'optional:numeric' },
+          fields: { limit: T.opt(T.bool(false), null) },
+          path: [],
+        },
+      ],
+    })
+  );
+  assert.equal(termToSmt(onlyNone.goal), 'true');
+});
+
+test('non-negative-fields: an Optional field COPIED from another is stated over its own pair', () => {
+  // The value is a symbol the package declares `Optional Numeric`. Its pair is
+  // the same two names translateCase gives the field, so an obligation stated
+  // here and a guard recovered there speak about ONE flag and ONE payload.
+  const inst = nonNegativeFields(
+    typed(
+      { 'arg.newLimit': 'optional:numeric' },
+      {
+        creates: [
+          {
+            template: 'T',
+            base: null,
+            fieldSorts: { limit: 'optional:numeric' },
+            fields: { limit: v('arg.newLimit') },
+            path: [],
+          },
+        ],
+      }
+    )
+  );
+  assert.equal(inst.coverage.checked, 1);
+  assert.equal(
+    termToSmt(inst.goal),
+    '(or (not |arg.newLimit.$some|) (>= |arg.newLimit.$value| 0))'
+  );
+});
+
+test('non-negative-fields: a CONDITIONAL Optional keeps each branch under its own flag', () => {
+  const inst = nonNegativeFields(
+    transition({
+      creates: [
+        {
+          template: 'T',
+          base: null,
+          fieldSorts: { limit: 'optional:numeric' },
+          fields: {
+            limit: T.ite(v('c'), T.opt(T.bool(true), v('arg.qty')), T.opt(T.bool(false), null)),
+          },
+          path: [],
+        },
+      ],
+    })
+  );
+  assert.equal(inst.coverage.checked, 1);
+  // The None branch contributes no payload, so the other branch's payload
+  // stands in both positions - never read there, because `$some` is false.
+  assert.equal(
+    termToSmt(inst.goal),
+    '(or (not (ite |c| true false)) (>= |arg.qty| 0))'
+  );
+});
+
+test('non-negative-fields: an Optional NON-numeric field is not an obligation at all', () => {
+  // `Optional Time` is no more a numeric question than `Time` is. Counting it
+  // as an unanswered obligation is what used to turn whole transitions into
+  // refusals over fields nobody ever asked about.
+  const inst = nonNegativeFields(
+    transition({
+      creates: [
+        {
+          template: 'T',
+          base: null,
+          fieldSorts: { createdAt: 'optional:time', owner: 'party', amount: 'numeric' },
+          fields: {
+            createdAt: T.opt(T.bool(true), T.unsupported('getTime', 'T')),
+            owner: v('arg.owner'),
+            amount: v('arg.qty'),
+          },
+          path: [],
+        },
+      ],
+    })
+  );
+  assert.equal(inst.coverage.total, 1, 'only `amount` is an obligation');
+  assert.equal(inst.coverage.checked, 1);
+  assert.equal(inst.coverage.excluded, 2);
+  assert.ok(inst.coverage.excludedFields.includes('T.createdAt (optional:time)'));
+});
+
+test('non-negative-fields: a declared Optional Numeric whose value is unreadable is a GAP', () => {
+  // Not an exclusion and not an unknown: the package says it is a number, and
+  // the translation could not name a pair to state the guarded obligation
+  // over. That is a question we know went unanswered.
+  const inst = nonNegativeFields(
+    transition({
+      creates: [
+        {
+          template: 'T',
+          base: null,
+          fieldSorts: { limit: 'optional:numeric', amount: 'numeric' },
+          fields: { limit: T.unsupported('a fetch in the field expression', 'T'), amount: v('arg.qty') },
+          path: [],
+        },
+      ],
+    })
+  );
+  assert.equal(inst.coverage.skippedNumeric, 1);
+  assert.equal(inst.coverage.skippedUnreadable, 0);
+  assert.match(inst.coverage.skipped.join(' '), /declared `Optional Numeric` by the/);
+});
+
+test('translate: the Optional constructors become the pair, and decide a case exactly', () => {
+  // `case (Some this.amount) of None -> 0; Some x -> x` IS `this.amount`.
+  const strings = ['this', 'amount', 'x'];
+  const ctx = makeCtx(fakePkg(strings), { selfParam: 'this', argParam: null, label: 't' });
+  const someExpr = msg(
+    bf(S.Expr.optionalSome, msg(bf(S.OptionalSomeExpr.value, exprProj(exprVar(0), 1))))
+  );
+  assert.deepEqual(translateExpr(decodeMessage(someExpr), ctx), {
+    k: 'opt',
+    some: { k: 'bool', v: true },
+    value: { k: 'var', name: 'this.amount', sort: 'Real' },
+  });
+  assert.deepEqual(translateExpr(decodeMessage(msg(bf(S.Expr.optionalNone, msg()))), ctx), {
+    k: 'opt',
+    some: { k: 'bool', v: false },
+    value: null,
+  });
+
+  const CASE = S.message('Case');
+  const caseExpr = msg(
+    bf(
+      S.Expr.case,
+      msg(
+        bf(CASE.scrut, someExpr),
+        bf(
+          CASE.alts,
+          msg(bf(S.CaseAlt.optionalNone, msg()), bf(S.CaseAlt.body, exprInt(0)))
+        ),
+        bf(
+          CASE.alts,
+          msg(
+            bf(S.CaseAlt.optionalSome, msg(vf(S.OptionalSomeAlt.varBodyInternedStr, 2))),
+            bf(S.CaseAlt.body, exprVar(2))
+          )
+        )
+      )
+    )
+  );
+  const ctx2 = makeCtx(fakePkg(strings), { selfParam: 'this', argParam: null, label: 't' });
+  assert.deepEqual(translateExpr(decodeMessage(caseExpr), ctx2), {
+    k: 'var',
+    name: 'this.amount',
+    sort: 'Real',
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Enum and variant case analysis
+//
+// A Daml enum becomes an SMT algebraic datatype declared with exactly the
+// constructors the package declares. These tests pin the three things that
+// make that sound: the COMPLETENESS of the constructor list (a short one can
+// make an unsat spurious), the catch-all read as the NEGATION of the
+// alternatives above it, and the refusal to model a variant's payload.
+// ---------------------------------------------------------------------------
+
+/** A package context whose data types are one enum and one variant. */
+function enumPkg(strings, { enumCtors = ['Red', 'Green', 'Blue'], variantCtors = ['Ok', 'Err'] } = {}) {
+  const defs = new Map([
+    ['Color', { kind: 'enum', constructors: enumCtors, sortName: 'enum M:Color@testpkg' }],
+    ['Result', { kind: 'variant', constructors: variantCtors, sortName: 'variant M:Result@testpkg' }],
+  ]);
+  return {
+    ...fakePkg(strings),
+    // The tycon carries the type's dotted-name index; the fixture maps the
+    // index straight onto the name so the test reads like the source.
+    dname: (i) => strings[i],
+    dataConRefOfTycon: (tycon) => {
+      if (!tycon) return null;
+      const name = strings[int(tycon, S.TypeConId.nameInternedDname)];
+      const d = defs.get(name);
+      return d ? { pkg: null, module: 'M', name, ...d } : null;
+    },
+  };
+}
+
+const tycon = (nameSi) => msg(vf(S.TypeConId.nameInternedDname, nameSi));
+const CASE = S.message('Case');
+const caseOf = (scrut, ...alts) =>
+  msg(bf(S.Expr.case, msg(bf(CASE.scrut, scrut), ...alts.map((a) => bf(CASE.alts, a)))));
+const enumAlt = (typeSi, ctorSi, body) =>
+  msg(
+    bf(S.CaseAlt.enum, msg(bf(S.EnumAlt.con, tycon(typeSi)), vf(S.EnumAlt.constructorInternedStr, ctorSi))),
+    bf(S.CaseAlt.body, body)
+  );
+const variantAlt = (typeSi, ctorSi, binderSi, body) =>
+  msg(
+    bf(
+      S.CaseAlt.variant,
+      msg(
+        bf(S.VariantAlt.con, tycon(typeSi)),
+        vf(S.VariantAlt.variantInternedStr, ctorSi),
+        vf(S.VariantAlt.binderInternedStr, binderSi)
+      )
+    ),
+    bf(S.CaseAlt.body, body)
+  );
+const defaultAlt = (body) => msg(bf(S.CaseAlt.default, msg()), bf(S.CaseAlt.body, body));
+const exprEnumCon = (typeSi, ctorSi) =>
+  msg(bf(S.Expr.enumCon, msg(bf(S.EnumConExpr.tycon, tycon(typeSi)), vf(S.EnumConExpr.enumConInternedStr, ctorSi))));
+
+// strings: 0 this, 1 shade, 2 Color, 3 Red, 4 Green, 5 Blue, 6 Result, 7 Ok,
+//          8 Err, 9 payload, 10 status
+const ES = ['this', 'shade', 'Color', 'Red', 'Green', 'Blue', 'Result', 'Ok', 'Err', 'payload', 'status'];
+const enumCtx = (opts) =>
+  makeCtx(enumPkg(ES, opts), { selfParam: 'this', argParam: null, label: 't' });
+
+test('enum case: an exhaustive case becomes a chain of equality tests', () => {
+  // `case this.shade of Red -> 1; Green -> 2; Blue -> 3`. The LAST alternative
+  // needs no test: the sort is declared with exactly these three constructors,
+  // so failing the first two IMPLIES the third. That step is only sound
+  // because the constructor list is the complete declared one.
+  const ctx = enumCtx();
+  const term = translateExpr(
+    decodeMessage(
+      caseOf(
+        exprProj(exprVar(0), 1),
+        enumAlt(2, 3, exprInt(1)),
+        enumAlt(2, 4, exprInt(2)),
+        enumAlt(2, 5, exprInt(3))
+      )
+    ),
+    ctx
+  );
+  assert.equal(
+    termToSmt(term),
+    '(ite (= |this.shade| |enum M:Color@testpkg#Red|) 1 ' +
+      '(ite (= |this.shade| |enum M:Color@testpkg#Green|) 2 3))'
+  );
+});
+
+test('enum case: a `_ ->` catch-all is the NEGATION of the alternatives, never a drop', () => {
+  const ctx = enumCtx();
+  const term = translateExpr(
+    decodeMessage(
+      caseOf(exprProj(exprVar(0), 1), enumAlt(2, 3, exprInt(1)), defaultAlt(exprInt(9)))
+    ),
+    ctx
+  );
+  assert.equal(termToSmt(term), '(ite (= |this.shade| |enum M:Color@testpkg#Red|) 1 9)');
+});
+
+test('enum case: a NON-exhaustive case with no catch-all ends in an abort, not a value', () => {
+  // LF raises on a non-exhaustive match, so the fall-through is not a value at
+  // all. Modelling it as an abort is what lets guardConjuncts eliminate it
+  // where guard semantics allow and refuse it everywhere else - a silent
+  // fall-through to the last branch would be a wrong answer.
+  const ctx = enumCtx();
+  const term = translateExpr(
+    decodeMessage(caseOf(exprProj(exprVar(0), 1), enumAlt(2, 3, exprInt(1)), enumAlt(2, 4, exprInt(2)))),
+    ctx
+  );
+  assert.equal(term.k, 'ite');
+  // Red, then Green, then the fall-through - which is not a value.
+  assert.equal(term.b.b.k, 'abort');
+  assert.match(term.b.b.why, /non-exhaustive case over `M:Color`/);
+  assert.match(term.b.b.why, /Blue/, 'the constructor nothing matches is named');
+  assert.equal(hasUnsupported(term), true, 'an un-eliminated abort must never be asserted');
+});
+
+test('enum case: a literal constructor scrutinee decides the case exactly', () => {
+  const ctx = enumCtx();
+  const term = translateExpr(
+    decodeMessage(
+      caseOf(
+        exprEnumCon(2, 4),
+        enumAlt(2, 3, exprInt(1)),
+        enumAlt(2, 4, exprInt(2)),
+        enumAlt(2, 5, exprInt(3))
+      )
+    ),
+    ctx
+  );
+  // Evaluation, not abstraction: no test is emitted and the branches not taken
+  // are never translated.
+  assert.deepEqual(term, { k: 'num', v: '2' });
+  // ...and a constructor that matches nothing aborts rather than falling out.
+  const none = translateExpr(
+    decodeMessage(caseOf(exprEnumCon(2, 5), enumAlt(2, 3, exprInt(1)))),
+    enumCtx()
+  );
+  assert.equal(none.k, 'abort');
+});
+
+test('enum case: a catch-all that is not last is REFUSED, not reordered', () => {
+  // LF matches alternatives in order, so a leading `_ ->` makes the rest dead;
+  // treating it as the else branch would pick the wrong one.
+  const ctx = enumCtx();
+  const term = translateExpr(
+    decodeMessage(caseOf(exprProj(exprVar(0), 1), defaultAlt(exprInt(9)), enumAlt(2, 3, exprInt(1)))),
+    ctx
+  );
+  assert.equal(term.k, 'unsupported');
+  assert.match(term.why, /not the last alternative/);
+});
+
+test('enum case: an undeclared constructor, or a type the archive lacks, is refused', () => {
+  // The constructor list becomes the SMT sort's; a constructor outside it
+  // would be an undeclared symbol, and a type with no declaration has no
+  // complete list at all.
+  const short = translateExpr(
+    decodeMessage(caseOf(exprProj(exprVar(0), 1), enumAlt(2, 9, exprInt(1)), defaultAlt(exprInt(2)))),
+    enumCtx()
+  );
+  assert.equal(short.k, 'unsupported');
+  assert.match(short.why, /not among the ones `M:Color` declares/);
+
+  const missing = translateExpr(
+    decodeMessage(caseOf(exprProj(exprVar(0), 1), enumAlt(10, 3, exprInt(1)), defaultAlt(exprInt(2)))),
+    enumCtx()
+  );
+  assert.equal(missing.k, 'unsupported');
+  assert.match(missing.why, /declaration this archive does not carry/);
+});
+
+test('variant case: only the DISCRIMINANT is modelled, and the payload says so', () => {
+  // `case this.status of Ok x -> x; Err e -> 0`. The tag is a fresh free
+  // symbol under the scrutinee's path - the same discipline the Optional
+  // encoding uses - and the payload binder is an explicit refusal, so a
+  // projection off it is reported rather than guessed.
+  const ctx = enumCtx();
+  const term = translateExpr(
+    decodeMessage(
+      caseOf(
+        exprProj(exprVar(0), 10),
+        variantAlt(6, 7, 9, exprVar(9)),
+        variantAlt(6, 8, 9, exprInt(0))
+      )
+    ),
+    ctx
+  );
+  assert.equal(term.k, 'ite');
+  assert.equal(termToSmt(term.c), '(= |this.status.$tag| |variant M:Result@testpkg#Ok|)');
+  assert.equal(term.a.k, 'unsupported');
+  assert.match(term.a.why, /payload of variant constructor `Ok` of `M:Result`/);
+  assert.match(term.a.why, /only the discriminant is modelled/);
+  assert.deepEqual(term.b, { k: 'num', v: '0' });
+  // The tag is a registered symbol, so a second case on the same path shares
+  // it rather than inventing a second one.
+  assert.ok(ctx.params.has('this.status.$tag'));
+});
+
+test('the datatype sort is declared on demand, and a disagreeing list refuses', () => {
+  // The Party-sort precedent: declared only when the query uses it, and a
+  // signature conflict makes the query non-modellable rather than being
+  // reconciled.
+  const plain = buildQuery([], T.app('>=', [v('x'), T.num('0')]));
+  assert.ok(!plain.script.includes('declare-datatypes'), 'no datatype mentioned, none declared');
+
+  const red = T.dcon('enum M:Color@p', 'Red', ['Red', 'Green']);
+  const q = buildQuery([T.app('=', [v('this.shade'), red])], T.bool(true));
+  assert.match(
+    q.script,
+    /\(declare-datatypes \(\(\|enum M:Color@p\| 0\)\) \(\(\(\|enum M:Color@p#Red\|\) \(\|enum M:Color@p#Green\|\)\)\)\)/
+  );
+  // the variable takes the datatype sort from the POSITION, exactly as a
+  // party constant pins its class
+  assert.match(q.script, /\(declare-const \|this\.shade\| \|enum M:Color@p\|\)/);
+
+  // Two occurrences disagreeing about the constructor list is a conflict: the
+  // sort name identifies the declaring package's type, so a disagreement means
+  // one name was attached to two types, and declaring either list would be an
+  // assumption about values the other does not have.
+  const green = T.dcon('enum M:Color@p', 'Green', ['Red', 'Green', 'Blue']);
+  assert.throws(
+    () => buildQuery([T.app('=', [v('this.shade'), red]), T.app('=', [v('this.shade'), green])], T.bool(true)),
+    /two different constructor lists/
+  );
+  // ...and so is using it where a number is expected.
+  const conflict = inferSorts([{ term: T.app('+', [v('this.shade'), T.num('1')]), sort: 'Real' }, { term: T.app('=', [v('this.shade'), red]), sort: 'Bool' }]);
+  assert.ok(conflict.conflicts.length, 'a datatype-sorted symbol used arithmetically must conflict');
+});
+
+test('an enum-sorted field is never given a `>= 0` obligation', () => {
+  // The whole point of `pinned`: a symbol pinned to a datatype sort is not a
+  // number, so asserting `>= 0` of it would be a fabricated obligation.
+  const red = T.dcon('enum M:Color@p', 'Red', ['Red', 'Green']);
+  const inst = nonNegativeFields(
+    transition({
+      guards: [T.app('=', [v('arg.shade'), red]), T.app('>', [v('arg.qty'), T.num('0')])],
+      creates: [
+        { template: 'T', base: null, fields: { shade: v('arg.shade'), amount: v('arg.qty') }, path: [] },
+      ],
+    })
+  );
+  assert.equal(inst.applicable, true);
+  // `amount` is used as a number by a guard, so it IS an obligation; `shade`
+  // is pinned to the datatype sort, so nothing types it as a number and it is
+  // skipped rather than asserted about.
+  assert.equal(inst.coverage.checked, 1);
+  assert.equal(termToSmt(inst.goal), '(>= |arg.qty| 0)');
+  assert.match(inst.coverage.skipped.join(' '), /T\.shade is not known to be numeric/);
+});
+
+test(
+  'enum and variant declarations decode from the real token DAR with full constructor lists',
+  { skip: !HAVE_TOKENS_DAR && `DAR not present at ${TOKENS_DAR}` },
+  () => {
+    // The compiled shapes are not what one would guess, so this pins what is
+    // actually there rather than a fixture's idea of it.
+    const raw = readDarRaw(TOKENS_DAR);
+    const enums = [...raw.dataTypes.entries()].filter(([, e]) => e.kind === 'enum');
+    assert.ok(enums.length, 'the package declares enums');
+    for (const [key, e] of enums) {
+      assert.ok(
+        Array.isArray(e.constructors) && e.constructors.length,
+        `${key} must decode with its constructor list; a short one is unsound for PROVED`
+      );
+    }
+    // Every datatype constant the translation produces names a constructor its
+    // own declaration lists - the invariant the SMT sort rests on.
+    const transitions = extractTransitions(raw, { bound: 3 });
+    const walk = (t, out) => {
+      if (!t || typeof t !== 'object') return out;
+      if (t.k === 'dcon') out.push(t);
+      for (const key of ['args', 'unrolled']) if (Array.isArray(t[key])) t[key].forEach((x) => walk(x, out));
+      for (const key of ['c', 'a', 'b', 'some', 'value']) if (t[key]) walk(t[key], out);
+      return out;
+    };
+    const cons = [];
+    for (const t of transitions) {
+      for (const g of t.guards) walk(g, cons);
+      for (const c of t.creates || []) {
+        Object.values(c.fields || {}).forEach((x) => walk(x, cons));
+        (c.path || []).forEach((x) => walk(x, cons));
+      }
+    }
+    for (const d of cons) {
+      assert.ok(d.ctors.includes(d.ctor), `${d.ctor} must be among ${d.ctors.join(', ')}`);
+      assert.match(d.sort, /^(enum|variant) .+:.+@/, 'a sort name identifies the declaring package');
+    }
+  }
+);
+
+test(
+  'a variant DISCRIMINANT is recovered from a real compiled package',
+  { skip: !HAVE_VARIANT_DAR && `DAR not present at ${VARIANT_DAR}` },
+  () => {
+    // `DA.Validation.Types:Validation` reaches the translator only after a
+    // cross-package beta reduction, which is why it is pinned against the
+    // compiled package rather than a fixture. Only the tag is modelled; the
+    // payload stays an explicit refusal.
+    const raw = readDarRaw(VARIANT_DAR);
+    const transitions = extractTransitions(raw, { bound: 3 });
+    const tags = new Set();
+    for (const t of transitions) {
+      for (const p of t.params || []) if (p.path.endsWith('$tag')) tags.add(p.name);
+    }
+    assert.ok(tags.size, 'a variant case should register a `$tag` symbol for its scrutinee');
+    for (const name of tags) {
+      assert.ok(
+        !name.includes('.$tag.'),
+        'a tag is a leaf: nothing is projected out of a discriminant'
+      );
+    }
   }
 );

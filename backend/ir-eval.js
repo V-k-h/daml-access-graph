@@ -69,6 +69,13 @@
 // The interpretation's results go through the same discipline as everything
 // else: a rational must be a {p, q} pair (no floats), a Bool a JS boolean, and
 // arguments arrive already evaluated, so an interpretation never sees a term.
+//
+// DATATYPE CONSTANTS (a Daml enum value, or a variant's discriminant) need no
+// interpretation at all, unlike an uninterpreted function and unlike a party
+// constant: SMT-LIB fixes the meaning of a datatype's nullary constructors -
+// they are pairwise distinct - so the term alone determines the value, and
+// equality is identity of (sort, constructor). A variable of such a sort does
+// take an environment entry, built with `dcon(sort, ctor)`.
 
 // ---------------------------------------------------------------- rationals
 
@@ -91,6 +98,26 @@ export const party = (token) => ({ party: String(token) });
 /** Is a value a party token? */
 export function isParty(v) {
   return typeof v === 'object' && v !== null && typeof v.party === 'string';
+}
+
+/**
+ * A value of a declared DATATYPE sort: a Daml enum constant, or the
+ * discriminant of a variant (see smt.js). An SMT datatype's nullary
+ * constructors are DISTINCT by the theory, so two of these are equal exactly
+ * when they name the same constructor of the same sort - no interpretation is
+ * involved and none is supplied.
+ *
+ * The sort travels with the value because constructor names are only unique
+ * within a sort, and an equality that ignored the sort would agree with the
+ * emitter for the wrong reason (the emitter's symbols are sort-qualified).
+ */
+export const dcon = (sort, ctor) => ({ dconSort: String(sort), ctor: String(ctor) });
+
+/** Is a value a datatype constructor token? */
+export function isDcon(v) {
+  return (
+    typeof v === 'object' && v !== null && typeof v.dconSort === 'string' && typeof v.ctor === 'string'
+  );
 }
 
 /** Is a value a rational {p, q}? */
@@ -229,6 +256,7 @@ function asStr(v, where) {
 function kindOf(v) {
   if (isUndef(v)) return 'undef';
   if (isRat(v)) return 'rational';
+  if (isDcon(v)) return `datatype constructor ${v.ctor}`;
   return typeof v;
 }
 
@@ -269,12 +297,18 @@ export function evalTerm(term, env, interp = undefined) {
       const v = env instanceof Map ? env.get(term.name) : env[term.name];
       if (v === undefined) throw new Error(`ir-eval: unbound variable ${term.name}`);
       if (typeof v === 'boolean' || typeof v === 'string') return v;
-      if (isParty(v)) return v;
+      if (isParty(v) || isDcon(v)) return v;
       if (isRat(v)) return ratNorm(v.p, v.q);
       throw new Error(
         `ir-eval: env value for ${term.name} is neither boolean, string nor {p,q}`
       );
     }
+    case 'dcon':
+      // A CONSTANT of a declared datatype sort. Unlike a party constant it
+      // needs no environment entry: the term names the constructor, and a
+      // datatype's nullary constructors are pairwise distinct by the theory,
+      // so its meaning is fixed by the term alone.
+      return dcon(term.sort, term.ctor);
     case 'party': {
       // A constant of the UNINTERPRETED `Party` sort. It has no structure and
       // no operations: the only thing a model fixes about it is which other
@@ -301,6 +335,11 @@ export function evalTerm(term, env, interp = undefined) {
       return evalApp(term, env, interp);
     case 'record':
       throw new Error('ir-eval: a whole record is not a value in this fragment');
+    case 'opt':
+      // An Optional value is a (presence, payload) PAIR, matching smt.js: it
+      // has no scalar meaning, and a property must destructure it into a
+      // guarded obligation before either side can evaluate anything.
+      throw new Error('ir-eval: an Optional value is a $some/$value pair, not a scalar');
     case 'unsupported':
       throw new Error(`ir-eval: unsupported term: ${term.why}`);
     default:
@@ -412,6 +451,19 @@ function evalApp(term, env, interp) {
         return chain(args, (a, b) => {
           if (!isParty(a) || !isParty(b)) throw new Error('ir-eval: = mixes a party with another sort');
           return a.party === b.party;
+        });
+      }
+      if (isDcon(args[0])) {
+        // Distinctness of a datatype's nullary constructors is part of the
+        // theory, so equality is identity of (sort, constructor).
+        return chain(args, (a, b) => {
+          if (!isDcon(a) || !isDcon(b)) {
+            throw new Error('ir-eval: = mixes a datatype constructor with another sort');
+          }
+          if (a.dconSort !== b.dconSort) {
+            throw new Error('ir-eval: = compares constructors of two different datatype sorts');
+          }
+          return a.ctor === b.ctor;
         });
       }
       return chain(args, (a, b) => ratEq(asRat(a, '='), asRat(b, '=')));

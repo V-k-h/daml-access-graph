@@ -291,6 +291,40 @@ export const T = {
    * the `builtin FOLDL is outside the fragment` node it replaces.
    */
   fold: (listName, op, unrolled) => ({ k: 'fold', listName, op, unrolled }),
+  /**
+   * An OPTIONAL VALUE, carried as the (presence, payload) PAIR the IR already
+   * uses for Optional FIELDS.
+   *
+   * `Some e` is `opt(true, <e>)` and `None` is `opt(false, null)`. This is not
+   * an abstraction: an Optional is exactly a flag plus a payload that only
+   * means anything when the flag is set, which is the same encoding
+   * translateCase gives an Optional field as the symbol pair
+   * `<path>.$some` / `<path>.$value`.
+   *
+   * An `opt` is NOT A SCALAR and never reaches the emitter. Like an
+   * uninstantiated `fold` it counts as unsupported everywhere
+   * (`hasUnsupported`), so every property that does not know about the pair
+   * drops it with a reason exactly as it dropped the `Optional constructor`
+   * node it replaces. Only a property that DESTRUCTURES the pair - and states
+   * an obligation guarded by `$some` - sees anything new.
+   */
+  opt: (some, value) => ({ k: 'opt', some, value: value || null }),
+  /**
+   * A CONSTANT of a Daml ENUM type, or the DISCRIMINANT of a variant: a
+   * constructor of an SMT algebraic datatype sort.
+   *
+   * `sort` is the sort name (package-qualified, see dalf.js
+   * dataConRefOfTycon), `ctor` the constructor, and `ctors` the COMPLETE
+   * constructor list read off the declaration. The list travels with every
+   * occurrence because the emitter declares the sort from the terms it sees
+   * (`declare-datatypes`), and it must declare the whole type: a sort declared
+   * with a constructor missing would make its variables range over fewer
+   * values than the Daml type has, which can turn a satisfiable query unsat
+   * and yield a spurious PROVED. Two occurrences disagreeing about the list
+   * are a CONFLICT and refuse the query, exactly as a uf used at two
+   * signatures does.
+   */
+  dcon: (sort, ctor, ctors) => ({ k: 'dcon', sort, ctor, ctors }),
   unsupported: (why, at) => ({ k: 'unsupported', why, at }),
 };
 
@@ -308,6 +342,11 @@ export function hasUnsupported(term) {
   // node - it gets dropped or skipped, with the reason reported, never
   // asserted and never proved over.
   if (term.k === 'fold') return true;
+  // An Optional VALUE is not a scalar either: it denotes a flag and a payload,
+  // and only a property that destructures the pair can say anything about it.
+  // Counting it as unsupported here is what keeps every other property
+  // behaving exactly as it did when `Some e` was a plain `unsupported` node.
+  if (term.k === 'opt') return true;
   if (term.k === 'app' || term.k === 'uf') return term.args.some(hasUnsupported);
   if (term.k === 'ite') return [term.c, term.a, term.b].some(hasUnsupported);
   return false;
@@ -324,6 +363,14 @@ export function unsupportedReasons(term, out = []) {
       why:
         `${term.op} over \`${term.listName}\` used where no list length is fixed; ` +
         `only a bounded property instantiates it`,
+    });
+  } else if (term.k === 'opt') {
+    out.push({
+      k: 'unsupported',
+      why:
+        'an Optional VALUE used where a scalar is required; it is modelled as the ' +
+        '`$some`/`$value` pair, which only a property that states an obligation guarded by ' +
+        '`$some` can destructure',
     });
   } else if (term.k === 'app' || term.k === 'uf') {
     term.args.forEach((a) => unsupportedReasons(a, out));
@@ -366,6 +413,13 @@ export function instantiateFolds(term, k) {
       b: instantiateFolds(term.b, k),
     };
   }
+  if (term.k === 'opt') {
+    return {
+      ...term,
+      some: instantiateFolds(term.some, k),
+      value: term.value ? instantiateFolds(term.value, k) : null,
+    };
+  }
   return term;
 }
 
@@ -379,6 +433,8 @@ export function foldLists(term, out = new Set()) {
     term.args.forEach((a) => foldLists(a, out));
   } else if (term.k === 'ite') {
     [term.c, term.a, term.b].forEach((a) => foldLists(a, out));
+  } else if (term.k === 'opt') {
+    [term.some, term.value].forEach((a) => a && foldLists(a, out));
   }
   return out;
 }
@@ -438,6 +494,9 @@ function scrubAborts(t) {
   }
   if (t.k === 'app' || t.k === 'uf') return { ...t, args: t.args.map(scrubAborts) };
   if (t.k === 'ite') return { ...t, c: scrubAborts(t.c), a: scrubAborts(t.a), b: scrubAborts(t.b) };
+  if (t.k === 'opt') {
+    return { ...t, some: scrubAborts(t.some), value: t.value ? scrubAborts(t.value) : null };
+  }
   return t;
 }
 
@@ -455,6 +514,8 @@ export function divisors(term, out = []) {
     [term.c, term.a, term.b].forEach((a) => divisors(a, out));
   } else if (term.k === 'fold') {
     term.unrolled.forEach((u) => divisors(u, out));
+  } else if (term.k === 'opt') {
+    [term.some, term.value].forEach((a) => a && divisors(a, out));
   }
   return out;
 }
@@ -925,12 +986,45 @@ function translateInner(expr, ctx) {
     );
   }
 
-  if (has(expr, S.Expr.optionalSome) || has(expr, S.Expr.optionalNone)) {
-    return refuse(
-      ctx,
-      'expr',
-      'Optional constructor (only Optional CASE ANALYSIS on contract/argument fields is modelled)'
-    );
+  // Optional CONSTRUCTORS, as the (presence, payload) pair. `None` is
+  // `opt(false, null)` and `Some e` is `opt(true, <e>)`, which is the same
+  // encoding translateCase gives an Optional FIELD - so the two agree by
+  // construction. The pair is not a scalar (hasUnsupported counts it), so a
+  // property that does not destructure it drops the term exactly as it dropped
+  // the refusal this replaces.
+  if (has(expr, S.Expr.optionalNone)) return T.opt(T.bool(false), null);
+  const someExpr = sub(expr, S.Expr.optionalSome);
+  if (someExpr) {
+    return T.opt(T.bool(true), translateExpr(deref(sub(someExpr, S.OptionalSomeExpr.value), ctx), ctx));
+  }
+
+  // An ENUM CONSTANT. Exact: an enum value IS its constructor, so a constant of
+  // the declared datatype sort loses nothing. The constructor must be one the
+  // declaration lists, because the sort is declared from that list and a
+  // constructor outside it would be an undeclared symbol in the script.
+  const enumConMsg = sub(expr, S.Expr.enumCon);
+  if (enumConMsg) {
+    const def = ctx.pkg.dataConRefOfTycon
+      ? ctx.pkg.dataConRefOfTycon(sub(enumConMsg, S.EnumConExpr.tycon))
+      : null;
+    const ctor = ctx.pkg.str(int(enumConMsg, S.EnumConExpr.enumConInternedStr));
+    if (!def || def.kind !== 'enum') {
+      return refuse(
+        ctx,
+        'enum',
+        `enum constructor \`${ctor}\` of a type whose declaration this archive does not carry, ` +
+          `so the complete constructor list - which the SMT sort must be declared with - is unknown`
+      );
+    }
+    if (!def.constructors.includes(ctor)) {
+      return refuse(
+        ctx,
+        'enum',
+        `enum constructor \`${ctor}\` is not among the constructors \`${def.module}:${def.name}\` ` +
+          `declares (${def.constructors.join(', ')})`
+      );
+    }
+    return T.dcon(def.sortName, ctor, def.constructors);
   }
 
   return refuse(ctx, 'expr', 'expression form outside the translated fragment');
@@ -1061,6 +1155,7 @@ function containsAbort(t) {
   if (t.k === 'app' || t.k === 'uf') return t.args.some(containsAbort);
   if (t.k === 'ite') return [t.c, t.a, t.b].some(containsAbort);
   if (t.k === 'fold') return t.unrolled.some(containsAbort);
+  if (t.k === 'opt') return [t.some, t.value].some((x) => x && containsAbort(x));
   return false;
 }
 
@@ -1170,6 +1265,16 @@ function textOpaqueUf(fun, rawArgs, ctx, trace, translated) {
 function translateCase(cse, ctx) {
   const scrutExpr = deref(sub(cse, 1), ctx);
   const alts = subs(cse, 2);
+
+  // ENUM and VARIANT alternatives, at any arity. Tried first because a case
+  // over a Daml datatype is not a two-way Bool and would otherwise be refused
+  // before its shape was ever looked at - which is what the `case with N
+  // alternatives` and `case on something other than a two-way Bool` refusals
+  // were.
+  if (alts.some((a) => has(a, S.CaseAlt.enum) || has(a, S.CaseAlt.variant))) {
+    return translateDataCase(alts, scrutExpr, ctx);
+  }
+
   if (alts.length !== 2) {
     return refuse(ctx, 'case', `case with ${alts.length} alternatives`);
   }
@@ -1205,33 +1310,49 @@ function translateCase(cse, ctx) {
   // branch binds nothing, so the Some side simply cannot name the payload,
   // which costs nothing for a guard that only asks whether the field is set.
   if ((noneAlt || someAlt) && (noneAlt || defaultAlt) && (someAlt || defaultAlt)) {
-    if (!(scrut.k === 'var' && ctx.params.has(scrut.name))) {
+    // The (presence, payload) pair the branches speak about. It comes either
+    // from the FIELD encoding - two symbols under the scrutinee's path - or
+    // from an Optional VALUE the translation built (`Some e`, `None`), and the
+    // two are the same shape by construction, which is the point of carrying
+    // `opt` as a term at all.
+    let present;
+    let value;
+    if (scrut.k === 'var' && ctx.params.has(scrut.name)) {
+      const p = ctx.params.get(scrut.name);
+      present = symbol(ctx, p.root, `${p.path}.$some`, 'Bool');
+      value = symbol(ctx, p.root, `${p.path}.$value`, 'Real');
+    } else if (scrut.k === 'opt') {
+      present = scrut.some;
+      // `None` has no payload at all. Nothing may read it: the Some branch is
+      // only reachable when `present` is true, and here it is statically false.
+      value =
+        scrut.value ||
+        T.unsupported('the payload of a `None`, which has none', ctx.label);
+    } else {
       if (scrut.k === 'unsupported') return scrut;
       return refuse(ctx, 'case', 'Optional case over a value that is not a contract/argument field');
     }
-    const p = ctx.params.get(scrut.name);
-    const present = symbol(ctx, p.root, `${p.path}.$some`, 'Bool');
-    const value = symbol(ctx, p.root, `${p.path}.$value`, 'Real');
-    let someBody;
-    if (someAlt) {
+    const someSide = () => {
+      if (!someAlt) return translateExpr(deref(sub(defaultAlt, S.CaseAlt.body), ctx), ctx);
       const someMsg = sub(someAlt, S.CaseAlt.optionalSome);
       const binder = ctx.pkg.str(int(someMsg, S.OptionalSomeAlt.varBodyInternedStr));
       const prev = ctx.env.has(binder) ? ctx.env.get(binder) : undefined;
       ctx.env.set(binder, value);
       try {
-        someBody = translateExpr(deref(sub(someAlt, S.CaseAlt.body), ctx), ctx);
+        return translateExpr(deref(sub(someAlt, S.CaseAlt.body), ctx), ctx);
       } finally {
         if (prev === undefined) ctx.env.delete(binder);
         else ctx.env.set(binder, prev);
       }
-    } else {
-      someBody = translateExpr(deref(sub(defaultAlt, S.CaseAlt.body), ctx), ctx);
-    }
-    const noneBody = translateExpr(
-      deref(sub(noneAlt || defaultAlt, S.CaseAlt.body), ctx),
-      ctx
-    );
-    return T.ite(present, someBody, noneBody);
+    };
+    const noneSide = () =>
+      translateExpr(deref(sub(noneAlt || defaultAlt, S.CaseAlt.body), ctx), ctx);
+
+    // A statically known presence decides the case exactly - which is what an
+    // Optional VALUE produces - and only the branch that is taken is
+    // translated, so nothing a dead branch would have refused is recorded.
+    if (present && present.k === 'bool') return present.v ? someSide() : noneSide();
+    return T.ite(present, someSide(), noneSide());
   }
 
   let whenTrue = null;
@@ -1256,6 +1377,271 @@ function translateCase(cse, ctx) {
   }
 
   return T.ite(scrut, translateExpr(whenTrue, ctx), translateExpr(whenFalse, ctx));
+}
+
+
+/**
+ * A `case` over a Daml ENUM or VARIANT, at any arity.
+ *
+ * Daml datatypes map onto SMT ALGEBRAIC DATATYPES, which cvc5 supports through
+ * `declare-datatypes` in logic ALL, and this is where that mapping is made.
+ * Two very different amounts of information are recovered, and the difference
+ * is stated on the term rather than blurred:
+ *
+ *   ENUM - EXACT. An enum value IS its constructor: there is nothing else in
+ *     it. The scrutinee becomes a term of a datatype sort whose constructors
+ *     are the ones the package DECLARES, and the case becomes a chain of
+ *     equality tests. No approximation is involved in either direction.
+ *
+ *   VARIANT - the DISCRIMINANT ONLY. A variant constructor carries a payload,
+ *     and modelling the payload would mean giving the emitter a sort for an
+ *     arbitrary Daml type (a record, a list, another variant) that it does not
+ *     have. So the value is represented by a FRESH FREE SYMBOL `<path>.$tag`
+ *     of the tag sort - exactly the way an Optional field is represented by
+ *     the free symbol `<path>.$some` - and each alternative's payload binder is
+ *     bound to an explicit `unsupported` node. The branch CONDITIONS are
+ *     recovered; a projection off a payload is refused with its reason.
+ *
+ *     Why a free symbol is the sound choice, in the same words as the Optional
+ *     encoding: the tag is not a function of anything else in the query, so
+ *     the solver ranges over every tag the type has, and in particular over
+ *     the one the real value carries. Every real state therefore has a model,
+ *     which is what a universal property needs. The cost is precision, never
+ *     soundness: two occurrences of the same path share one tag symbol, and
+ *     two different paths never do.
+ *
+ * THE CATCH-ALL. A `_ ->` alternative is the ELSE of the chain, which is
+ * exactly the negation of every alternative spelled out above it - never a
+ * dropped branch. A case that does NOT spell out every constructor and has no
+ * catch-all ends in an `abort`, because a non-exhaustive match in Daml-LF
+ * raises rather than producing a value; `guardConjuncts` can then eliminate it
+ * where guard semantics allow and refuses it everywhere else.
+ *
+ * A catch-all that is not the LAST alternative is refused rather than
+ * reordered: LF matches alternatives in order, so a leading `_ ->` makes every
+ * alternative after it dead, and building the chain as if it were last would
+ * silently pick the wrong branch.
+ *
+ * Refusals here keep the `case` kind the refusals they replace already had, so
+ * the uninterpreted-function eligibility rules (UF_BLOCKING_REFUSAL) see
+ * exactly what they saw before; only the REASON gets more precise.
+ */
+function translateDataCase(alts, scrutExpr, ctx) {
+  const r = resolveDataCase(alts, scrutExpr, ctx);
+  if (!r.ok) return r.propagate || refuse(ctx, 'case', r.why, { cascade: !!r.cascade });
+  const { kind, def, dataAlts, defaultAlt, ctors, scrut, test, withPayload } = r;
+
+  const bodyOf = (alt, index) =>
+    withPayload(alt, index, () => translateExpr(deref(sub(alt, S.CaseAlt.body), ctx), ctx));
+
+  // A scrutinee that IS a constructor decides the case statically. This is
+  // evaluation, not abstraction, and it is how a compiled `case someEnumConst
+  // of ...` collapses to the one branch it takes - so nothing in the branches
+  // not taken is translated, and no refusal from a dead branch is recorded.
+  if (scrut.k === 'dcon') {
+    const i = ctors.indexOf(scrut.ctor);
+    if (i >= 0) return bodyOf(dataAlts[i], i);
+    if (defaultAlt) return bodyOf(defaultAlt, null);
+    return T.abort(
+      `no alternative matches \`${scrut.ctor}\` in a case over \`${def.module}:${def.name}\``
+    );
+  }
+
+  const covered = new Set(ctors);
+  let last = dataAlts.length - 1;
+  let chain;
+  if (defaultAlt) {
+    chain = bodyOf(defaultAlt, null);
+  } else if (covered.size === def.constructors.length) {
+    // Every constructor is spelled out, so the final alternative's test is
+    // implied by the failure of all the others: the sort is DECLARED with
+    // exactly these constructors, so there is no fourth value to fall to.
+    chain = bodyOf(dataAlts[last], last);
+    last -= 1;
+  } else {
+    const missing = def.constructors.filter((c) => !covered.has(c));
+    chain = T.abort(
+      `a non-exhaustive case over \`${def.module}:${def.name}\`: nothing matches ` +
+        `${missing.join(', ')}`
+    );
+  }
+  for (let i = last; i >= 0; i--) chain = T.ite(test(i), bodyOf(dataAlts[i], i), chain);
+  return chain;
+}
+
+/**
+ * Validate a `case` over an enum or variant and produce everything both
+ * consumers need: the translated scrutinee, the constructor per alternative,
+ * the equality test for each, and the payload binding discipline.
+ *
+ * Shared by translateDataCase (which builds a TERM) and collectEffects (which
+ * needs the same branch conditions as PATH CONDITIONS on the creates it finds
+ * underneath). Sharing it is not a tidiness point: a branch condition that
+ * differed between the two would let a create be recorded under a guard the
+ * term for the same branch does not mention.
+ *
+ * @returns {{ok: true, ...} | {ok: false, why: string, cascade?: boolean,
+ *   propagate?: Object}}
+ */
+function resolveDataCase(alts, scrutExpr, ctx) {
+  const isEnum = (a) => has(a, S.CaseAlt.enum);
+  const isVariant = (a) => has(a, S.CaseAlt.variant);
+  const no = (why, extra = {}) => ({ ok: false, why, ...extra });
+  const defaultAlt = alts.find((a) => has(a, S.CaseAlt.default));
+
+  const dataAlts = alts.filter((a) => isEnum(a) || isVariant(a));
+  if (!dataAlts.length) return no('a case with no enum or variant alternative');
+  if (dataAlts.some(isEnum) && dataAlts.some(isVariant)) {
+    return no('a case mixing enum and variant patterns, which is not well typed');
+  }
+  const kind = isEnum(dataAlts[0]) ? 'enum' : 'variant';
+  const altField = kind === 'enum' ? S.CaseAlt.enum : S.CaseAlt.variant;
+  const conField = kind === 'enum' ? S.EnumAlt.con : S.VariantAlt.con;
+  const ctorField =
+    kind === 'enum' ? S.EnumAlt.constructorInternedStr : S.VariantAlt.variantInternedStr;
+
+  for (const a of alts) {
+    if (isEnum(a) || isVariant(a) || a === defaultAlt) continue;
+    return no(`a case mixing ${kind} patterns with another pattern shape, which is not well typed`);
+  }
+  if (defaultAlt && alts[alts.length - 1] !== defaultAlt) {
+    return no(
+      `a \`_ ->\` catch-all that is not the last alternative; LF matches alternatives in order, ` +
+        `so the alternatives after it are dead and treating it as the else branch would pick ` +
+        `the wrong one`
+    );
+  }
+
+  // The DECLARED type, with its COMPLETE constructor list. Every alternative
+  // must name the same one; a package the archive does not carry yields
+  // nothing rather than a partial list (see dalf.js: dataConRefOfTycon).
+  const patterns = dataAlts.map((a) => sub(a, altField));
+  let def = null;
+  const ctors = [];
+  for (let i = 0; i < patterns.length; i++) {
+    const here = ctx.pkg.dataConRefOfTycon
+      ? ctx.pkg.dataConRefOfTycon(sub(patterns[i], conField))
+      : null;
+    if (!here) {
+      return no(
+        `a case over a ${kind} whose declaration this archive does not carry, so the complete ` +
+          `constructor list the SMT sort must be declared with is unknown`
+      );
+    }
+    if (here.kind !== kind) {
+      return no(
+        `a ${kind} pattern naming \`${here.module}:${here.name}\`, which the package declares ` +
+          `as a ${here.kind}`
+      );
+    }
+    if (def && here.sortName !== def.sortName) {
+      return no(
+        `a case whose alternatives name two different types (\`${def.module}:${def.name}\` and ` +
+          `\`${here.module}:${here.name}\`)`
+      );
+    }
+    def = here;
+    const ctor = ctx.pkg.str(int(patterns[i], ctorField));
+    if (!def.constructors.includes(ctor)) {
+      return no(
+        `constructor \`${ctor}\` is not among the ones \`${def.module}:${def.name}\` declares ` +
+          `(${def.constructors.join(', ')})`
+      );
+    }
+    ctors.push(ctor);
+  }
+
+  const scrut = dataCaseScrutinee(kind, def, scrutExpr, ctx);
+  if (!scrut) return no(dataCaseScrutineeWhy(kind), { cascade: true });
+  if (scrut.k === 'unsupported') return no(scrut.why, { cascade: true, propagate: scrut });
+
+  /** Run `f` with alternative `index`'s variant payload binder in scope. */
+  const withPayload = (alt, index, f) => {
+    if (kind !== 'variant' || index === null) return f();
+    const binder = ctx.pkg.str(int(sub(alt, altField), S.VariantAlt.binderInternedStr));
+    const prev = ctx.env.has(binder) ? ctx.env.get(binder) : undefined;
+    const prevRaw = ctx.rawEnv.has(binder) ? ctx.rawEnv.get(binder) : undefined;
+    ctx.env.set(
+      binder,
+      T.unsupported(
+        `the payload of variant constructor \`${ctors[index]}\` of \`${def.module}:${def.name}\`: ` +
+          `only the discriminant is modelled, because the payload's type has no sort in the ` +
+          `emitter (Bool/Real/Int/String, plus the declared datatype sorts)`,
+        ctx.label
+      )
+    );
+    // A stale raw binding would let recordFields or betaReduce chase the
+    // payload as if it had an expression behind it; it does not.
+    ctx.rawEnv.delete(binder);
+    try {
+      return f();
+    } finally {
+      if (prev === undefined) ctx.env.delete(binder);
+      else ctx.env.set(binder, prev);
+      if (prevRaw === undefined) ctx.rawEnv.delete(binder);
+      else ctx.rawEnv.set(binder, prevRaw);
+    }
+  };
+
+  return {
+    ok: true,
+    kind,
+    def,
+    dataAlts,
+    defaultAlt,
+    ctors,
+    scrut,
+    test: (i) => T.app('=', [scrut, T.dcon(def.sortName, ctors[i], def.constructors)]),
+    withPayload,
+  };
+}
+
+/**
+ * The term a data case branches on.
+ *
+ * For an ENUM it is the scrutinee's own term: an enum value is its
+ * constructor, so whatever denotes the value denotes the tag.
+ *
+ * For a VARIANT it is a FRESH tag symbol under the scrutinee's path, because
+ * the value itself has no term. The two shapes that can carry a path are the
+ * two the rest of the translator already names: a REGISTERED projection
+ * (`this.status`, `arg.x.y`) and a RECORD root (the template record, a choice
+ * argument, or a symbolic list element introduced for an unapplied lambda's
+ * parameter). Anything else has no name to hang a tag on, and inventing one
+ * would relate two unrelated occurrences.
+ *
+ * @returns {Object|null} the term, an `unsupported` to propagate, or null
+ */
+function dataCaseScrutinee(kind, def, scrutExpr, ctx) {
+  const term = translateExpr(scrutExpr, ctx);
+  if (term && term.k === 'unsupported') return term;
+
+  // An ENUM value IS its constructor, so whatever term denotes the value
+  // denotes the tag and is used as it stands - a registered field symbol, an
+  // enum constant, a conditional between constants.
+  if (kind === 'enum' && term && !hasUnsupported(term) && term.k !== 'record') return term;
+
+  // Otherwise the value has no term of its own and a FRESH tag symbol stands
+  // for it, under the only two paths this translation can name: a registered
+  // projection, and a record root (the contract, the choice argument, or the
+  // symbolic element an unapplied lambda's parameter became - a parameter of
+  // datatype type is not a record at all, and `$tag` is the honest name for
+  // what a case on it looks at).
+  if (term && term.k === 'var' && ctx.params.has(term.name)) {
+    const p = ctx.params.get(term.name);
+    return symbol(ctx, p.root, `${p.path}.$tag`, def.sortName);
+  }
+  if (term && term.k === 'record') return symbol(ctx, term.root, '$tag', def.sortName);
+  return null;
+}
+
+function dataCaseScrutineeWhy(kind) {
+  return (
+    `${kind === 'enum' ? 'an' : 'a'} ${kind} case whose scrutinee is neither a value of the ` +
+    `type nor a projection off the ` +
+    `contract or the choice argument nor a record in scope, so there is no path to name its ` +
+    `discriminant after; inventing one would let two unrelated occurrences share a tag symbol`
+  );
 }
 
 /**
@@ -2342,6 +2728,13 @@ export function rewriteVars(term, fn) {
   if (term.k === 'ite') {
     return { ...term, c: rewriteVars(term.c, fn), a: rewriteVars(term.a, fn), b: rewriteVars(term.b, fn) };
   }
+  if (term.k === 'opt') {
+    return {
+      ...term,
+      some: rewriteVars(term.some, fn),
+      value: term.value ? rewriteVars(term.value, fn) : null,
+    };
+  }
   return term;
 }
 
@@ -3157,8 +3550,55 @@ function collectEffects(expr, ctx, path, creates, unsupported, depth = 0) {
   // a branch contributes a path condition to each side
   const cse = sub(expr, S.Expr.case);
   if (cse) {
-    const scrut = translateExpr(sub(cse, 1), ctx);
     const alts = subs(cse, 2);
+
+    // ENUM and VARIANT branches, at any arity. The conditions come from the
+    // SAME resolver the term translator uses (resolveDataCase), so a create
+    // found under one of these branches is recorded under exactly the
+    // condition the term for that branch would have carried. The catch-all is
+    // the negation of the alternatives spelled out, never a dropped branch.
+    if (alts.some((a) => has(a, S.CaseAlt.enum) || has(a, S.CaseAlt.variant))) {
+      const r = resolveDataCase(alts, sub(cse, S.Case.scrut), ctx);
+      if (r.ok) {
+        r.dataAlts.forEach((alt, i) => {
+          r.withPayload(alt, i, () =>
+            collectEffects(
+              sub(alt, S.CaseAlt.body),
+              ctx,
+              [...path, r.test(i)],
+              creates,
+              unsupported,
+              depth + 1
+            )
+          );
+        });
+        if (r.defaultAlt) {
+          const others = r.dataAlts.map((_, i) => r.test(i));
+          const cond =
+            others.length === 1
+              ? T.app('not', [others[0]])
+              : T.app('not', [T.app('or', others)]);
+          collectEffects(
+            sub(r.defaultAlt, S.CaseAlt.body),
+            ctx,
+            [...path, cond],
+            creates,
+            unsupported,
+            depth + 1
+          );
+        }
+        return;
+      }
+      // Not modellable as a datatype case: say why, then descend with no
+      // refinement so the creates below are still found.
+      unsupported.push({ why: `branch outside the translated fragment: ${r.why}` });
+      for (const alt of alts) {
+        collectEffects(sub(alt, S.CaseAlt.body), ctx, path, creates, unsupported, depth + 1);
+      }
+      return;
+    }
+
+    const scrut = translateExpr(sub(cse, 1), ctx);
     if (alts.length !== 2 || scrut.k === 'unsupported') {
       unsupported.push({ why: 'branch on a value outside the translated fragment' });
       // still descend, so creates below are not missed, but with no refinement

@@ -66,6 +66,12 @@ export const TemplateChoice = G.message('TemplateChoice');
  */
 export const DefDataType = G.message('DefDataType');
 export const DataTypeFields = G.message('DefDataType.Fields');
+/**
+ * An enum's CONSTRUCTOR LIST. Needed in full, not in part: it becomes the
+ * constructor list of an SMT datatype sort, and a short list would shrink the
+ * set of values the sort's variables range over (see dalf.js).
+ */
+export const DataTypeEnumConstructors = G.message('DefDataType.EnumConstructors');
 export const FieldWithType = G.message('FieldWithType');
 
 // ------------------------------------------------------------------- names
@@ -110,6 +116,18 @@ export const Block = G.message('Block');
 export const Case = G.message('Case');
 export const CaseAlt = G.message('CaseAlt');
 export const OptionalSomeAlt = G.message('CaseAlt.OptionalSome');
+/**
+ * The ENUM and VARIANT patterns, and the enum CONSTRUCTOR expression.
+ *
+ * Like the Optional pair above, the pattern and the constructor are different
+ * messages: `CaseAlt.Enum` names the constructor a branch matches, while
+ * `Expr.EnumCon` IS a value of the enum type. The translator needs both - one
+ * to build the branch conditions, the other to decide a case whose scrutinee
+ * is a literal constructor.
+ */
+export const EnumAlt = G.message('CaseAlt.Enum');
+export const VariantAlt = G.message('CaseAlt.Variant');
+export const EnumConExpr = G.message('Expr.EnumCon');
 export const Binding = G.message('Binding');
 export const BuiltinLit = G.message('BuiltinLit');
 export const CallInterface = G.message('Expr.CallInterface');

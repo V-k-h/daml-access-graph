@@ -52,7 +52,16 @@
 //
 // What a PROVED here does NOT mean, stated where it cannot be missed:
 //   * Numeric 10 is modelled as exact Real (see smt.js) - rounding-dependent
-//     equalities are refused rather than proved wrongly.
+//     equalities are refused rather than proved wrongly. Daml's `Int` (Int64)
+//     is modelled as exact Real TOO, and that one cuts the other way: the
+//     emitter has no rule that yields the SMT `Int` sort, so an integer field
+//     is declared `Real` and carries no integrality constraint. Sound for
+//     PROVED (the solver quantifies over a superset of the reachable values),
+//     but it means a DISPROVED whose counterexample gives an INTEGER-declared
+//     field a fractional value - `x = (/ (- 1) 10)` for a field the package
+//     declares `Int` - is an artifact of this abstraction and not a behaviour
+//     of the code. Check a counterexample's values against the declared field
+//     types before treating it as a finding.
 //   * Guards that leave the fragment are dropped, which is sound for proving
 //     (superset of reachable states) but each drop is listed in the report.
 //   * Opaque Text operations are modelled as UNINTERPRETED FUNCTIONS (see the
