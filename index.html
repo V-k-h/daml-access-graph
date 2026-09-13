@@ -38,9 +38,79 @@
       <section class="pane pane-graph">
         <div class="pane-toolbar">
           <span id="stats" class="stats"></span>
-          <span id="legend" class="legend"></span>
+          <span class="toolbar-spacer"></span>
+          <label for="layout-mode">Layout</label>
+          <select id="layout-mode" title="Layered suits the collapsed lifecycle view; force suits expanded detail">
+            <option value="auto">auto</option>
+            <option value="layered">layered</option>
+            <option value="force">force</option>
+          </select>
+          <button id="collapse-all" type="button" class="btn-secondary" title="Show one node per template or interface">Collapse all</button>
+          <button id="expand-all" type="button" class="btn-secondary" title="Show every party, choice and key node">Expand all</button>
         </div>
-        <svg id="graph" width="100%" height="100%"></svg>
+
+        <div class="graph-controls">
+          <fieldset class="ctl">
+            <legend>Focus</legend>
+            <span id="focus-target" class="focus-target">none selected</span>
+            <label for="focus-hops">hops</label>
+            <select id="focus-hops">
+              <option value="1">1</option>
+              <option value="2" selected>2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+            <label for="focus-direction">direction</label>
+            <select id="focus-direction" title="&quot;in&quot; answers: what can touch this template?">
+              <option value="both">both</option>
+              <option value="in">in (what reaches it)</option>
+              <option value="out">out (what it reaches)</option>
+            </select>
+            <label for="focus-mode">outside</label>
+            <select id="focus-mode">
+              <option value="dim">dim</option>
+              <option value="hide">hide</option>
+            </select>
+            <button id="focus-clear" type="button" class="btn-secondary">Clear</button>
+          </fieldset>
+
+          <fieldset class="ctl">
+            <legend>Edges</legend>
+            <label class="chk"><input type="checkbox" id="edges-structural" checked /> structural</label>
+            <label class="chk"><input type="checkbox" id="edges-operational" checked /> operational</label>
+            <details class="ctl-details">
+              <summary>by kind</summary>
+              <div id="edge-kinds" class="chk-grid"></div>
+            </details>
+          </fieldset>
+
+          <fieldset class="ctl">
+            <legend>Nodes</legend>
+            <details class="ctl-details">
+              <summary>kinds</summary>
+              <div id="node-kinds" class="chk-grid"></div>
+            </details>
+            <details class="ctl-details">
+              <summary id="module-summary">modules</summary>
+              <div class="module-box">
+                <label class="sr-only" for="module-prefix">module prefix</label>
+                <input id="module-prefix" type="text" placeholder="prefix, e.g. Calc." />
+                <div class="module-actions">
+                  <button id="modules-all" type="button" class="btn-tiny">all</button>
+                  <button id="modules-none" type="button" class="btn-tiny">none</button>
+                </div>
+                <div id="module-list" class="chk-grid"></div>
+              </div>
+            </details>
+            <label class="chk"><input type="checkbox" id="hide-isolated" /> hide unconnected</label>
+          </fieldset>
+        </div>
+
+        <p id="hidden-report" class="hidden-report" role="status" aria-live="polite"></p>
+
+        <svg id="graph" width="100%" height="100%" role="img" aria-label="Daml access graph"></svg>
+
+        <div id="legend" class="legend"></div>
       </section>
     </main>
 

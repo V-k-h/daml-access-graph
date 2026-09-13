@@ -2,6 +2,11 @@
 //
 // Wires the UI together: read Daml source -> parse -> build graph -> render,
 // and surface diagnostics + the raw graph JSON.
+//
+// The app owns the VIEW STATE (what is expanded, what is filtered, what is
+// focused) and hands it to renderGraph on every change. The view state is a
+// plain object, and every transformation it drives lives in src/view.js, so
+// what the user sees is reproducible from {graph, viewState} alone.
 
 import { parseDaml } from './parser.js';
 import { parseProject } from './project.js';
@@ -9,6 +14,7 @@ import { expandCalls } from './callgraph.js';
 import { buildGraph } from './graph.js';
 import { renderGraph, NODE_STYLE, EDGE_STYLE } from './renderer.js';
 import { analyzeAll } from './analysis.js';
+import { modulesOf, edgeKindsOf, OPERATIONAL, STRUCTURAL } from './view.js';
 
 const els = {
   source: document.getElementById('source'),
@@ -24,7 +30,48 @@ const els = {
   jsonFile: document.getElementById('json-file'),
   loadDaml: document.getElementById('load-daml'),
   damlFile: document.getElementById('daml-file'),
+  // view controls
+  layoutMode: document.getElementById('layout-mode'),
+  collapseAll: document.getElementById('collapse-all'),
+  expandAll: document.getElementById('expand-all'),
+  focusTarget: document.getElementById('focus-target'),
+  focusHops: document.getElementById('focus-hops'),
+  focusDirection: document.getElementById('focus-direction'),
+  focusMode: document.getElementById('focus-mode'),
+  focusClear: document.getElementById('focus-clear'),
+  edgesStructural: document.getElementById('edges-structural'),
+  edgesOperational: document.getElementById('edges-operational'),
+  edgeKinds: document.getElementById('edge-kinds'),
+  nodeKinds: document.getElementById('node-kinds'),
+  moduleList: document.getElementById('module-list'),
+  moduleSummary: document.getElementById('module-summary'),
+  modulePrefix: document.getElementById('module-prefix'),
+  modulesAll: document.getElementById('modules-all'),
+  modulesNone: document.getElementById('modules-none'),
+  hideIsolated: document.getElementById('hide-isolated'),
+  hiddenReport: document.getElementById('hidden-report'),
 };
+
+// ------------------------------------------------------------- view state
+
+/** The currently rendered graph, and how it is being looked at. */
+let currentGraph = null;
+let viewState = freshViewState();
+
+function freshViewState() {
+  return {
+    expanded: new Set(),
+    layout: 'auto',
+    filters: {
+      edgeKinds: null,   // null = every kind
+      nodeKinds: null,
+      modules: null,
+      modulePrefix: '',
+      hideIsolated: false,
+    },
+    focus: { seeds: [], hops: 2, direction: 'both', mode: 'dim' },
+  };
+}
 
 // Small built-in examples so the app is usable without loading files.
 const EXAMPLES = {
@@ -112,7 +159,26 @@ function runProject(files) {
 
 // Render an already-built graph (from source, or loaded JSON).
 function showGraph(graph, { diagnostics, findings } = {}) {
-  renderGraph(els.svg, graph);
+  currentGraph = graph;
+  // A new graph invalidates every selection: node ids from the old one would
+  // silently match nothing, which would look like an empty focus rather than
+  // a stale one.
+  viewState = freshViewState();
+  viewState.layout = els.layoutMode.value || 'auto';
+
+  // Start collapsed on anything large enough to be a hairball, expanded on the
+  // small pasted examples where the detail IS the point. The threshold is
+  // about the reader, not the renderer: a dozen nodes is readable in full.
+  if (graph.nodes.length > 40) {
+    viewState.expanded = new Set();
+  } else {
+    viewState.expanded = new Set(
+      graph.nodes.filter((n) => n.kind === 'template' || n.kind === 'interface').map((n) => n.id)
+    );
+  }
+
+  buildFilterControls(graph);
+  rerender();
   renderDiagnostics(diagnostics || []);
   // Prefer analysis embedded by `extract-dar.js --analyze`; otherwise compute.
   renderFindings(findings || analyzeAll(graph).all);
@@ -120,34 +186,150 @@ function showGraph(graph, { diagnostics, findings } = {}) {
   els.json.textContent = JSON.stringify(graph, null, 2);
 }
 
-// Validate + render a normalized graph JSON (e.g. from the Daml-LF backend).
-function loadGraphJson(text, fileName) {
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    renderDiagnostics([{ severity: 'error', message: `Not valid JSON: ${e.message}` }]);
-    return;
-  }
-  const graph = data && data.nodes && data.edges ? data : null;
-  if (!graph || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) {
-    renderDiagnostics([
-      { severity: 'error', message: 'JSON does not look like a normalized graph (missing `nodes` / `edges` arrays).' },
-    ]);
-    return;
-  }
-  graph.meta = graph.meta || {};
-  // `--analyze` output nests the graph under top-level keys plus `analysis`.
-  const embedded = data.analysis && Array.isArray(data.analysis.all) ? data.analysis.all : null;
-  showGraph(graph, {
-    diagnostics: [
-      {
-        severity: 'info',
-        message: `Loaded ${fileName || 'graph JSON'} (source: ${graph.meta.source || 'unknown'}) - visualization only, no Daml was parsed.`,
-      },
-    ],
-    findings: embedded,
+/** Re-run the view pipeline and repaint. Cheap enough to call on every input. */
+function rerender() {
+  if (!currentGraph) return;
+  const info = renderGraph(els.svg, currentGraph, viewState, {
+    onSelect: (id) => {
+      // Clicking an already-focused node clears the focus, so a click is a
+      // toggle rather than a trap.
+      const seeds = viewState.focus.seeds;
+      viewState.focus.seeds = seeds.length === 1 && seeds[0] === id ? [] : [id];
+      syncFocusLabel();
+      rerender();
+    },
+    onToggleExpand: (containerId) => {
+      if (viewState.expanded.has(containerId)) viewState.expanded.delete(containerId);
+      else viewState.expanded.add(containerId);
+      rerender();
+    },
   });
+  renderLegend(info.legend);
+  renderHiddenReport(info);
+}
+
+function syncFocusLabel() {
+  const seeds = viewState.focus.seeds;
+  els.focusTarget.textContent = seeds.length === 0
+    ? 'none selected'
+    : seeds.map((s) => s.replace(/^(tpl|iface|choice|party|key):/, '')).join(', ');
+}
+
+/**
+ * The hidden-node report.
+ *
+ * This is not decoration. The tool's discipline is that it never shows a
+ * subset without saying so, and collapse / filter / focus all show subsets by
+ * design. If every node and every underlying edge is on screen, it says so
+ * plainly instead of staying silent, so "no message" is never ambiguous.
+ */
+function renderHiddenReport(info) {
+  const h = info.hidden;
+  const head =
+    `Showing ${h.shownNodes} of ${h.rawNodes} node(s) and ${h.rawEdgesShown} of ${h.rawEdges} edge(s) ` +
+    `(${h.shownEdges} drawn after aggregation).`;
+  const labels = info.labelsTotal > info.labelsShown
+    ? ` ${info.labelsTotal - info.labelsShown} label(s) suppressed to avoid overlap.`
+    : '';
+  const timing = ` [${info.layout.mode}, layout ${info.layout.ms.toFixed(1)}ms, total ${info.timing.totalMs.toFixed(1)}ms]`;
+
+  els.hiddenReport.className = 'hidden-report' + (h.complete && !labels ? ' complete' : ' partial');
+  if (h.complete && h.reasons.length === 0) {
+    els.hiddenReport.textContent = `${head} Nothing is hidden.${labels}${timing}`;
+    return;
+  }
+  els.hiddenReport.textContent = `${head} ${h.reasons.join('; ')}.${labels}${timing}`;
+}
+
+/** Build the per-graph filter checkboxes from what the graph actually holds. */
+function buildFilterControls(graph) {
+  // --- edge kinds
+  const kinds = edgeKindsOf(graph);
+  els.edgeKinds.innerHTML = '';
+  for (const { kind, count, group } of kinds) {
+    els.edgeKinds.appendChild(checkbox(`ek-${kind}`, `${kind} (${count})`, true, () => {
+      syncEdgeFilter();
+      rerender();
+    }, { 'data-kind': kind, 'data-group': group }));
+  }
+  els.edgesStructural.checked = true;
+  els.edgesOperational.checked = true;
+
+  // --- node kinds
+  const nodeKinds = [...new Set(graph.nodes.map((n) => n.kind))].sort();
+  els.nodeKinds.innerHTML = '';
+  for (const k of nodeKinds) {
+    const count = graph.nodes.filter((n) => n.kind === k).length;
+    els.nodeKinds.appendChild(checkbox(`nk-${k}`, `${k} (${count})`, true, () => {
+      syncNodeKindFilter();
+      rerender();
+    }, { 'data-kind': k }));
+  }
+
+  // --- modules (derived through containers, so templates whose own `module`
+  // field is missing still land in the right bucket - see view.js deriveModule)
+  const mods = modulesOf(graph);
+  els.moduleList.innerHTML = '';
+  for (const { module, count } of mods) {
+    els.moduleList.appendChild(checkbox(`mod-${module}`, `${module} (${count})`, true, () => {
+      syncModuleFilter();
+      rerender();
+    }, { 'data-module': module }));
+  }
+  els.moduleSummary.textContent = `modules (${mods.length})`;
+  els.modulePrefix.value = '';
+  els.hideIsolated.checked = false;
+}
+
+function syncEdgeFilter() {
+  const boxes = [...els.edgeKinds.querySelectorAll('input[type=checkbox]')];
+  const on = boxes.filter((b) => b.checked).map((b) => b.dataset.kind);
+  viewState.filters.edgeKinds = on.length === boxes.length ? null : new Set(on);
+  // Keep the two group toggles honest about the per-kind state.
+  const groupState = (test) => {
+    const inGroup = boxes.filter((b) => test(b.dataset.kind));
+    return inGroup.length > 0 && inGroup.every((b) => b.checked);
+  };
+  els.edgesStructural.checked = groupState((k) => STRUCTURAL.has(k));
+  els.edgesOperational.checked = groupState((k) => OPERATIONAL.has(k));
+  if (on.length === 0) viewState.filters.edgeKinds = new Set([' none']);
+}
+
+function syncNodeKindFilter() {
+  const boxes = [...els.nodeKinds.querySelectorAll('input[type=checkbox]')];
+  const on = boxes.filter((b) => b.checked).map((b) => b.dataset.kind);
+  viewState.filters.nodeKinds = on.length === boxes.length ? null : new Set(on);
+  if (on.length === 0) viewState.filters.nodeKinds = new Set([' none']);
+}
+
+function syncModuleFilter() {
+  const boxes = [...els.moduleList.querySelectorAll('input[type=checkbox]')];
+  const on = boxes.filter((b) => b.checked).map((b) => b.dataset.module);
+  viewState.filters.modules = on.length === boxes.length ? null : new Set(on);
+  if (on.length === 0) viewState.filters.modules = new Set([' none']);
+}
+
+function setGroup(test, checked) {
+  for (const b of els.edgeKinds.querySelectorAll('input[type=checkbox]')) {
+    if (test(b.dataset.kind)) b.checked = checked;
+  }
+  syncEdgeFilter();
+  rerender();
+}
+
+function checkbox(id, label, checked, onChange, data = {}) {
+  const wrap = document.createElement('label');
+  wrap.className = 'chk';
+  wrap.htmlFor = id;
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.id = id;
+  box.checked = checked;
+  for (const [k, v] of Object.entries(data)) box.setAttribute(k, v);
+  box.addEventListener('change', onChange);
+  wrap.appendChild(box);
+  wrap.appendChild(document.createTextNode(' ' + label));
+  return wrap;
 }
 
 function renderFindings(findings) {
@@ -216,28 +398,44 @@ function renderStats(graph) {
     `${graph.nodes.length} nodes · ${graph.edges.length} edges`;
 }
 
-function buildLegend() {
-  const items = [
-    ['node', NODE_STYLE.template.fill, 'template'],
-    ['node', NODE_STYLE.party.fill, 'party field'],
-    ['node', NODE_STYLE.choice.fill, 'choice'],
-    ['node', NODE_STYLE.interface.fill, 'interface'],
-    ['node', NODE_STYLE.key.fill, 'contract key'],
-    ['edge', EDGE_STYLE.signatory.color, 'signatory'],
-    ['edge', EDGE_STYLE.observer.color, 'observer'],
-    ['edge', EDGE_STYLE.controller.color, 'controller'],
-    ['edge', EDGE_STYLE.create.color, 'create'],
-    ['edge', EDGE_STYLE.exercise.color, 'exercise'],
-    ['edge', EDGE_STYLE.archive.color, 'archive'],
-    ['edge', EDGE_STYLE.implements.color, 'implements'],
-    ['edge', EDGE_STYLE.maintainer.color, 'maintainer'],
-  ];
+/**
+ * The legend describes the graph that is ON SCREEN, not the schema.
+ * Edge kinds that were filtered out, or that this graph never had, are absent;
+ * listing them would imply the reader should be able to find them.
+ */
+function renderLegend(legend) {
   els.legend.innerHTML = '';
-  for (const [type, color, label] of items) {
+  const add = (type, color, label, title) => {
     const span = document.createElement('span');
     span.className = 'legend-item';
-    span.innerHTML =
-      `<span class="legend-swatch legend-${type}" style="background:${type === 'node' ? color : 'transparent'};border-color:${color}"></span>${label}`;
+    span.title = title || label;
+    const sw = document.createElement('span');
+    sw.className = `legend-swatch legend-${type}`;
+    sw.style.borderColor = color;
+    if (type === 'node') sw.style.background = color;
+    span.appendChild(sw);
+    span.appendChild(document.createTextNode(label));
+    els.legend.appendChild(span);
+  };
+  for (const k of legend.nodeKinds) {
+    add('node', (NODE_STYLE[k] || NODE_STYLE.template).fill, k);
+  }
+  let group = null;
+  for (const e of legend.edgeKinds) {
+    if (e.group !== group) {
+      group = e.group;
+      const sep = document.createElement('span');
+      sep.className = 'legend-group';
+      sep.textContent = group;
+      els.legend.appendChild(sep);
+    }
+    add('edge', (EDGE_STYLE[e.kind] || EDGE_STYLE.declares).color, `${e.kind} (${e.count})`,
+      `${e.count} underlying edge(s) in ${e.groups} drawn edge(s)`);
+  }
+  if (legend.edgeKinds.length === 0) {
+    const span = document.createElement('span');
+    span.className = 'legend-item';
+    span.textContent = 'no edges shown';
     els.legend.appendChild(span);
   }
 }
@@ -285,7 +483,103 @@ function initExamples() {
   });
 }
 
+// Validate + render a normalized graph JSON (e.g. from the Daml-LF backend).
+function loadGraphJson(text, fileName) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    renderDiagnostics([{ severity: 'error', message: `Not valid JSON: ${e.message}` }]);
+    return;
+  }
+  const graph = data && data.nodes && data.edges ? data : null;
+  if (!graph || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) {
+    renderDiagnostics([
+      { severity: 'error', message: 'JSON does not look like a normalized graph (missing `nodes` / `edges` arrays).' },
+    ]);
+    return;
+  }
+  graph.meta = graph.meta || {};
+  // `--analyze` output nests the graph under top-level keys plus `analysis`.
+  const embedded = data.analysis && Array.isArray(data.analysis.all) ? data.analysis.all : null;
+  showGraph(graph, {
+    diagnostics: [
+      {
+        severity: 'info',
+        message: `Loaded ${fileName || 'graph JSON'} (source: ${graph.meta.source || 'unknown'}) - visualization only, no Daml was parsed.`,
+      },
+    ],
+    findings: embedded,
+  });
+}
+
+// ------------------------------------------------------------------ events
+
 els.analyze.addEventListener('click', run);
+
+els.layoutMode.addEventListener('change', () => {
+  viewState.layout = els.layoutMode.value;
+  rerender();
+});
+els.collapseAll.addEventListener('click', () => {
+  viewState.expanded = new Set();
+  rerender();
+});
+els.expandAll.addEventListener('click', () => {
+  if (!currentGraph) return;
+  viewState.expanded = new Set(
+    currentGraph.nodes.filter((n) => n.kind === 'template' || n.kind === 'interface').map((n) => n.id)
+  );
+  rerender();
+});
+els.focusHops.addEventListener('change', () => {
+  viewState.focus.hops = Number(els.focusHops.value);
+  rerender();
+});
+els.focusDirection.addEventListener('change', () => {
+  viewState.focus.direction = els.focusDirection.value;
+  rerender();
+});
+els.focusMode.addEventListener('change', () => {
+  viewState.focus.mode = els.focusMode.value;
+  rerender();
+});
+els.focusClear.addEventListener('click', () => {
+  viewState.focus.seeds = [];
+  syncFocusLabel();
+  rerender();
+});
+els.edgesStructural.addEventListener('change', () =>
+  setGroup((k) => STRUCTURAL.has(k), els.edgesStructural.checked));
+els.edgesOperational.addEventListener('change', () =>
+  setGroup((k) => OPERATIONAL.has(k), els.edgesOperational.checked));
+els.modulePrefix.addEventListener('input', () => {
+  viewState.filters.modulePrefix = els.modulePrefix.value.trim();
+  rerender();
+});
+els.modulesAll.addEventListener('click', () => {
+  for (const b of els.moduleList.querySelectorAll('input')) b.checked = true;
+  syncModuleFilter();
+  rerender();
+});
+els.modulesNone.addEventListener('click', () => {
+  for (const b of els.moduleList.querySelectorAll('input')) b.checked = false;
+  syncModuleFilter();
+  rerender();
+});
+els.hideIsolated.addEventListener('change', () => {
+  viewState.filters.hideIsolated = els.hideIsolated.checked;
+  rerender();
+});
+
+// Re-layout on resize: the layout is a pure function of the graph AND the
+// viewport, so a resize genuinely changes the answer.
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  if (resizeTimer) clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(rerender, 160);
+});
+
 els.loadDaml.addEventListener('click', () => els.damlFile.click());
 els.damlFile.addEventListener('change', async (e) => {
   const picked = [...(e.target.files || [])];
@@ -322,7 +616,8 @@ els.jsonFile.addEventListener('change', (e) => {
   reader.readAsText(file);
   els.jsonFile.value = ''; // allow re-loading the same file
 });
-buildLegend();
+
 initExamples();
+syncFocusLabel();
 els.source.value = EXAMPLES.Asset;
 run();

@@ -71,12 +71,29 @@ export function buildGraph(parsed, options = {}) {
       nodes.set(node.id, node);
       return node;
     }
-    // A later, better-informed sighting upgrades an earlier placeholder: an
-    // `external: true` template stub becomes internal once its declaration is
-    // seen. Never downgrade internal -> external.
-    if (existing.meta && node.meta && existing.meta.external && node.meta.external === false) {
-      nodes.set(node.id, { ...existing, ...node, meta: { ...existing.meta, ...node.meta } });
+    // A later, better-informed sighting upgrades an earlier placeholder.
+    //
+    // The rule is "more information wins", not "external becomes internal".
+    // Keying only on the external flag lost real data: an operation edge that
+    // mentions a template BEFORE its declaration is reached creates a stub
+    // which `isInternal` already classifies correctly as `external: false`,
+    // so the flag never changed and the upgrade was skipped. The declaration's
+    // `module` and `meta.fields` were then dropped. On a 27 package Canton
+    // repository that hit 23 of 28 templates, which emptied `partyFields` in
+    // the analysis layer and left the renderer unable to group by module.
+    //
+    // Merge field by field instead, never letting an absent value overwrite a
+    // present one. The one genuinely directional rule is the original: an
+    // internal declaration must never be downgraded back to external.
+    const mergedMeta = { ...existing.meta, ...node.meta };
+    if (existing.meta && existing.meta.external === false) mergedMeta.external = false;
+    const merged = { ...existing };
+    for (const [k, v] of Object.entries(node)) {
+      if (k === 'meta') continue;
+      if (v !== undefined && v !== null) merged[k] = v;
     }
+    merged.meta = mergedMeta;
+    nodes.set(node.id, merged);
     return nodes.get(node.id);
   };
   const addEdge = (src, tgt, kind, label, meta) => {
