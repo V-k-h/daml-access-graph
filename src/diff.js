@@ -51,6 +51,33 @@ const EDGE_DIRECTION = {
 
 const edgeKey = (e) => `${e.source}|${e.kind}|${e.target}`;
 
+/**
+ * The template or interface a node belongs to, or the node itself when it is
+ * one. Party, choice and key nodes all carry `owner`.
+ *
+ * Used to decide whether an added or removed edge describes a whole
+ * DECLARATION appearing or disappearing, rather than a change to one that
+ * exists on both sides. It must be the CONTAINER and not the node: a new
+ * choice node on an existing template is a genuine widening (a new way to act
+ * on contracts that already exist), while a new choice node on a brand-new
+ * template is just that template's internal structure.
+ */
+function containerOf(node) {
+  if (!node) return null;
+  if (node.kind === 'template' || node.kind === 'interface') return node.label;
+  return node.owner || node.template || null;
+}
+
+/** Did this node's declaring container exist on the other side of the diff? */
+function containerPresent(node, otherNodes) {
+  const c = containerOf(node);
+  if (!c) return true;
+  for (const n of otherNodes.values()) {
+    if ((n.kind === 'template' || n.kind === 'interface') && n.label === c) return true;
+  }
+  return false;
+}
+
 const flip = (direction) =>
   direction === 'widening' ? 'narrowing' : direction === 'narrowing' ? 'widening' : 'neutral';
 
@@ -112,26 +139,51 @@ export function diffGraphs(before, after) {
 
   for (const [key, e] of afterEdges) {
     if (beforeEdges.has(key)) continue;
+
+    // Symmetric counterpart of the deletion rule below: an edge belonging to a
+    // DECLARATION that did not exist before describes that declaration's own
+    // structure, not a change to the access of anything that already existed.
+    //
+    // Keyed on the container, not the node: a new choice on an EXISTING
+    // template is a genuine widening (a new way to act on contracts that are
+    // already out there), and an earlier version of this rule that tested the
+    // node lost that case. Symmetry with the removal rule below is what keeps
+    // the antisymmetry law in tests/property.test.js true.
+    const sourceIsNew = !containerPresent(afterNodes.get(e.source), beforeNodes);
     changes.push({
       scope: 'edge',
       op: 'added',
-      direction: directionFor(e.kind, 'added'),
+      direction: sourceIsNew ? 'neutral' : directionFor(e.kind, 'added'),
       code: `edge-added-${e.kind}`,
       key,
       message:
         `${label(e.source, afterNodes)} -${e.kind}-> ${label(e.target, afterNodes)}` +
+        (sourceIsNew ? ` (with ${label(e.source, afterNodes)} itself)` : '') +
         (e.meta && e.meta.via ? ` (via ${e.meta.via.join(' -> ')})` : ''),
     });
   }
   for (const [key, e] of beforeEdges) {
     if (afterEdges.has(key)) continue;
+
+    // An edge whose SOURCE was deleted is not an access change.
+    //
+    // Removing a signatory widens (one fewer party must authorize), so a
+    // deleted template's signatory edges each read as widening and a pure
+    // deletion failed the gate. There is no access to widen: the contract
+    // that party could have authorized no longer exists. A gate that fires on
+    // deleting dead code is a gate people switch off, so the disappearance of
+    // the endpoint is reported as neutral, alongside the neutral
+    // `node-removed-*` change that already records it.
+    const sourceGone = !containerPresent(beforeNodes.get(e.source), afterNodes);
     changes.push({
       scope: 'edge',
       op: 'removed',
-      direction: directionFor(e.kind, 'removed'),
+      direction: sourceGone ? 'neutral' : directionFor(e.kind, 'removed'),
       code: `edge-removed-${e.kind}`,
       key,
-      message: `${label(e.source, beforeNodes)} -${e.kind}-> ${label(e.target, beforeNodes)} is gone`,
+      message:
+        `${label(e.source, beforeNodes)} -${e.kind}-> ${label(e.target, beforeNodes)} is gone` +
+        (sourceGone ? ` (with ${label(e.source, beforeNodes)} itself)` : ''),
     });
   }
 

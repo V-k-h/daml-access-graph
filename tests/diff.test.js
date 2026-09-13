@@ -114,6 +114,69 @@ template Token with issuer : Party, owner : Party where
   assert.equal(removed[0].direction, 'widening');
 });
 
+test('diff: deleting a template is neutral, not widening', () => {
+  // A false-alarm shape that used to fail the gate. README says "removing a
+  // signatory widens, for the same reason in reverse", and the differ applied
+  // that literally, so deleting a template outright - which removes its
+  // signatory edges along with everything else - read as widening even though
+  // nothing gained reach: the template is gone and has no contracts left to
+  // authorize. A gate that fires on deleting dead code is a gate people switch
+  // off.
+  //
+  // The rule is now that an edge whose SOURCE node also disappeared is
+  // neutral, with the neutral node-removed change carrying the report. The
+  // ADDED side is treated symmetrically (an edge whose source is itself new is
+  // also neutral), because the two halves must agree for the antisymmetry law
+  // in tests/property.test.js to hold - diffing in the opposite direction has
+  // to flip every direction, and a one-sided rule breaks it.
+  const before = graphOf(`module A where
+template Token with issuer : Party, owner : Party where
+  signatory issuer
+  observer owner
+template Other with p : Party where
+  signatory p
+`);
+  const after = graphOf(`module A where
+template Other with p : Party where
+  signatory p
+`);
+  const { changes, summary } = diffGraphs(before, after);
+  const sig = changes.find((c) => c.code === 'edge-removed-signatory');
+  assert.ok(sig, 'the deleted template took its signatory edge with it');
+  assert.equal(sig.direction, 'neutral', 'the source is gone, so no access widened');
+  assert.match(sig.message, /with Token itself/);
+  assert.ok(
+    changes.some((c) => c.code === 'node-removed-template' && c.direction === 'neutral'),
+    'the deletion itself is reported, and is neutral'
+  );
+  assert.equal(summary.byDirection.widening, 0, 'a pure deletion must not fail the gate');
+
+  // The mirror: adding that template back is also neutral, which is what keeps
+  // the diff antisymmetric.
+  const back = diffGraphs(after, before);
+  assert.equal(back.summary.byDirection.widening, 0);
+  assert.equal(back.summary.byDirection.narrowing, 0);
+});
+
+test('diff: removing a signatory from a SURVIVING template still widens', () => {
+  // The rule above must not swallow the real case: when the template lives on,
+  // dropping one of its signatories genuinely means fewer parties must
+  // authorize, and that is the thing the gate exists to catch.
+  const before = graphOf(`module A where
+template Token with issuer : Party, owner : Party where
+  signatory issuer, owner
+`);
+  const after = graphOf(`module A where
+template Token with issuer : Party, owner : Party where
+  signatory issuer
+`);
+  const removed = diffGraphs(before, after).changes.filter(
+    (c) => c.code === 'edge-removed-signatory'
+  );
+  assert.equal(removed.length, 1);
+  assert.equal(removed[0].direction, 'widening');
+});
+
 test('diff: a choice becoming consuming widens', () => {
   const after = graphOf(BASE.replace('nonconsuming choice Peek', 'choice Peek'));
   const change = diffGraphs(graphOf(BASE), after).changes.find(
@@ -412,4 +475,48 @@ test('verdict baseline: an unsupported version is rejected, not half-read', asyn
   const { createVerdictBaseline, compareVerdicts } = await import('../src/verdict-baseline.js');
   const b = { ...createVerdictBaseline([{ package: 'p', results: [] }]), version: 99 };
   assert.throws(() => compareVerdicts(b, []), /Unsupported verdict baseline version/);
+});
+
+test('verdict baseline: two DARs of the same package do not erase each other', async () => {
+  // REGRESSION TEST for a bug the round-trip property in tests/property.test.js
+  // found: createVerdictBaseline wrote `packages[name] = entries` per report,
+  // so when two DARs carried the same package name (two versions of one
+  // package in the scanned directory) the later one ERASED the earlier one's
+  // obligations. Comparing the very same, unchanged input against that
+  // baseline then reported the erased obligations as proof-disappeared
+  // regressions - a red gate on a tree nobody had touched, which
+  // --update-baseline could not clear because the refresh reproduced the
+  // collapse. Same-named reports are now merged on both sides.
+  const { createVerdictBaseline, compareVerdicts } = await import('../src/verdict-baseline.js');
+  const v1 = {
+    dar: 'tokens-1.0.dar',
+    package: 'tokens',
+    results: [{ property: 'p', transition: 'T.A', status: 'PROVED' }],
+  };
+  const v2 = {
+    dar: 'tokens-2.0.dar',
+    package: 'tokens',
+    results: [{ property: 'p', transition: 'T.B', status: 'PROVED' }],
+  };
+
+  const baseline = createVerdictBaseline([v1, v2]);
+  assert.deepEqual(
+    Object.keys(baseline.packages.tokens).sort(),
+    ['p::T.A', 'p::T.B'],
+    'both DARs contribute their obligations'
+  );
+
+  const cmp = compareVerdicts(baseline, [v1, v2]);
+  assert.equal(cmp.ok, true, 'an unchanged input must not be a regression');
+  assert.deepEqual(cmp.regressions, []);
+  assert.deepEqual(cmp.improvements, []);
+  assert.equal(cmp.unchanged, 2);
+
+  // and a proof lost in EITHER of them is still caught
+  const broken = compareVerdicts(baseline, [
+    v1,
+    { ...v2, results: [{ property: 'p', transition: 'T.B', status: 'DISPROVED' }] },
+  ]);
+  assert.equal(broken.ok, false);
+  assert.equal(broken.regressions[0].kind, 'proof-lost');
 });

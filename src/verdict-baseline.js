@@ -44,6 +44,40 @@ const isProving = (status) => PROVING.has(statusFamily(status));
 export const verdictKey = (r) => `${r.property}::${r.transition}`;
 
 /**
+ * Group a report list by the name the baseline is keyed on.
+ *
+ * WHY THIS IS NOT JUST `for (const report of reports)`: the API is plural
+ * because there is one report per DAR, and two DARs can carry the SAME package
+ * name - two versions of one package built into a directory the CI job scans.
+ * Writing `packages[name] = entries` per report let the later DAR silently
+ * erase the earlier one's obligations from the baseline; the very next
+ * comparison of the SAME UNCHANGED input then reported the erased obligations
+ * as `proof-disappeared` regressions. The gate went red on a tree nobody had
+ * touched, and `--update-baseline` could not clear it, because the refresh
+ * reproduced the same collapse. Found by the round-trip property in
+ * tests/property.test.js, which generates colliding package names.
+ *
+ * Same-named reports are therefore MERGED, here and in compareVerdicts, so
+ * both sides agree on what one package's obligation set is. A key present in
+ * two of them keeps the last verdict seen, which is what the overwriting
+ * version did for the keys it did not lose.
+ *
+ * @param {Array<{dar?: string, package?: string, results?: Array<Object>}>} reports
+ * @returns {Map<string, Array<Object>>} package name -> its verdicts, deduped by obligation
+ */
+function groupByPackage(reports) {
+  /** @type {Map<string, Map<string, Object>>} */
+  const byName = new Map();
+  for (const report of reports || []) {
+    const name = report.package || report.dar;
+    if (!byName.has(name)) byName.set(name, new Map());
+    const into = byName.get(name);
+    for (const r of report.results || []) into.set(verdictKey(r), r);
+  }
+  return new Map([...byName].map(([name, verdicts]) => [name, [...verdicts.values()]]));
+}
+
+/**
  * Build a baseline from a verify.js JSON report (or several, keyed by DAR).
  *
  * Only the fields the gate compares are stored. Counterexamples and notes are
@@ -54,12 +88,9 @@ export const verdictKey = (r) => `${r.property}::${r.transition}`;
  */
 export function createVerdictBaseline(reports, meta = {}) {
   const packages = {};
-  for (const report of reports) {
-    const name = report.package || report.dar;
+  for (const [name, results] of groupByPackage(reports)) {
     const entries = {};
-    for (const r of report.results || []) {
-      entries[verdictKey(r)] = statusFamily(r.status);
-    }
+    for (const r of results) entries[verdictKey(r)] = statusFamily(r.status);
     packages[name] = entries;
   }
   return {
@@ -89,20 +120,19 @@ export function compareVerdicts(baseline, reports) {
   const improvements = [];
   let unchanged = 0;
 
-  for (const report of reports) {
-    const name = report.package || report.dar;
+  for (const [name, results] of groupByPackage(reports)) {
     const was = (baseline.packages || {})[name];
     if (!was) {
       improvements.push({
         package: name,
         kind: 'new-package',
-        detail: `${(report.results || []).length} verdict(s) not in the baseline`,
+        detail: `${results.length} verdict(s) not in the baseline`,
       });
       continue;
     }
 
     const seen = new Set();
-    for (const r of report.results || []) {
+    for (const r of results) {
       const key = verdictKey(r);
       seen.add(key);
       const before = was[key];
