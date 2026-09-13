@@ -197,6 +197,12 @@ export function decodeDalfRaw(bytes, getPackage = null) {
   return {
     ctx,
     modules,
+    /**
+     * "Module:Name" -> the definition's shape, with a record's fields mapped to
+     * their coarse sorts. Exposed so the verification frontend can ask what a
+     * field IS rather than inferring it from how the code uses it.
+     */
+    dataTypes: ctx.dataTypes,
     packageId,
     name: ctx.packageName,
     version: ctx.packageVersion,
@@ -304,6 +310,59 @@ function buildContext(pkg, diagnostics = []) {
       if (!ctx.values.has(vname)) ctx.values.set(vname, body);
     }
   }
+
+  // FIELD TYPES.
+  //
+  // A `DefTemplate` says what a template DOES; it does not say what shape its
+  // record has. The fields and their types live in the `DefDataType` of the
+  // same qualified name, which this decoder used to drop. That gap was not
+  // cosmetic: without it a property asking "is this field a Numeric?" has
+  // nothing to consult, and the only remaining options are to infer numeric-ness
+  // from how the compiled code happens to use the field, or to guess from its
+  // NAME. The second is not something a proof may rest on, so the types are
+  // decoded instead.
+  //
+  // Keyed "Module:Name", which is how a TypeConId addresses a definition, and
+  // built for EVERY package the archive decodes - so a field whose type comes
+  // from a dependency resolves through that dependency's own table rather than
+  // being written off.
+  ctx.dataTypes = new Map();
+  for (const mod of modules) {
+    const moduleName = ctx.dname(int(mod, S.Module.nameInternedDname));
+    for (const dt of subs(mod, S.Module.dataTypes)) {
+      const dname = ctx.dname(int(dt, S.DefDataType.nameInternedDname));
+      const entry = { module: moduleName, name: dname, kind: 'other', fields: null };
+      if (has(dt, S.DefDataType.record)) {
+        entry.kind = 'record';
+        entry.fields = new Map();
+        // A record with no fields encodes as a zero-length `Fields`, so the
+        // presence test above is what decides the kind, not the field count.
+        for (const f of subs(sub(dt, S.DefDataType.record), S.DataTypeFields.fields)) {
+          const fname = ctx.str(int(f, S.FieldWithType.fieldInternedStr));
+          entry.fields.set(fname, classifyType(sub(f, S.FieldWithType.type), ctx));
+        }
+      } else if (has(dt, S.DefDataType.variant)) entry.kind = 'variant';
+      else if (has(dt, S.DefDataType.enum)) entry.kind = 'enum';
+      else if (has(dt, S.DefDataType.interface)) entry.kind = 'interface';
+      ctx.dataTypes.set(`${moduleName}:${dname}`, entry);
+    }
+  }
+
+  /**
+   * The coarse sort of `start.segments`, or null when the path cannot be
+   * followed. Null means NOTHING IS KNOWN and is never a guess: see
+   * resolveFieldSort.
+   */
+  ctx.fieldSort = (start, segments) => resolveFieldSort(ctx, start, segments);
+  /** The record a Type denotes, as a {pkg, module, name} start for fieldSort. */
+  ctx.recordTypeRef = (type) => recordTypeRef(type, ctx);
+  /** The same, for the bare TypeConId a `create` names its target with. */
+  ctx.recordRefOfTycon = (tycon) => recordRefOfTycon(tycon, ctx);
+  /** The same, addressed by qualified name in THIS package. */
+  ctx.recordRef = (module, name) => {
+    const e = ctx.dataTypes.get(`${module}:${name}`);
+    return e && e.kind === 'record' ? { pkg: ctx, module, name } : null;
+  };
 
   // Bound form, so consumers outside this module (the verification frontend)
   // can follow a ValueId without reaching for internals.
@@ -944,6 +1003,173 @@ function typeConName(tycon, ctx) {
     }
   }
   return { name, module, external, packageRef };
+}
+
+// ---------------------------------------------------------------------------
+// Field types
+// ---------------------------------------------------------------------------
+
+/**
+ * BuiltinType -> the COARSE sort a property reasons about.
+ *
+ * Coarse on purpose. Nothing downstream needs to know that a field is
+ * `Numeric 10` rather than `Int64`; what it needs to know is whether `>= 0` is
+ * a question about that field at all. So the classification answers exactly
+ * that much, and everything it does not recognise stays `unknown` - which
+ * behaves as "no information", never as "not numeric".
+ *
+ * BIGNUMERIC is deliberately absent. It is a number, but it is also a type the
+ * translator does not arithmetically model, and admitting it here would create
+ * obligations over terms the fragment cannot carry. `unknown` leaves such a
+ * field exactly where it was before this table existed: judged on positional
+ * evidence alone.
+ */
+const BT = S.ENUMS.BuiltinType;
+const BUILTIN_SORT = new Map([
+  [BT.NUMERIC, 'numeric'],
+  [BT.INT64, 'numeric'],
+  [BT.BOOL, 'bool'],
+  [BT.TEXT, 'text'],
+  [BT.PARTY, 'party'],
+  [BT.DATE, 'time'],
+  [BT.TIMESTAMP, 'time'],
+  [BT.CONTRACT_ID, 'cid'],
+]);
+
+/**
+ * Classify a Type into `{sort, ref?}`.
+ *
+ * The three shapes that actually occur in a compiled field type:
+ *
+ *   * INTERNED. `Type.interned_type` is an index into `Package.interned_types`;
+ *     most field types in a real package arrive this way, so not following the
+ *     indirection would classify nearly everything as unknown.
+ *   * APPLIED. `Numeric 10` is the NUMERIC builtin applied to its scale, and an
+ *     `Optional Int64` is the OPTIONAL builtin applied to its element. LF
+ *     writes an application either as `Type.Builtin` carrying `args`, or as a
+ *     `Type.TApp` spine; in both the HEAD decides the sort, so the spine is
+ *     walked to its head and the arguments are ignored. That is what keeps
+ *     `Numeric 10` numeric and - just as importantly - keeps `Optional Numeric`
+ *     UNKNOWN rather than numeric, because the IR models an Optional field as a
+ *     `$some`/`$value` pair and the plain field path denotes neither.
+ *   * NOMINAL. A `Type.Con` names a declared data type. It is returned as
+ *     `record` together with the TypeConId it names, which is what lets a
+ *     nested path (`this.terms.rate`) be followed one hop further. `record`
+ *     covers variants and enums too; all three are non-numeric, and the descent
+ *     step checks the definition's kind before it tries to enter one.
+ *
+ * Everything else - a type variable, a synonym, a forall, a struct, a nat - is
+ * `unknown`. A type PARAMETER especially: its instantiation is not visible here,
+ * and answering anything but "unknown" would be inventing a fact.
+ *
+ * @returns {{sort: string, ref?: object}}
+ */
+function classifyType(type, ctx, depth = 0) {
+  if (!type || depth > 12) return { sort: 'unknown' };
+
+  if (has(type, S.Type.internedType)) {
+    const idx = int(type, S.Type.internedType);
+    const target = ctx.internedTypes[idx];
+    if (!target) return { sort: 'unknown' };
+    return classifyType(target, ctx, depth + 1);
+  }
+
+  const builtin = sub(type, S.Type.builtin);
+  if (builtin) {
+    return { sort: BUILTIN_SORT.get(int(builtin, S.TypeBuiltin.builtin)) || 'unknown' };
+  }
+
+  const con = sub(type, S.Type.con);
+  if (con) {
+    const ref = typeConName(sub(con, S.TypeCon.tycon), ctx);
+    return ref ? { sort: 'record', ref } : { sort: 'unknown' };
+  }
+
+  const tapp = sub(type, S.Type.tapp);
+  if (tapp) return classifyType(sub(tapp, S.TypeApp.lhs), ctx, depth + 1);
+
+  return { sort: 'unknown' };
+}
+
+/**
+ * Follow a projection PATH from a record type through nested record fields.
+ *
+ * Returns the coarse sort of the field the path ends at, or NULL when the path
+ * cannot be followed to the end. Null is the whole point of the function: it
+ * is returned for a field of a type declared in a package the archive does not
+ * contain, for a step through something that is not a record, and for a field
+ * name the record does not declare (which is what `this.maybeRate.$value`, the
+ * IR's Optional encoding, looks like from here). In every one of those cases
+ * the caller records nothing, so an unfollowable path costs coverage and never
+ * produces a wrong sort.
+ *
+ * @param {Object} ctx     the interning context `start` is expressed against
+ * @param {{module: string, name: string}} start  the record to begin at
+ * @param {string[]} segments  field names, outermost first
+ */
+export function resolveFieldSort(ctx, start, segments) {
+  if (!ctx || !start || !start.module || !start.name || !segments.length) return null;
+  let cur = ctx;
+  let ref = { module: start.module, name: start.name };
+
+  for (let i = 0; i < segments.length; i++) {
+    const entry = cur.dataTypes && cur.dataTypes.get(`${ref.module}:${ref.name}`);
+    if (!entry || entry.kind !== 'record' || !entry.fields) return null;
+    const field = entry.fields.get(segments[i]);
+    if (!field) return null;
+    if (i === segments.length - 1) return field.sort === 'unknown' ? null : field.sort;
+    // Not the last segment: the only thing we can step THROUGH is a record.
+    if (field.sort !== 'record' || !field.ref || !field.ref.module) return null;
+    if (field.ref.external) {
+      // The nested record is declared in a dependency; its field types live in
+      // that package's own table, against its own interning context.
+      const next = cur.getImportedPackage ? cur.getImportedPackage(field.ref.packageRef) : null;
+      if (!next) return null;
+      cur = next;
+    }
+    ref = { module: field.ref.module, name: field.ref.name };
+  }
+  return null;
+}
+
+/**
+ * The record a Type denotes, as the `{pkg, module, name}` a field walk starts
+ * from - or null when the type is not a record this archive can read.
+ *
+ * Used to root a symbol's projection path: at the template's own record for
+ * `this`, and at the choice argument's record for `arg`.
+ */
+function recordTypeRef(type, ctx) {
+  const cls = classifyType(type, ctx);
+  if (!cls || cls.sort !== 'record') return null;
+  return resolveConRef(cls.ref, ctx);
+}
+
+/**
+ * The record a TypeConId names, as a `{pkg, module, name}` - or null.
+ *
+ * Separate from recordTypeRef because a `create` addresses its target with a
+ * bare TypeConId rather than with a Type, and the created record's own field
+ * types are what say whether the field a create ASSIGNS is a number. That is a
+ * different question from what the assigned VALUE is, and it is the one the
+ * non-negativity property is actually about: a value the translation could not
+ * read still lands in a field whose declared type is known.
+ */
+function recordRefOfTycon(tycon, ctx) {
+  return resolveConRef(typeConName(tycon, ctx), ctx);
+}
+
+/** Shared tail of the two above: hop to the declaring package, check the kind. */
+function resolveConRef(ref, ctx) {
+  if (!ref || !ref.module) return null;
+  let target = ctx;
+  if (ref.external) {
+    target = ctx.getImportedPackage ? ctx.getImportedPackage(ref.packageRef) : null;
+    if (!target) return null;
+  }
+  const entry = target.dataTypes && target.dataTypes.get(`${ref.module}:${ref.name}`);
+  if (!entry || entry.kind !== 'record') return null;
+  return { pkg: target, module: ref.module, name: ref.name };
 }
 
 /** A readable rendering of a Type, for view types and key types. */

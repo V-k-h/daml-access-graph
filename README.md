@@ -95,7 +95,9 @@ daml-access-graph/
 │   ├── baseline.js         # the committed accepted-state record for CI
 │   ├── graph.js            # structural model -> normalized graph JSON (shared)
 │   ├── analysis.js         # static analyses over the graph IR (shared)
-│   ├── renderer.js         # normalized graph -> interactive SVG (force layout)
+│   ├── view.js             # collapse, filter, focus, hidden-accounting (pure)
+│   ├── layout.js           # deterministic force and layered layouts (pure)
+│   ├── renderer.js         # normalized graph -> interactive SVG (drawing only)
 │   └── app.js              # wiring: read -> parse -> build -> analyze -> render
 ├── backend/                # Node CLIs and the compiled-package reader
 │   ├── verify.js           # CLI: prove properties of a DAR via SMT (cvc5/z3)

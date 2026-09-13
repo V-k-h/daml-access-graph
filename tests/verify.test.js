@@ -1808,6 +1808,14 @@ test('non-negative-fields: only terms with numeric EVIDENCE become obligations',
     checked: 1,
     total: 2,
     skipped: [inst.coverage.skipped[0]],
+    // No declared types on this hand-built transition, so nothing is excluded
+    // and the single skip lands in the "read it, cannot type it" class.
+    excluded: 0,
+    excludedFields: [],
+    excludedNestedRecords: 0,
+    skippedNumeric: 0,
+    skippedUnreadable: 0,
+    skippedUnknown: 1,
   });
   assert.match(inst.coverage.skipped[0], /T\.owner is not known to be numeric/);
   assert.equal(termToSmt(inst.goal), '(>= (- |this.amount| |arg.qty|) 0)');
@@ -1938,6 +1946,550 @@ test('non-negative-fields: an inherited field is disclosed, not counted as check
     inst.notes.some((n) => /inherit every field they do not name/.test(n)),
     `expected an inheritance disclosure, got ${JSON.stringify(inst.notes)}`
   );
+});
+
+// ------------------------------- field types threaded from the package to the IR
+
+/**
+ * A package whose records carry real types, so the projection paths a choice
+ * builds can be walked back to a declared sort:
+ *
+ *   data TokenData = TokenData with rate : Numeric 10; name : Text
+ *   data SetArg    = SetArg    with newAmount : Numeric 10; memo : Text
+ *   template Token with owner : Party; amount : Numeric 10; fee : Numeric 10;
+ *                       info : TokenData
+ *     choice Set : SetArg
+ *       do create Token with owner = this.owner, amount = arg.newAmount,
+ *                            fee = this.info.rate, info = this.info
+ */
+function buildTypedTemplateDalf() {
+  const strings = [
+    'Mod', 'Token', 'TokenData', 'SetArg', 'Set', 'this', 'arg',
+    'owner', 'amount', 'fee', 'info', 'rate', 'name', 'newAmount', 'memo',
+    'pkg', '1.0.0',
+  ];
+  const SI = Object.fromEntries(strings.map((x, i) => [x, i]));
+  const dnameOrder = ['Mod', 'Token', 'TokenData', 'SetArg'];
+  const DN = Object.fromEntries(dnameOrder.map((n, i) => [n, i]));
+  const dnameMsgs = dnameOrder.map((n) =>
+    bf(S.Package.internedDottedNames, bf(S.InternedDottedName.segmentsInternedStr, varint(SI[n])))
+  );
+
+  const BT = S.ENUMS.BuiltinType;
+  const builtinType = (code) => bf(S.Type.builtin, vf(S.TypeBuiltin.builtin, code));
+  // `Numeric 10` as the applied shape a compiler actually emits.
+  const numericType = bf(
+    S.Type.tapp,
+    msg(bf(S.TypeApp.lhs, builtinType(BT.NUMERIC)), bf(S.TypeApp.rhs, vf(S.Type.nat, 10)))
+  );
+  const selfModule = msg(
+    bf(S.ModuleId.packageId, bf(S.SelfOrImportedPackageId.selfPackageId, Buffer.alloc(0))),
+    vf(S.ModuleId.moduleNameInternedDname, DN.Mod)
+  );
+  const tyconOf = (dn) =>
+    msg(bf(S.TypeConId.module, selfModule), vf(S.TypeConId.nameInternedDname, dn));
+  const conType = (dn) => bf(S.Type.con, bf(S.TypeCon.tycon, tyconOf(dn)));
+
+  const field = (nameSi, typeBuf) =>
+    bf(
+      S.DataTypeFields.fields,
+      msg(bf(S.FieldWithType.type, typeBuf), vf(S.FieldWithType.fieldInternedStr, nameSi))
+    );
+  const record = (dn, ...fields) =>
+    bf(
+      S.Module.dataTypes,
+      msg(vf(S.DefDataType.nameInternedDname, dn), bf(S.DefDataType.record, msg(...fields)))
+    );
+
+  const proj = (recordExpr, fieldSi) =>
+    msg(
+      bf(
+        S.Expr.recProj,
+        msg(vf(S.RecProj.fieldInternedStr, fieldSi), bf(S.RecProj.record, recordExpr))
+      )
+    );
+  const RECCON = S.message('Expr.RecCon');
+  const FWE = S.message('FieldWithExpr');
+  const recField = (nameSi, expr) =>
+    bf(RECCON.fields, msg(bf(FWE.expr, expr), vf(FWE.fieldInternedStr, nameSi)));
+  const thisVar = msg(vf(S.Expr.varInternedStr, SI.this));
+  const argVar = msg(vf(S.Expr.varInternedStr, SI.arg));
+
+  const createExpr = bf(
+    S.Expr.update,
+    bf(
+      S.Update.create,
+      msg(
+        bf(S.message('Update.Create').template, tyconOf(DN.Token)),
+        bf(
+          S.message('Update.Create').expr,
+          msg(
+            bf(
+              S.Expr.recCon,
+              msg(
+                bf(RECCON.tycon, tyconOf(DN.Token)),
+                recField(SI.owner, proj(thisVar, SI.owner)),
+                recField(SI.amount, proj(argVar, SI.newAmount)),
+                recField(SI.fee, proj(proj(thisVar, SI.info), SI.rate)),
+                recField(SI.info, proj(thisVar, SI.info))
+              )
+            )
+          )
+        )
+      )
+    )
+  );
+
+  const choice = msg(
+    vf(S.TemplateChoice.nameInternedStr, SI.Set),
+    vf(S.TemplateChoice.consuming, 1),
+    bf(
+      S.TemplateChoice.argBinder,
+      msg(bf(S.VarWithType.type, conType(DN.SetArg)), vf(S.VarWithType.varInternedStr, SI.arg))
+    ),
+    bf(S.TemplateChoice.update, createExpr)
+  );
+
+  const module = msg(
+    vf(S.Module.nameInternedDname, DN.Mod),
+    record(DN.TokenData, field(SI.rate, numericType), field(SI.name, builtinType(BT.TEXT))),
+    record(DN.SetArg, field(SI.newAmount, numericType), field(SI.memo, builtinType(BT.TEXT))),
+    record(
+      DN.Token,
+      field(SI.owner, builtinType(BT.PARTY)),
+      field(SI.amount, numericType),
+      field(SI.fee, numericType),
+      field(SI.info, conType(DN.TokenData))
+    ),
+    bf(
+      S.Module.templates,
+      msg(
+        vf(S.DefTemplate.tyconInternedDname, DN.Token),
+        vf(S.DefTemplate.paramInternedStr, SI.this),
+        bf(S.DefTemplate.choices, choice)
+      )
+    )
+  );
+
+  const pkg = msg(
+    bf(S.Package.modules, module),
+    ...strings.map((x) => sf(S.Package.internedStrings, x)),
+    ...dnameMsgs,
+    bf(
+      S.Package.metadata,
+      msg(
+        vf(S.PackageMetadata.nameInternedStr, SI.pkg),
+        vf(S.PackageMetadata.versionInternedStr, SI['1.0.0'])
+      )
+    )
+  );
+  const payload = msg(sf(S.ArchivePayload.minor, '3'), bf(S.ArchivePayload.damlLf2, pkg));
+  return msg(bf(S.Archive.payload, payload), sf(S.Archive.hash, 'typedtpl'));
+}
+
+test('field types reach the IR: symbols carry the sort the package declares', () => {
+  const [t] = extractTransitions(decodeDalfRaw(buildTypedTemplateDalf()));
+  assert.equal(`${t.template}.${t.choice}`, 'Token.Set');
+  assert.deepEqual(Object.fromEntries(t.symbolTypes), {
+    'this.owner': 'party',
+    // rooted at the choice ARGUMENT's own record, via the binder's type
+    'arg.newAmount': 'numeric',
+    // a NESTED path, walked one hop through the declared record field
+    'this.info.rate': 'numeric',
+    'this.info': 'record',
+  });
+});
+
+test('the CREATED record\'s own declared field sorts are attached to each create', () => {
+  // The value side (symbolTypes) cannot answer for a field whose assigned
+  // expression left the fragment - there is no symbol to consult. The created
+  // record's declaration can, and this is where it comes from.
+  const [t] = extractTransitions(decodeDalfRaw(buildTypedTemplateDalf()));
+  assert.deepEqual(t.creates[0].fieldSorts, {
+    owner: 'party',
+    amount: 'numeric',
+    fee: 'numeric',
+    info: 'record',
+  });
+});
+
+test('field types reach the property: the party field is excluded, the numerics checked', () => {
+  // End to end: nothing in this choice USES any field as a number, so before
+  // the declared types every one of the four assignments was "not known to be
+  // numeric" and the transition was a refusal over four unanswered questions.
+  const [t] = extractTransitions(decodeDalfRaw(buildTypedTemplateDalf()));
+  const inst = nonNegativeFields(t);
+  assert.equal(inst.applicable, true);
+  assert.deepEqual(
+    { checked: inst.coverage.checked, total: inst.coverage.total, excluded: inst.coverage.excluded },
+    { checked: 2, total: 2, excluded: 2 }
+  );
+  assert.deepEqual(inst.coverage.excludedFields.sort(), ['Token.info (record)', 'Token.owner (party)']);
+  const smt = termToSmt(inst.goal);
+  assert.match(smt, /\(>= \|arg\.newAmount\| 0\)/);
+  assert.match(smt, /\(>= \|this\.info\.rate\| 0\)/);
+  assert.doesNotMatch(smt, /owner/, 'a Party must never reach a `>= 0`');
+});
+
+test('field types are absent, not guessed, where the path cannot be walked', () => {
+  // No `dataTypes` on the context at all (a hand-built fake package): every
+  // symbol is simply untyped, and the property falls back to positional
+  // evidence exactly as it did before the types were decoded.
+  const ctx = makeCtx(fakePkg(['this', 'amount']), {
+    selfParam: 'this',
+    argParam: null,
+    label: 't',
+  });
+  const term = translateExpr(decodeMessage(exprProj(exprVar(0), 1)), ctx);
+  assert.equal(term.name, 'this.amount', 'the symbol is still registered');
+  assert.equal(ctx.symbolTypes.size, 0, 'no root type means no entry, never a default');
+
+  // ...and a root type that IS known but whose path the records cannot be
+  // walked along records nothing either: half a walk is not evidence.
+  const withRoot = makeCtx(
+    { ...fakePkg(['this', 'amount']), fieldSort: () => null },
+    { selfParam: 'this', argParam: null, label: 't', selfType: { pkg: null, module: 'M', name: 'T' } }
+  );
+  withRoot.rootTypes.set('this', { pkg: { fieldSort: () => null }, module: 'M', name: 'T' });
+  translateExpr(decodeMessage(exprProj(exprVar(0), 1)), withRoot);
+  assert.equal(withRoot.symbolTypes.size, 0);
+});
+
+// ------------------------------------ non-negativity: the DECLARED field types
+//
+// Before the package's `DefDataType` records were decoded, a Party field and a
+// Numeric field whose value the translation could not read were indistinguishable:
+// both came back "not known to be numeric" and both were counted as unchecked
+// obligations. These tests pin the three-way split that replaced that, and in
+// particular pin the two directions it must not confuse - a declared
+// non-numeric field is NOT an obligation, while a declared numeric field with
+// an unreadable value IS one and is still skipped.
+
+/** A transition whose symbols carry declared sorts, as lfir.js attaches them. */
+const typed = (symbolTypes, overrides) =>
+  transition({ symbolTypes: new Map(Object.entries(symbolTypes)), ...overrides });
+
+test('non-negative-fields: a declared NUMERIC field is an obligation without positional evidence', () => {
+  // `this.amount` is a bare projection: no arithmetic, no comparison, nothing
+  // in the transition uses it as a number. Before the types it was skipped.
+  // The package declares it Numeric, and that is the same fact the positional
+  // evidence was standing in for - so it is checked.
+  const inst = nonNegativeFields(
+    typed(
+      { 'this.amount': 'numeric' },
+      { creates: [{ template: 'T', base: null, fields: { amount: v('this.amount') }, path: [] }] }
+    )
+  );
+  assert.equal(inst.applicable, true);
+  assert.equal(inst.coverage.checked, 1);
+  assert.equal(inst.coverage.total, 1);
+  assert.equal(termToSmt(inst.goal), '(>= |this.amount| 0)');
+});
+
+test('non-negative-fields: a declared NON-numeric field is EXCLUDED, not skipped', () => {
+  // The distinction that matters: a Party field is not an obligation that went
+  // unanswered, it is not an obligation. It must not appear in the coverage
+  // denominator, or a transition assigning one party and one amount reports as
+  // half-checked when it was in fact fully checked.
+  const inst = nonNegativeFields(
+    typed(
+      {
+        'this.amount': 'numeric',
+        'arg.newOwner': 'party',
+        'this.label': 'text',
+        'this.when': 'time',
+        'this.ref': 'cid',
+        'this.flag': 'bool',
+        'this.data': 'record',
+      },
+      {
+        creates: [
+          {
+            template: 'T',
+            base: null,
+            fields: {
+              amount: v('this.amount'),
+              owner: v('arg.newOwner'),
+              label: v('this.label'),
+              when: v('this.when'),
+              ref: v('this.ref'),
+              flag: v('this.flag'),
+              data: v('this.data'),
+            },
+            path: [],
+          },
+        ],
+      }
+    )
+  );
+  assert.equal(inst.applicable, true);
+  assert.deepEqual(
+    { checked: inst.coverage.checked, total: inst.coverage.total, excluded: inst.coverage.excluded },
+    { checked: 1, total: 1, excluded: 6 },
+    'the six non-numeric fields are excluded from the denominator, not counted as skipped'
+  );
+  assert.deepEqual(inst.coverage.skipped, [], 'nothing was skipped: nothing went unanswered');
+  assert.deepEqual(inst.coverage.excludedFields.sort(), [
+    'T.data (record)',
+    'T.flag (bool)',
+    'T.label (text)',
+    'T.owner (party)',
+    'T.ref (cid)',
+    'T.when (time)',
+  ]);
+  // ...and the exclusion is DISCLOSED rather than silent.
+  assert.ok(inst.notes.some((n) => /NOT obligations of this property/.test(n)));
+  // None of the excluded symbols may appear in the goal: asserting `>= 0` of a
+  // Party is a fabricated obligation, which is the failure this guards.
+  assert.equal(termToSmt(inst.goal), '(>= |this.amount| 0)');
+});
+
+test('non-negative-fields: a declared numeric field with an unreadable value is skipped AND counted', () => {
+  // Still skipped - an unreadable value is an unanswered question and is never
+  // assumed non-negative - but counted apart from the unknowns, because here we
+  // KNOW it was a question.
+  const inst = nonNegativeFields(
+    typed(
+      { 'this.amount': 'numeric', 'this.rate': 'numeric' },
+      {
+        creates: [
+          {
+            template: 'T',
+            base: null,
+            fields: {
+              amount: v('this.amount'),
+              rate: T.ite(v('c'), v('this.rate'), T.unsupported('a fetch in the field expression', 'T')),
+            },
+            path: [],
+          },
+        ],
+      }
+    )
+  );
+  assert.equal(inst.applicable, true);
+  assert.deepEqual(
+    {
+      checked: inst.coverage.checked,
+      total: inst.coverage.total,
+      numeric: inst.coverage.skippedNumeric,
+      unreadable: inst.coverage.skippedUnreadable,
+      unknown: inst.coverage.skippedUnknown,
+      excluded: inst.coverage.excluded,
+    },
+    { checked: 1, total: 2, numeric: 1, unreadable: 0, unknown: 0, excluded: 0 }
+  );
+  assert.match(inst.coverage.skipped.join(' '), /T\.rate is declared numeric.*outside the fragment.*fetch/);
+  assert.ok(inst.notes.some((n) => /declares NUMERIC could not be checked/.test(n)));
+  assert.doesNotMatch(termToSmt(inst.goal), /this\.rate/);
+});
+
+test('non-negative-fields: an unreadable field DECLARED numeric is skipped and counted as a gap', () => {
+  // This is the case only the created record's declaration can decide: the
+  // value left the fragment, so there is no symbol carrying a sort, but the
+  // field it lands in is declared Numeric all the same. It stays SKIPPED - an
+  // unreadable value is never assumed non-negative - and it is counted apart
+  // from the unknowns, because here we know a question went unanswered.
+  const inst = nonNegativeFields(
+    transition({
+      creates: [
+        {
+          template: 'T',
+          base: null,
+          fieldSorts: { amount: 'numeric', info: 'record', memo: 'text' },
+          fields: {
+            amount: T.unsupported('a fetch in the field expression', 'T'),
+            info: T.unsupported('a fetch in the field expression', 'T'),
+            memo: T.unsupported('a fetch in the field expression', 'T'),
+            ok: T.app('+', [v('x'), T.num('1')]),
+          },
+          path: [],
+        },
+      ],
+    })
+  );
+  assert.equal(inst.applicable, true);
+  assert.deepEqual(
+    {
+      checked: inst.coverage.checked,
+      total: inst.coverage.total,
+      numeric: inst.coverage.skippedNumeric,
+      unreadable: inst.coverage.skippedUnreadable,
+      unknown: inst.coverage.skippedUnknown,
+      excluded: inst.coverage.excluded,
+      nested: inst.coverage.excludedNestedRecords,
+    },
+    // `info` and `memo` are excluded although their values are unreadable too:
+    // whether we could read a Text field's value does not make `>= 0` a
+    // question about it.
+    { checked: 1, total: 2, numeric: 1, unreadable: 0, unknown: 0, excluded: 2, nested: 1 }
+  );
+  assert.match(inst.coverage.skipped.join(' '), /T\.amount is declared numeric by the package/);
+  // ...and the one exclusion that hides something is disclosed.
+  assert.ok(
+    inst.notes.some((n) => /does not descend into them/.test(n)),
+    'a nested record assigned whole must carry the caveat that its own fields were not examined'
+  );
+});
+
+test('non-negative-fields: the created record\'s declaration is preferred over the value\'s', () => {
+  // Both are reads of the same package and agree in practice; where only one
+  // answers, that one decides. Here only the created record does.
+  const inst = nonNegativeFields(
+    typed(
+      { 'this.mystery': 'text' },
+      {
+        creates: [
+          {
+            template: 'T',
+            base: null,
+            fieldSorts: { amount: 'numeric' },
+            fields: { amount: v('this.mystery') },
+            path: [],
+          },
+        ],
+      }
+    )
+  );
+  assert.equal(inst.coverage.checked, 1, 'the field a contract is GIVEN is what the property is about');
+  assert.equal(termToSmt(inst.goal), '(>= |this.mystery| 0)');
+});
+
+test('non-negative-fields: every assigned field non-numeric is NOT-APPLICABLE, not a refusal', () => {
+  // The property does not concern this transition at all, and saying
+  // NOT-MODELLABLE would claim something was refused when nothing was asked.
+  const inst = nonNegativeFields(
+    typed(
+      { 'this.admin': 'party', 'this.label': 'text' },
+      {
+        creates: [
+          {
+            template: 'T',
+            base: null,
+            fields: { admin: v('this.admin'), label: v('this.label') },
+            path: [],
+          },
+        ],
+      }
+    )
+  );
+  assert.equal(inst.applicable, false);
+  assert.equal(inst.notModellable, undefined, 'nothing was refused here');
+  assert.match(inst.why, /declared NON-numeric type.*T\.admin \(party\).*T\.label \(text\)/);
+});
+
+test('non-negative-fields: an UNREADABLE field is still a refusal, never non-applicability', () => {
+  // The NOT-MODELLABLE / NOT-APPLICABLE line must survive the new split: a
+  // field whose value we could not read is a question we refused, and it must
+  // not be folded into the "nothing here was a number" answer.
+  const unreadable = nonNegativeFields(
+    typed(
+      {},
+      { creates: [{ template: 'T', base: null, fields: { x: T.unsupported('outside', 'T') }, path: [] }] }
+    )
+  );
+  assert.equal(unreadable.applicable, false);
+  assert.equal(unreadable.notModellable, true, 'unreadable is a REFUSAL');
+
+  // ...even mixed with a readable-but-untypable one.
+  const mixed = nonNegativeFields(
+    typed(
+      {},
+      {
+        creates: [
+          {
+            template: 'T',
+            base: null,
+            fields: { x: T.unsupported('outside', 'T'), y: v('this.mystery') },
+            path: [],
+          },
+        ],
+      }
+    )
+  );
+  assert.equal(mixed.notModellable, true);
+
+  // ...while readable-but-untypable ALONE stays non-applicable, as before.
+  const untypable = nonNegativeFields(
+    typed({}, { creates: [{ template: 'T', base: null, fields: { y: v('this.mystery') }, path: [] }] })
+  );
+  assert.equal(untypable.applicable, false);
+  assert.equal(untypable.notModellable, undefined);
+  assert.match(untypable.why, /none of the 1 resolved created field\(s\) is known to be numeric/);
+});
+
+test('non-negative-fields: disagreeing branch declarations exclude nothing and check nothing', () => {
+  // A conditional assignment whose two branches carry DIFFERENT declared sorts
+  // cannot occur in well-typed Daml, so it means the walk read something wrong.
+  // The direction that must not happen is EXCLUSION: dropping an obligation on
+  // a disagreement would lose a real check silently. So a disagreement answers
+  // nothing at all, and the field falls back to positional evidence - which
+  // here finds none, so it is reported unchecked.
+  const disagreeing = nonNegativeFields(
+    typed(
+      { 'this.a': 'party', 'this.b': 'text' },
+      {
+        creates: [
+          { template: 'T', base: null, fields: { f: T.ite(v('c'), v('this.a'), v('this.b')) }, path: [] },
+        ],
+      }
+    )
+  );
+  assert.equal(disagreeing.applicable, false);
+  assert.match(disagreeing.why, /none of the 1 resolved created field\(s\) is known to be numeric/);
+  assert.doesNotMatch(disagreeing.why, /NON-numeric/, 'a disagreement must not EXCLUDE the field');
+
+  // Branches that AGREE do decide, in both directions.
+  const agreeingNumeric = nonNegativeFields(
+    typed(
+      { 'this.a': 'numeric', 'this.b': 'numeric' },
+      {
+        creates: [
+          { template: 'T', base: null, fields: { f: T.ite(v('c'), v('this.a'), v('this.b')) }, path: [] },
+        ],
+      }
+    )
+  );
+  assert.equal(agreeingNumeric.coverage.checked, 1);
+
+  const agreeingParty = nonNegativeFields(
+    typed(
+      { 'this.a': 'party', 'this.b': 'party' },
+      {
+        creates: [
+          {
+            template: 'T',
+            base: null,
+            fields: {
+              f: T.ite(v('c'), v('this.a'), v('this.b')),
+              amount: T.app('+', [v('x'), T.num('1')]),
+            },
+            path: [],
+          },
+        ],
+      }
+    )
+  );
+  assert.equal(agreeingParty.coverage.excluded, 1);
+  assert.equal(agreeingParty.coverage.total, 1);
+});
+
+test('inferSorts: declared seeds fill only classes no position pinned', () => {
+  // The seeding is what lets a field assigned from a declared-Numeric symbol
+  // resolve to Real. It must be unable to MOVE an answer, which is what makes
+  // it safe to add without changing a single emitted query.
+  const positioned = T.app('=', [v('this.id'), T.str('x')]); // pins this.id to String
+  const seeded = inferSorts([{ term: positioned, sort: 'Bool' }], [
+    ['this.id', 'Real'],      // contradicts the position: the position wins
+    ['this.unseen', 'Real'],  // not mentioned by any term: not declared at all
+  ]);
+  assert.equal(seeded.sorts.get('this.id'), 'String', 'a position always beats a declaration');
+  assert.equal(seeded.sorts.has('this.unseen'), false, 'seeds never add variables');
+
+  // An unpinned class is where a seed pays off: without it the class defaults
+  // to Real but is NOT pinned, so it is not evidence of anything.
+  const bare = { term: v('this.amount'), sort: 'field$0' };
+  assert.equal(inferSorts([bare]).pinned.has('this.amount'), false);
+  assert.equal(inferSorts([bare], [['this.amount', 'Real']]).pinned.has('this.amount'), true);
 });
 
 test('non-negative-fields: cvc5 proves what the guards imply and refutes what they do not', { skip: !SOLVER }, () => {

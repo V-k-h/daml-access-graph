@@ -191,10 +191,19 @@ export function termToSmt(t, realNumerals = false) {
  *   sort name or any other string, which is then just a class identifier: a
  *   caller that wants a term's sort INFERRED rather than forced passes a fresh
  *   identifier per term (see nonNegativeFields).
+ * @param {Array<[string, string]>} [seeds]  DECLARED sorts, `[varName, sort]`,
+ *   read out of the compiled package's field types rather than inferred from a
+ *   position. They are applied AFTER every term has been walked and only to
+ *   variables the terms actually mention, which makes them unable to move an
+ *   answer: a class a position already pinned stays pinned (unifying two
+ *   concrete roots records a conflict and changes nothing), and a variable no
+ *   term mentions is not declared, so the emitted variable list is unchanged.
+ *   A declaration can therefore only type a class that nothing else typed -
+ *   which is exactly the gap the emitter used to fill with its Real default.
  * @returns {{sorts: Map<string,string>, conflicts: string[],
  *   ufs: Map<string, {args: string[], ret: string}>, pinned: Set<string>}}
  */
-export function inferSorts(terms) {
+export function inferSorts(terms, seeds = []) {
   // `Party` is an UNINTERPRETED sort: no literals, no arithmetic, nothing but
   // equality. Nothing else in the emitter produces a Party-sorted position, so
   // adding it here cannot move any position that used to resolve to Real.
@@ -325,6 +334,13 @@ export function inferSorts(terms) {
   };
 
   for (const { term, sort } of terms) walk(term, sort);
+
+  // Declared sorts last, so a position always wins over a declaration. See the
+  // seeds note above for why that ordering is what keeps seeding conservative.
+  for (const [name, sort] of seeds) {
+    if (!CONCRETE.has(sort) || !seenVar.has(name)) continue;
+    union(`v:${name}`, sort);
+  }
 
   const resolve = (id) => {
     const r = node(id);
@@ -822,11 +838,16 @@ const ARITHMETIC_OPS = new Set(['+', '-', '*', '/', 'div', 'mod']);
  *     code using the field as a number, which is the same fact a type would
  *     have told us, read off the code instead.
  *
- * Anything else is skipped and SAID to be skipped. The field types are not
- * available here: readDarRaw keeps the template definitions, not the
- * DefDataType records that carry the field types, so there is no type to
- * consult and the honest thing is to report the gap rather than guess from
- * the field's name.
+ * Anything else is skipped and SAID to be skipped.
+ *
+ * This is the FALLBACK path. The package's declared field types are now
+ * decoded (dalf.js) and threaded onto the transition as `symbolTypes`, and a
+ * field the declaration covers is decided from the declaration. Positional
+ * evidence stays because the declaration does not reach everywhere: a created
+ * field computed from a fetched contract, from a list element, or from a
+ * struct has no projection path from `this` or `arg` to walk, and the way the
+ * code uses it is then the only fact available. Neither path ever guesses from
+ * the field's NAME.
  */
 function numericEvidence(term, isRealVar) {
   if (!term || typeof term !== 'object') return false;
@@ -848,6 +869,73 @@ function numericEvidence(term, isRealVar) {
 }
 
 /**
+ * Sorts a field can have that make `>= 0` NOT A QUESTION ABOUT IT.
+ *
+ * The distinction this set draws is the point of decoding the field types at
+ * all. Before them a Party field and a Numeric field the translation could not
+ * read were indistinguishable: both came back "not known to be numeric", both
+ * were counted as unchecked obligations, and a transition assigning six party
+ * and text fields reported as a refusal over six unanswered questions. Five of
+ * those six were never questions. A field the package declares to be a Party,
+ * a Text, a Date, a ContractId, a Bool or a nested data type is not an
+ * obligation of this property that went unchecked - it is not an obligation.
+ *
+ * `record` covers every nominal data type (records, variants, enums alike);
+ * none of them is a number, and the field-type walk enters one only when it
+ * has to go deeper, never to decide a leaf.
+ *
+ * The asymmetry to keep in mind: this set EXCLUDES work. Getting a sort wrong
+ * here would silently drop a real obligation, so it is driven only by the
+ * declared type and never by a heuristic - an unfollowable path yields no
+ * entry at all and the field stays in the unknown class where it was before.
+ */
+const NON_NUMERIC_SORTS = new Set(['party', 'text', 'time', 'cid', 'bool', 'record']);
+
+/**
+ * The one thing excluding a field can hide, said on every verdict that excludes
+ * one. See `nestedRecords`.
+ */
+const NESTED_RECORD_CAVEAT =
+  'some of the excluded fields are nested RECORDS assigned whole; this property checks the ' +
+  'fields a create assigns and does not descend into them, so numeric fields INSIDE those ' +
+  'records are not examined here and this verdict says nothing about them';
+
+/** Declared coarse sort -> the SMT sort it seeds inferSorts with. */
+const DECLARED_SMT_SORT = new Map([
+  ['numeric', 'Real'],
+  ['text', 'String'],
+  ['bool', 'Bool'],
+  ['party', 'Party'],
+]);
+
+/**
+ * The sort the compiled package DECLARES for a field term, or null.
+ *
+ * Only two shapes can carry a declaration: a symbol, which is a projection
+ * path whose sort was read off the DefDataType records, and an `ite` whose
+ * branches agree (both sides of a conditional assignment are the same field
+ * type, and disagreeing branches say the walk got something wrong, so they
+ * answer null rather than picking one). An arithmetic term is deliberately NOT
+ * consulted here: that is positional evidence, and it is judged by
+ * numericEvidence so the two sources stay distinguishable in the report.
+ */
+function declaredSort(term, types) {
+  if (!types || types.size === 0 || !term || typeof term !== 'object') return null;
+  switch (term.k) {
+    case 'var':
+      return types.get(term.name) || null;
+    case 'ite': {
+      const a = declaredSort(term.a, types);
+      const b = declaredSort(term.b, types);
+      if (a && b) return a === b ? a : null;
+      return a || b;
+    }
+    default:
+      return null;
+  }
+}
+
+/**
  * NON-NEGATIVITY: every numeric field of every created contract is `>= 0`
  * under the guards that hold on the path that creates it.
  *
@@ -855,12 +943,36 @@ function numericEvidence(term, isRealVar) {
  * translation could not read must not hide the ones it could, and the
  * coverage split is what keeps a partial answer from printing as a whole one.
  *
- * WHAT IS AND IS NOT AN OBLIGATION HERE. Only fields the create ASSIGNS are
- * checked. A `create this with amount = ...` inherits every field it does not
- * mention, and an inherited field's value is the pre-state's, about which this
+ * WHICH FIELDS ARE OBLIGATIONS. Three classes, and the three-way split is what
+ * the decoded field types bought:
+ *
+ *   * DECLARED NUMERIC, or shown numeric by the way the transition uses it:
+ *     an obligation, and checked.
+ *   * DECLARED NON-NUMERIC: not an obligation at all. Excluded from the
+ *     coverage denominator and reported separately, because counting a Party
+ *     field as an unanswered question overstates the gap and turns whole
+ *     transitions into refusals over nothing.
+ *   * NEITHER: unknown. Skipped and said to be skipped, exactly as before.
+ *     The sub-case worth naming is a field that IS declared numeric but whose
+ *     value the translation could not read; it is still skipped, and it is
+ *     counted apart from the unknowns because it is a real gap rather than a
+ *     question that was never asked.
+ *
+ * WHAT IS STILL NOT AN OBLIGATION. Only fields the create ASSIGNS are checked.
+ * A `create this with amount = ...` inherits every field it does not mention,
+ * and an inherited field's value is the pre-state's, about which this
  * transition establishes nothing at all - `this.owner >= 0` is not a property
  * of the choice. Those fields are disclosed on the verdict rather than
- * counted, because there is no type information here to count them with.
+ * counted: the declaration says what they ARE, not what this choice did to
+ * them, and a property about the pre-state is a different property.
+ *
+ * AND WHAT IS STILL NOT ASSUMED. The CREATED template's own `ensure` clause is
+ * not a guard here. The ledger enforces it at create time, so assuming it
+ * would make every such obligation vacuously true - the check would be
+ * "assuming the create succeeds, does the create succeed?". Not assuming it is
+ * what lets a create that CAN abort show up as a finding. The EXERCISED
+ * contract's ensure is a different matter and is assumed, because that
+ * contract already exists on the ledger and its precondition already held.
  */
 export function nonNegativeFields(transition) {
   const creates = transition.creates || [];
@@ -898,12 +1010,55 @@ export function nonNegativeFields(transition) {
   for (const d of transition.divisions || []) {
     evidence.push({ term: d.denominator, sort: `denominator$${fresh++}` });
   }
-  const { sorts, pinned } = inferSorts(evidence);
+  // The DECLARED sorts of this transition's symbols, read out of the compiled
+  // package's DefDataType records by lfir.js. Absent on a hand-built
+  // transition, and an absent map simply means every field falls back to
+  // positional evidence - the behaviour before the types were decoded.
+  const declared = transition.symbolTypes instanceof Map ? transition.symbolTypes : new Map();
+  // Declarations also SEED the sort inference, which is where they pay off a
+  // second time: a symbol the package declares Numeric pins its class, so a
+  // field assigned from it is Real-sorted and the positional path agrees with
+  // the declared one instead of contradicting it. Seeds are applied after
+  // every position has been walked and only to symbols the terms mention, so
+  // they cannot move a sort a position already decided (see inferSorts).
+  const seeds = [];
+  for (const [name, sort] of declared) {
+    const smtSort = DECLARED_SMT_SORT.get(sort);
+    if (smtSort) seeds.push([name, smtSort]);
+  }
+  const { sorts, pinned } = inferSorts(evidence, seeds);
   const isRealVar = (name) => pinned.has(name) && sorts.get(name) === 'Real';
 
   const checkable = [];
   const skipped = [];
-  let nonNumeric = 0;
+  /** Fields the package declares NON-numeric: not obligations, not gaps. */
+  const excluded = [];
+  /**
+   * How many of those are NESTED RECORDS, which is the one exclusion that
+   * hides something. `create M with contractData = <a whole record>` assigns a
+   * field that is not a number, so it is correctly not an obligation - but the
+   * record it assigns may itself contain numeric fields, and this property
+   * checks the fields a create ASSIGNS rather than descending into a record
+   * assigned whole. Excluding it silently would let "no numeric field here"
+   * read as "no numeric field anywhere in what was created", so the count is
+   * carried onto the verdict in both the applicable and the non-applicable
+   * case.
+   */
+  let nestedRecords = 0;
+  /** Declared numeric, but the value itself is outside the fragment. */
+  let skippedNumeric = 0;
+  /**
+   * Value outside the fragment AND no declaration: unreadable, so whether it
+   * was even a numeric question is unknown. Counted apart from the class below
+   * because the two lead to different verdicts - an unreadable field is a
+   * REFUSAL (NOT-MODELLABLE: the property applies but cannot be expressed),
+   * while a readable field nothing types as a number is NOT-APPLICABLE. That
+   * distinction is the pipeline's whole vocabulary for "we could not" versus
+   * "there was nothing to"; collapsing them would report refusals as absences.
+   */
+  let skippedUnreadable = 0;
+  /** Readable, but nothing - declaration or position - says it is a number. */
+  let skippedUnknown = 0;
   let total = 0;
   for (const c of creates) {
     const usablePath = [];
@@ -913,32 +1068,76 @@ export function nonNegativeFields(transition) {
       else usablePath.push(p);
     }
     for (const [name, term] of Object.entries(c.fields || {})) {
-      total++;
       const at = `${c.template}.${name}`;
+      // The CREATED record's own declaration first: this property is about the
+      // field a contract is given, so the created template's record is the
+      // direct answer, and it is the only one available when the assigned
+      // value left the fragment. The value side is consulted only where the
+      // created record could not be resolved (a target declared in a package
+      // the archive does not carry). Both are reads of the same compiled
+      // package, so where both answer they answer the same thing.
+      const sort = (c.fieldSorts && c.fieldSorts[name]) || declaredSort(term, declared);
+
+      // Declared non-numeric: excluded BEFORE anything else, including the
+      // readability test. Whether the translation could read a Party field's
+      // value does not matter - `>= 0` is not a question about it either way,
+      // so it is not counted as an obligation in any state.
+      if (sort && NON_NUMERIC_SORTS.has(sort)) {
+        excluded.push(`${at} (${sort})`);
+        if (sort === 'record') nestedRecords++;
+        continue;
+      }
+
+      total++;
       if (hasUnsupported(term)) {
         // NOT assumed non-negative: an unreadable field is an unanswered
         // question, and it is reported as one.
-        skipped.push(`${at} is outside the fragment: ${unsupportedReasons(term).map((u) => u.why).join('; ')}`);
+        const why = unsupportedReasons(term).map((u) => u.why).join('; ');
+        if (sort === 'numeric') {
+          skippedNumeric++;
+          skipped.push(
+            `${at} is declared numeric by the package but its value is outside the fragment: ${why}`
+          );
+        } else {
+          skippedUnreadable++;
+          skipped.push(`${at} is outside the fragment: ${why}`);
+        }
         continue;
       }
-      if (!numericEvidence(term, isRealVar)) {
-        nonNumeric++;
-        skipped.push(
-          `${at} is not known to be numeric: nothing in the transition uses it as a number and ` +
-            `the compiled package's field types are not available here, so it is left unchecked ` +
-            `rather than asserted about`
-        );
+      if (sort === 'numeric' || numericEvidence(term, isRealVar)) {
+        checkable.push({ at, term, path: usablePath, droppedPath });
         continue;
       }
-      checkable.push({ at, term, path: usablePath, droppedPath });
+      skippedUnknown++;
+      skipped.push(
+        `${at} is not known to be numeric: the package's field types do not cover the term it is ` +
+          `assigned (no projection path from \`this\` or \`arg\` that the data-type records could ` +
+          `be walked along) and nothing in the transition uses it as a number, so it is left ` +
+          `unchecked rather than asserted about`
+      );
     }
   }
 
   if (checkable.length === 0) {
     if (total === 0) {
+      if (excluded.length) {
+        // Every assigned field has a declared non-numeric type. This is a
+        // genuine NOT-APPLICABLE - the property does not concern this
+        // transition - and not a refusal: nothing here went unanswered.
+        return {
+          applicable: false,
+          why:
+            `every field the create(s) assign has a declared NON-numeric type ` +
+            `(${[...new Set(excluded)].join(', ')}), so non-negativity is not a property of ` +
+            `this transition` + (nestedRecords ? `; ${NESTED_RECORD_CAVEAT}` : ''),
+        };
+      }
       return { applicable: false, why: 'no create resolves a field the translation could read' };
     }
-    if (nonNumeric === total) {
+    // Every unchecked field was READABLE and simply not known to be a number:
+    // nothing was refused, so this is non-applicability. One unreadable field
+    // among them makes it a refusal instead - see skippedUnreadable.
+    if (skippedUnknown === total) {
       return {
         applicable: false,
         why: `none of the ${total} resolved created field(s) is known to be numeric`,
@@ -976,6 +1175,23 @@ export function nonNegativeFields(transition) {
         `produces a term, so every field built through one is among the skipped ones above`
     );
   }
+  if (excluded.length) {
+    const shown = [...new Set(excluded)];
+    notes.push(
+      `${shown.length} assigned field(s) are NOT obligations of this property: the package ` +
+        `declares them non-numeric (${shown.slice(0, 6).join(', ')}` +
+        `${shown.length > 6 ? `, and ${shown.length - 6} more` : ''}). They are excluded from ` +
+        `the coverage denominator rather than reported as unchecked, which they never were` +
+        (nestedRecords ? `; ${NESTED_RECORD_CAVEAT}` : '')
+    );
+  }
+  if (skippedNumeric) {
+    notes.push(
+      `${skippedNumeric} field(s) the package declares NUMERIC could not be checked because the ` +
+        `value assigned is outside the translated fragment; those are real gaps, listed in the ` +
+        `coverage split`
+    );
+  }
 
   return {
     applicable: true,
@@ -983,7 +1199,25 @@ export function nonNegativeFields(transition) {
     goal,
     dropped,
     notes,
-    coverage: { checked: checkable.length, total, skipped: [...new Set(skipped)] },
+    /**
+     * `total` counts OBLIGATIONS, which is why declared non-numeric fields are
+     * not in it: they are reported in `excluded` instead. The three skip
+     * counters split the remainder - `skippedNumeric` is a question we know we
+     * could not answer, `skippedUnreadable` a value we could not read at all,
+     * `skippedUnknown` a value we read but nothing types as a number - and
+     * they sum with `checked` to `total`.
+     */
+    coverage: {
+      checked: checkable.length,
+      total,
+      skipped: [...new Set(skipped)],
+      excluded: excluded.length,
+      excludedFields: [...new Set(excluded)],
+      excludedNestedRecords: nestedRecords,
+      skippedNumeric,
+      skippedUnreadable,
+      skippedUnknown,
+    },
   };
 }
 

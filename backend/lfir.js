@@ -467,10 +467,21 @@ export function divisors(term, out = []) {
  * `env` maps an LF variable name to a term, which is how `let` bindings and
  * lambda parameters are resolved without substituting into the protobuf.
  */
-function makeCtx(pkg, { selfParam, argParam, label, dispatch = null, bound = DEFAULT_BOUND }) {
+function makeCtx(
+  pkg,
+  { selfParam, argParam, label, dispatch = null, bound = DEFAULT_BOUND, selfType = null, argType = null }
+) {
   const env = new Map();
   if (selfParam) env.set(selfParam, T.record('this'));
   if (argParam) env.set(argParam, T.record('arg'));
+  // The RECORD TYPE behind each symbol root, when the caller could supply one.
+  // `this` is the template's own record and `arg` the choice argument's; both
+  // are `{pkg, module, name}` addressed against the package that DECLARES the
+  // record, because a nested field's type has to be read against its own
+  // package's interning tables.
+  const rootTypes = new Map();
+  if (selfType) rootTypes.set('this', selfType);
+  if (argType) rootTypes.set('arg', argType);
   return {
     /**
      * The interning context of the expression CURRENTLY being read. Following
@@ -504,6 +515,27 @@ function makeCtx(pkg, { selfParam, argParam, label, dispatch = null, bound = DEF
     rawEnv: new Map(),
     /** symbolic inputs discovered during translation */
     params: new Map(),
+    /**
+     * Root name -> the record type it denotes (`{pkg, module, name}`).
+     *
+     * Only roots whose type the caller actually knows appear here. A list
+     * element, a fetched contract, a struct field: absent, and absence means
+     * no sort is recorded for symbols under them.
+     */
+    rootTypes,
+    /**
+     * Symbol name -> its DECLARED coarse sort, read out of the package's
+     * `DefDataType` records rather than inferred from how the code uses it.
+     *
+     * Only populated where the projection path could be walked all the way
+     * from a known root through declared record fields. A path the walk cannot
+     * follow records NOTHING: this map never contains a guess, so a consumer
+     * may treat a present entry as a fact about the compiled package and an
+     * absent one as "no information", which is exactly the distinction the
+     * non-negativity property needs in order to exclude a Party field instead
+     * of reporting it as an unexplained gap.
+     */
+    symbolTypes: new Map(),
     rounding: [],
     divisions: [],
     /**
@@ -604,7 +636,33 @@ function ufName(qualified, pkgCtx) {
 function symbol(ctx, root, path, sort) {
   const name = `${root}.${path}`;
   if (!ctx.params.has(name)) ctx.params.set(name, { name, root, path, sort });
+  recordSymbolType(ctx, name, root, path);
   return T.varRef(name, sort);
+}
+
+/**
+ * Record the DECLARED sort of a symbol, where the package's field types can
+ * supply one.
+ *
+ * `sort` on the term is the EMITTER's sort and defaults to Real for everything
+ * it cannot place; this is the other thing entirely - what the compiled
+ * package says the field IS. The path is walked from the root's record type
+ * through declared record fields, and anything the walk cannot follow (a field
+ * of a type from a package that is not in the archive, a step through a
+ * non-record, the synthetic `$some`/`$value` segments the Optional encoding
+ * introduces) records nothing at all. There is deliberately no fallback: half
+ * a walk is not evidence, and a wrong sort here would let the non-negativity
+ * property either fabricate an obligation or drop a real one.
+ */
+function recordSymbolType(ctx, name, root, path) {
+  if (!ctx.symbolTypes || ctx.symbolTypes.has(name)) return;
+  const origin = ctx.rootTypes && ctx.rootTypes.get(root);
+  if (!origin || !origin.pkg || typeof origin.pkg.fieldSort !== 'function') return;
+  const declared = origin.pkg.fieldSort(
+    { module: origin.module, name: origin.name },
+    path.split('.')
+  );
+  if (declared) ctx.symbolTypes.set(name, declared);
 }
 
 /**
@@ -2620,6 +2678,11 @@ export function extractTransitions(raw, options = {}) {
       const template = raw.ctx.dname(int(tpl, S.DefTemplate.tyconInternedDname));
       const selfParam = raw.ctx.str(int(tpl, S.DefTemplate.paramInternedStr));
       const tplLocation = readLocation(tpl, S.DefTemplate.location, raw.ctx);
+      // The template's OWN record: `this` projections are walked from here
+      // through the package's DefDataType records to recover declared sorts.
+      // Null when the package has no record definition of that name, in which
+      // case nothing is recorded rather than something assumed.
+      const selfType = raw.ctx.recordRef ? raw.ctx.recordRef(mod.name, template) : null;
 
       // `ensure` holds on every successful path through every choice, and it
       // also held when THIS contract was created, so it is a valid assumption
@@ -2631,6 +2694,7 @@ export function extractTransitions(raw, options = {}) {
         argParam: null,
         label: `${template}.ensure`,
         bound,
+        selfType,
       });
       const precondExpr = sub(tpl, S.DefTemplate.precond);
       const precond = precondExpr ? translateExpr(precondExpr, precondCtx) : null;
@@ -2642,6 +2706,12 @@ export function extractTransitions(raw, options = {}) {
         const argParam = argBinder
           ? raw.ctx.str(int(argBinder, S.VarWithType.varInternedStr))
           : null;
+        // The choice ARGUMENT's record, straight off the binder's declared
+        // type, so `arg.<field>` is typed the same way `this.<field>` is.
+        const argType =
+          argBinder && raw.ctx.recordTypeRef
+            ? raw.ctx.recordTypeRef(sub(argBinder, S.VarWithType.type))
+            : null;
 
         // The controller clause in its OWN context: it contributes to the
         // acting authority, not to the choice's arithmetic, and sharing a
@@ -2651,13 +2721,22 @@ export function extractTransitions(raw, options = {}) {
           argParam,
           label: `${template}.${choice}.controller`,
           bound,
+          selfType,
+          argType,
         });
         const controllers = analysePartyExpr(
           sub(choiceMsg, S.TemplateChoice.controllers),
           controllerCtx
         );
 
-        const ctx = makeCtx(raw.ctx, { selfParam, argParam, label: `${template}.${choice}`, bound });
+        const ctx = makeCtx(raw.ctx, {
+          selfParam,
+          argParam,
+          label: `${template}.${choice}`,
+          bound,
+          selfType,
+          argType,
+        });
         // carry the precondition's discovered symbols into this choice
         for (const [k, v] of precondCtx.params) ctx.params.set(k, v);
         // ...and the abstractions it made: the ensure guards travel onto every
@@ -2684,6 +2763,14 @@ export function extractTransitions(raw, options = {}) {
           selfParam,
           argParam,
           params: [...ctx.params.values()],
+          /**
+           * Declared sorts for the symbols this transition mentions, read out
+           * of the package's DefDataType records. The ensure clause's symbols
+           * travel with its guards, so its map is merged in; the body's
+           * entries win on a key collision, which cannot change an answer
+           * because both are reads of the same declaration.
+           */
+          symbolTypes: new Map([...precondCtx.symbolTypes, ...ctx.symbolTypes]),
           guards: [...ensureGuards],
           creates,
           divisions: ctx.divisions.map((d) => ({
@@ -2834,6 +2921,10 @@ function interfaceInstanceTransitions({
       `view fields come from`,
   };
   const implLocation = readLocation(implMsg, S.Implements.location, raw.ctx) || tplLocation;
+  // `this` in an interface choice denotes the IMPLEMENTING TEMPLATE's record:
+  // the interface parameter and the template parameter are both bound to it,
+  // and call_interface dispatches into this template's method bodies.
+  const selfType = raw.ctx.recordRef ? raw.ctx.recordRef(mod.name, template) : null;
 
   // The instance's method bodies live in THIS package regardless of where the
   // interface is declared.
@@ -2873,6 +2964,7 @@ function interfaceInstanceTransitions({
       controllers: ifaceControllers,
       templateSignatories,
       unsupported: [{ why: resolved.error }],
+      symbolTypes: new Map(),
       location: implLocation,
     });
     return;
@@ -2887,6 +2979,12 @@ function interfaceInstanceTransitions({
     const argParam = argBinder
       ? ifacePkg.str(int(argBinder, S.VarWithType.varInternedStr))
       : null;
+    // The interface choice's argument record is declared in the INTERFACE's
+    // package, so its type is resolved against that package's tables.
+    const argType =
+      argBinder && ifacePkg.recordTypeRef
+        ? ifacePkg.recordTypeRef(sub(argBinder, S.VarWithType.type))
+        : null;
     const selfBinder = has(choiceMsg, S.TemplateChoice.selfBinderInternedStr)
       ? ifacePkg.str(int(choiceMsg, S.TemplateChoice.selfBinderInternedStr))
       : null;
@@ -2901,6 +2999,8 @@ function interfaceInstanceTransitions({
       label,
       dispatch: { methods },
       bound,
+      selfType,
+      argType,
     });
     // The template's own parameter names the same record once dispatch enters
     // the implementing package's method bodies.
@@ -2929,6 +3029,7 @@ function interfaceInstanceTransitions({
       selfParam,
       argParam,
       params: [...ctx.params.values()],
+      symbolTypes: new Map([...precondCtx.symbolTypes, ...ctx.symbolTypes]),
       guards: [...ensureGuards],
       creates,
       divisions: ctx.divisions.map((d) => ({
@@ -3157,9 +3258,32 @@ function collectEffects(expr, ctx, path, creates, unsupported, depth = 0) {
   // create: the shape we are here for
   const create = sub(update, S.Update.create);
   if (create) {
-    const target = createTargetName(sub(create, 1), ctx);
+    const tycon = sub(create, 1);
+    const target = createTargetName(tycon, ctx);
     const { base, fields } = recordFields(sub(create, 2), ctx, unsupported);
-    creates.push({ template: target || '<unknown>', base, fields, path: [...path] });
+    creates.push({
+      template: target || '<unknown>',
+      base,
+      fields,
+      /**
+       * What the CREATED record declares each assigned field to be.
+       *
+       * Distinct from the sorts of the symbols the values are built from, and
+       * the more direct answer: this property asks about the field a contract
+       * is given, so the created template's own record is the right thing to
+       * ask. It also reaches where the value-side answer cannot - a field whose
+       * assigned expression left the fragment has no symbol to consult, but its
+       * DECLARED type is known all the same, which is how "a numeric field we
+       * could not read" stops being indistinguishable from "a field that was
+       * never a numeric question".
+       *
+       * Only fields the declaration actually covers appear; a create whose
+       * target is declared in a package the archive does not carry contributes
+       * nothing rather than a guess.
+       */
+      fieldSorts: createFieldSorts(tycon, fields, ctx),
+      path: [...path],
+    });
     return;
   }
 
@@ -3355,6 +3479,27 @@ function restore(saved, ctx) {
       else ctx.rawEnv.set(name, prevRaw);
     }
   }
+}
+
+/**
+ * The declared sorts of the fields a create assigns, keyed by field name.
+ *
+ * Read against `ctx.pkg`, which is the package the create EXPRESSION is being
+ * read in and therefore the one its TypeConId is meaningful against; the
+ * target record may still live in a dependency, and recordRefOfTycon hops
+ * there. An unresolvable target yields an empty map, never a partial one.
+ */
+function createFieldSorts(tycon, fields, ctx) {
+  const out = {};
+  if (!tycon || !ctx.pkg || typeof ctx.pkg.recordRefOfTycon !== 'function') return out;
+  const ref = ctx.pkg.recordRefOfTycon(tycon);
+  if (!ref || typeof ref.pkg.fieldSort !== 'function') return out;
+  const start = { module: ref.module, name: ref.name };
+  for (const name of Object.keys(fields)) {
+    const sort = ref.pkg.fieldSort(start, [name]);
+    if (sort) out[name] = sort;
+  }
+  return out;
 }
 
 function createTargetName(tycon, ctx) {

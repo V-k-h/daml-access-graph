@@ -55,6 +55,18 @@ export const InterfaceInstanceMethod = G.message('InterfaceInstanceBody.Interfac
 export const DefInterface = G.message('DefInterface');
 export const InterfaceMethod = G.message('InterfaceMethod');
 export const TemplateChoice = G.message('TemplateChoice');
+/**
+ * The data-type definitions, which is where FIELD TYPES live.
+ *
+ * A `DefTemplate` carries a template's behaviour but not the shape of its
+ * record: the fields and their types sit in the `DefDataType` of the same
+ * qualified name. Without these a property can only infer whether a field is
+ * a number from how the compiled code happens to use it, which is why they are
+ * decoded (see the field-type section of dalf.js).
+ */
+export const DefDataType = G.message('DefDataType');
+export const DataTypeFields = G.message('DefDataType.Fields');
+export const FieldWithType = G.message('FieldWithType');
 
 // ------------------------------------------------------------------- names
 export const TypeConId = G.message('TypeConId');
@@ -68,6 +80,14 @@ export const Range = G.message('Location.Range');
 // ------------------------------------------------------------------- types
 export const Type = G.message('Type');
 export const TypeCon = G.message('Type.Con');
+/**
+ * `Numeric 10` is a builtin APPLIED to its scale, and LF writes that either as
+ * `Type.Builtin` with `args`, or as a `Type.TApp` spine whose head is the
+ * builtin. Both shapes have to be read or half the numeric fields in a package
+ * come back unclassified, so both messages are named here.
+ */
+export const TypeBuiltin = G.message('Type.Builtin');
+export const TypeApp = G.message('Type.TApp');
 
 // ------------------------------------------------------------- expressions
 export const Expr = G.message('Expr');

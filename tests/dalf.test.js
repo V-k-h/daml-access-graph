@@ -17,7 +17,7 @@ import { deflateRawSync } from 'node:zlib';
 
 import { decodeMessage, readPackedVarints, one, sub, subs, int, bool, has } from '../backend/protobuf.js';
 import { listEntries, readEntry, readByName, parseManifest } from '../backend/zip.js';
-import { decodeDalf, readDar } from '../backend/dalf.js';
+import { decodeDalf, decodeDalfRaw, readDar, resolveFieldSort } from '../backend/dalf.js';
 import * as S from '../backend/lf2-schema.js';
 import { buildGraph } from '../src/graph.js';
 import { analyzeAll } from '../src/analysis.js';
@@ -356,4 +356,214 @@ test('dalf: an LF 1 payload is rejected rather than decoded into nonsense', () =
 test('readDar: rejects a zip that is not a DAR', () => {
   // No fixture file needed: a missing manifest is the failure we care about.
   assert.throws(() => readDar('/nonexistent/path/to.dar'), /ENOENT|no such file/i);
+});
+
+// ---------------------------------------------------------------------------
+// Field types: DefDataType decoding and path resolution
+//
+// The decoder used to keep the definitions that carry BEHAVIOUR (templates,
+// interfaces, values) and drop the `DefDataType` records that carry the FIELD
+// TYPES. A property asking "is this field a Numeric?" therefore had nothing to
+// consult. These tests pin the three Type shapes a real package actually uses
+// - interned, builtin, and APPLIED (`Numeric 10` is a builtin applied to its
+// scale) - because getting the applied shape wrong silently classifies every
+// decimal field in a package as unknown, which reads exactly like success.
+// ---------------------------------------------------------------------------
+
+/**
+ * A package of pure data types:
+ *
+ *   data Deep      = Deep      with bps : Int64
+ *   data TokenData = TokenData with rate : Numeric 10; name : Text; deep : Deep
+ *   data Token     = Token     with issuer, owner : Party; amount : Numeric 10;
+ *                                   label : Text; count : Int64; when : Time;
+ *                                   ref : ContractId Token; flag : Bool;
+ *                                   opt : Optional Int64; poly : a;
+ *                                   data_ : TokenData
+ *   data Color     = Red | Green            -- an enum, not a record
+ */
+function buildTypedRecordDalf() {
+  const strings = [
+    'Tok', 'Token', 'TokenData', 'Deep', 'Color',
+    'issuer', 'owner', 'amount', 'label', 'count', 'when', 'ref', 'flag', 'opt', 'poly', 'data_',
+    'rate', 'name', 'deep', 'bps', 'a', 'pkg', '1.0.0',
+  ];
+  const SI = Object.fromEntries(strings.map((s, i) => [s, i]));
+  const dnameOrder = ['Tok', 'Token', 'TokenData', 'Deep', 'Color'];
+  const DN = Object.fromEntries(dnameOrder.map((n, i) => [n, i]));
+  const dnameMsgs = dnameOrder.map((n) =>
+    bf(S.Package.internedDottedNames, bf(S.InternedDottedName.segmentsInternedStr, varint(SI[n])))
+  );
+
+  const BT = S.ENUMS.BuiltinType;
+  const builtinType = (code) => bf(S.Type.builtin, vf(S.TypeBuiltin.builtin, code));
+  const natType = (n) => vf(S.Type.nat, n);
+  const internedRef = (i) => msg(vf(S.Type.internedType, i));
+
+  // The interned type table. `Numeric 10` is entry 3 and is BOTH interned and
+  // applied, which is the combination a compiled Daml field actually carries.
+  const internedTypes = [
+    builtinType(BT.PARTY),                                          // 0
+    builtinType(BT.NUMERIC),                                        // 1
+    natType(10),                                                    // 2
+    bf(S.Type.tapp, msg(bf(S.TypeApp.lhs, internedRef(1)), bf(S.TypeApp.rhs, internedRef(2)))), // 3
+    builtinType(BT.TEXT),                                           // 4
+  ];
+  const IT = { party: 0, numeric10: 3, text: 4 };
+
+  const selfModule = msg(
+    bf(S.ModuleId.packageId, bf(S.SelfOrImportedPackageId.selfPackageId, Buffer.alloc(0))),
+    vf(S.ModuleId.moduleNameInternedDname, DN.Tok)
+  );
+  const conType = (dn) =>
+    bf(
+      S.Type.con,
+      bf(
+        S.TypeCon.tycon,
+        msg(bf(S.TypeConId.module, selfModule), vf(S.TypeConId.nameInternedDname, dn))
+      )
+    );
+
+  const field = (nameSi, typeBuf) =>
+    bf(
+      S.DataTypeFields.fields,
+      msg(bf(S.FieldWithType.type, typeBuf), vf(S.FieldWithType.fieldInternedStr, nameSi))
+    );
+  const record = (dn, ...fields) =>
+    bf(
+      S.Module.dataTypes,
+      msg(vf(S.DefDataType.nameInternedDname, dn), bf(S.DefDataType.record, msg(...fields)))
+    );
+
+  const module = msg(
+    vf(S.Module.nameInternedDname, DN.Tok),
+    record(DN.Deep, field(SI.bps, builtinType(BT.INT64))),
+    record(
+      DN.TokenData,
+      field(SI.rate, internedRef(IT.numeric10)),
+      field(SI.name, internedRef(IT.text)),
+      field(SI.deep, conType(DN.Deep))
+    ),
+    record(
+      DN.Token,
+      field(SI.issuer, internedRef(IT.party)),
+      // owner's type is written INLINE rather than interned: both shapes occur.
+      field(SI.owner, builtinType(BT.PARTY)),
+      field(SI.amount, internedRef(IT.numeric10)),
+      field(SI.label, internedRef(IT.text)),
+      field(SI.count, builtinType(BT.INT64)),
+      field(SI.when, builtinType(BT.TIMESTAMP)),
+      field(SI.ref, builtinType(BT.CONTRACT_ID)),
+      field(SI.flag, builtinType(BT.BOOL)),
+      // `Optional Int64`: an application whose HEAD is OPTIONAL, so unknown -
+      // NOT numeric, even though its element is.
+      field(
+        SI.opt,
+        bf(
+          S.Type.tapp,
+          msg(bf(S.TypeApp.lhs, builtinType(BT.OPTIONAL)), bf(S.TypeApp.rhs, builtinType(BT.INT64)))
+        )
+      ),
+      field(SI.poly, bf(S.Type.var, vf(S.message('Type.Var').varInternedStr, SI.a))),
+      field(SI.data_, conType(DN.TokenData))
+    ),
+    bf(
+      S.Module.dataTypes,
+      msg(
+        vf(S.DefDataType.nameInternedDname, DN.Color),
+        bf(
+          S.DefDataType.enum,
+          bf(S.message('DefDataType.EnumConstructors').constructorsInternedStr, varint(SI.name))
+        )
+      )
+    )
+  );
+
+  const pkg = msg(
+    bf(S.Package.modules, module),
+    ...strings.map((s) => sf(S.Package.internedStrings, s)),
+    ...dnameMsgs,
+    ...internedTypes.map((t) => bf(S.Package.internedTypes, t)),
+    bf(
+      S.Package.metadata,
+      msg(
+        vf(S.PackageMetadata.nameInternedStr, SI.pkg),
+        vf(S.PackageMetadata.versionInternedStr, SI['1.0.0'])
+      )
+    )
+  );
+  const payload = msg(sf(S.ArchivePayload.minor, '3'), bf(S.ArchivePayload.damlLf2, pkg));
+  return msg(bf(S.Archive.payload, payload), sf(S.Archive.hash, 'typedfixture'));
+}
+
+test('dalf: DefDataType records decode to coarse field sorts', () => {
+  const raw = decodeDalfRaw(buildTypedRecordDalf());
+  // Exposed on the raw result, which is what the verification frontend reads.
+  assert.ok(raw.dataTypes instanceof Map);
+  const token = raw.dataTypes.get('Tok:Token');
+  assert.equal(token.kind, 'record');
+  assert.deepEqual(
+    Object.fromEntries([...token.fields].map(([k, c]) => [k, c.sort])),
+    {
+      issuer: 'party',
+      owner: 'party',
+      amount: 'numeric',
+      label: 'text',
+      count: 'numeric',
+      when: 'time',
+      ref: 'cid',
+      flag: 'bool',
+      // `Optional Int64` is NOT numeric: the head of the application decides,
+      // and the IR models an Optional field as a $some/$value pair anyway.
+      opt: 'unknown',
+      // a type PARAMETER: its instantiation is not visible here, and anything
+      // but `unknown` would be inventing a fact.
+      poly: 'unknown',
+      data_: 'record',
+    }
+  );
+  // A nested record carries the qualified name the path walk continues at.
+  assert.deepEqual(
+    { module: token.fields.get('data_').ref.module, name: token.fields.get('data_').ref.name },
+    { module: 'Tok', name: 'TokenData' }
+  );
+  // Non-record data types are recorded with their kind, so the walk knows not
+  // to try to enter one.
+  assert.equal(raw.dataTypes.get('Tok:Color').kind, 'enum');
+  assert.equal(raw.dataTypes.get('Tok:Color').fields, null);
+});
+
+test('dalf: the interned and APPLIED Type shapes both classify', () => {
+  // `amount` is interned AND applied (`Numeric 10` = builtin NUMERIC @ nat 10);
+  // `owner` is a bare inline builtin. Reading only one of the two shapes leaves
+  // half a real package unclassified without erroring, so both are pinned.
+  const raw = decodeDalfRaw(buildTypedRecordDalf());
+  const start = { module: 'Tok', name: 'Token' };
+  assert.equal(resolveFieldSort(raw.ctx, start, ['amount']), 'numeric', 'interned + applied');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['owner']), 'party', 'inline builtin');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['issuer']), 'party', 'interned builtin');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['count']), 'numeric', 'Int64 is numeric');
+  // ...and the bound form on the context agrees with the exported function.
+  assert.equal(raw.ctx.fieldSort(start, ['amount']), 'numeric');
+});
+
+test('dalf: a nested record path is followed; an unfollowable one yields null', () => {
+  const raw = decodeDalfRaw(buildTypedRecordDalf());
+  const start = { module: 'Tok', name: 'Token' };
+  assert.equal(resolveFieldSort(raw.ctx, start, ['data_', 'rate']), 'numeric', 'one hop');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['data_', 'deep', 'bps']), 'numeric', 'two hops');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['data_', 'name']), 'text');
+
+  // Every way the walk can fail answers NULL - "nothing is known" - and never
+  // a partial or guessed sort.
+  assert.equal(resolveFieldSort(raw.ctx, start, ['nosuchfield']), null, 'unknown field');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['label', 'x']), null, 'step through a non-record');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['opt']), null, 'unknown sort reports as null');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['data_', 'rate', 'x']), null, 'past the end');
+  assert.equal(resolveFieldSort(raw.ctx, start, []), null, 'empty path');
+  assert.equal(resolveFieldSort(raw.ctx, { module: 'Tok', name: 'Color' }, ['x']), null, 'enum');
+  assert.equal(resolveFieldSort(raw.ctx, { module: 'Nope', name: 'Token' }, ['amount']), null);
+  // The $some/$value segments the IR's Optional encoding introduces are not
+  // declared fields, so they resolve to nothing rather than to the element sort.
+  assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$value']), null);
 });
