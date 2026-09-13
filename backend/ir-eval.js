@@ -23,6 +23,11 @@
 //   - Numbers are exact rationals: pairs {p, q} of BigInt, normalized so that
 //     q > 0 and gcd(|p|, q) = 1. No floating point anywhere.
 //   - `+ - *` are exact; `/` is exact rational division.
+//   - `to_real` is the exact injection Int -> Real. It does not change the
+//     rational (an Int value is a rational with denominator 1); it changes the
+//     SORT, and this evaluator keeps that distinction by REFUSING a
+//     non-integer argument rather than quietly accepting one. See the
+//     'toreal' case.
 //   - `div` and `mod` are the SMT-LIB Ints operations. SMT-LIB defines them
 //     with the EUCLIDEAN convention (Boolos): for n != 0,
 //         m = n * (div m n) + (mod m n)   and   0 <= (mod m n) < |n|
@@ -321,6 +326,32 @@ export function evalTerm(term, env, interp = undefined) {
       if (v === undefined) throw new Error(`ir-eval: unbound party constant ${term.name}`);
       if (!isParty(v)) throw new Error(`ir-eval: env value for ${term.name} is not a party token`);
       return v;
+    }
+    case 'toreal': {
+      // SMT-LIB `to_real`: the exact injection of the integers into the reals.
+      // Numerically it is the identity on this evaluator's rationals - an Int
+      // value IS a rational with denominator 1 - so the VALUE is returned
+      // unchanged, and the only thing this case adds is the SORT CHECK.
+      //
+      // That check is the point. The emitter and this evaluator are two
+      // independent implementations of the same semantics, and the failure a
+      // separate Int sort introduces is an Int-sorted term and a Real-sorted
+      // one being silently interchanged. A non-integer reaching a `to_real`
+      // argument means one side believes the term is an Int and the other does
+      // not, so it THROWS (ill-formed here) rather than returning UNDEF
+      // (unspecified in SMT): an undef would be skipped by the differential
+      // layer, which is exactly how such a disagreement would go unnoticed.
+      const v = evalTerm(term.a, env, interp);
+      if (isUndef(v)) return UNDEF;
+      const r = asRat(v, 'to_real');
+      if (!ratIsInt(r)) {
+        throw new Error(
+          `ir-eval: to_real applied to the non-integer rational ${r.p}/${r.q}; its argument is ` +
+            `Int-sorted by construction, so a non-integer means emitter and evaluator disagree ` +
+            `about the term's sort`
+        );
+      }
+      return r;
     }
     case 'ite': {
       // lazy on the branches: sound because SMT ite ignores the untaken

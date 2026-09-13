@@ -165,9 +165,27 @@ function valueToSmt(v, sort) {
 //   Int mode:  ops + - * div mod, Int vars, integer literals
 // (SMT-LIB types div/mod at Int only - cvc5 rejects (div x y) on Reals - so
 // a well-sorted term never mixes the two families on the same variables.)
+//
+// A Real-mode term may additionally contain an INT-SORTED SUBTERM under an
+// explicit `to_real` coercion - which is exactly the shape INT64_TO_NUMERIC
+// produces (lfir.js) and the only well-sorted way the two arithmetic families
+// meet in one term. It is generated in its own sub-mode ('IntC') over a
+// DISJOINT set of variables, because a single variable cannot be Int in one
+// occurrence and Real in another: that is a sort conflict, not a case.
+//
+// This is the arm that pins the coercion end to end - the emitter's `to_real`
+// rendering, the evaluator's integrality check, the Int literal rendering
+// underneath it, and the fact that the Real arithmetic around it is unchanged.
 
 const NUM_VARS = ['n0', 'n1', 'n2', 'n3'];
+/** Int-sorted variables, reachable only under a `to_real` coercion. */
+const COERCED_INT_VARS = ['c0', 'c1'];
 const BOOL_VARS = ['b0', 'b1'];
+
+/** Does this generation mode produce Int-sorted terms? */
+const isIntMode = (mode) => mode === 'Int' || mode === 'IntC';
+/** The variables a mode draws on; 'IntC' has its own so sorts never clash. */
+const varsForMode = (mode) => (mode === 'IntC' ? COERCED_INT_VARS : NUM_VARS);
 
 // Real-mode literals always carry a decimal point, as the translator's
 // Numeric literals do ("0.0000000000"): SMT-LIB types a bare numeral as Int,
@@ -214,8 +232,13 @@ const UF_INTERP = {
 };
 
 function genNum(rnd, depth, mode) {
-  const lit = () => T.num(pick(rnd, mode === 'Int' ? INT_LITERALS : REAL_LITERALS));
-  const vr = () => T.varRef(pick(rnd, NUM_VARS), mode === 'Int' ? 'Int' : 'Real');
+  // Literals carry the sort of the LF field they would have been read out of:
+  // `T.int` for an int64 literal, `T.num(v, 'Real')` for a numeric one. That
+  // tag is what makes a Real literal meeting an Int term a sort conflict
+  // rather than a silent coercion, so the generator uses it too.
+  const lit = () =>
+    isIntMode(mode) ? T.int(pick(rnd, INT_LITERALS)) : T.num(pick(rnd, REAL_LITERALS), 'Real');
+  const vr = () => T.varRef(pick(rnd, varsForMode(mode)), isIntMode(mode) ? 'Int' : 'Real');
   if (depth <= 0) return chance(rnd, 0.5) ? lit() : vr();
   const roll = rnd();
   if (roll < 0.15) return lit();
@@ -231,13 +254,15 @@ function genNum(rnd, depth, mode) {
   }
   if (roll < 0.75) return T.app('*', [genNum(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode)]);
   if (roll < 0.85) {
-    const op = mode === 'Int' ? (chance(rnd, 0.5) ? 'div' : 'mod') : '/';
+    const op = isIntMode(mode) ? (chance(rnd, 0.5) ? 'div' : 'mod') : '/';
     return T.app(op, [genNum(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode)]);
   }
-  if (roll < 0.92 && mode !== 'Int') {
+  if (roll < 0.92 && mode === 'Real') {
     const u = pick(rnd, UF_NUM);
     return T.uf(u.name, Array.from({ length: u.arity }, () => genNum(rnd, depth - 1, mode)), u.sort);
   }
+  // An Int-sorted subterm lifted into this Real term by an explicit coercion.
+  if (roll < 0.96 && mode === 'Real') return T.toReal(genNum(rnd, depth - 1, 'IntC'));
   return T.ite(genBool(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode));
 }
 
@@ -263,7 +288,7 @@ function genBool(rnd, depth, mode) {
       ? T.app('=', [genNum(rnd, depth - 1, mode), genNum(rnd, depth - 1, mode)])
       : T.app('=', [genBool(rnd, depth - 1, mode), genBool(rnd, depth - 1, mode)]);
   }
-  if (roll < 0.94 && mode !== 'Int') {
+  if (roll < 0.94 && mode === 'Real') {
     const u = pick(rnd, UF_BOOL);
     return T.uf(u.name, Array.from({ length: u.arity }, () => genNum(rnd, depth - 1, mode)), u.sort);
   }
@@ -289,7 +314,11 @@ function randomInt(rnd) {
 
 function randomEnv(rnd, mode) {
   const env = new Map();
-  for (const n of NUM_VARS) env.set(n, mode === 'Int' ? randomInt(rnd) : randomRat(rnd));
+  for (const n of NUM_VARS) env.set(n, isIntMode(mode) ? randomInt(rnd) : randomRat(rnd));
+  // The coerced variables are Int in every mode: they only ever occur under a
+  // `to_real`, and binding one to a fraction would be binding an Int-sorted
+  // symbol to a non-integer - which the evaluator rightly refuses.
+  for (const c of COERCED_INT_VARS) env.set(c, randomInt(rnd));
   for (const b of BOOL_VARS) env.set(b, chance(rnd, 0.5));
   return env;
 }
@@ -300,6 +329,7 @@ function varsOf(term, out = new Set()) {
   if (term.k === 'var') out.add(term.name);
   else if (term.k === 'app' || term.k === 'uf') term.args.forEach((a) => varsOf(a, out));
   else if (term.k === 'ite') [term.c, term.a, term.b].forEach((a) => varsOf(a, out));
+  else if (term.k === 'toreal') varsOf(term.a, out);
   return out;
 }
 
@@ -311,6 +341,7 @@ function ufAppsOf(term, out = []) {
     out.push(term);
   } else if (term.k === 'app') term.args.forEach((a) => ufAppsOf(a, out));
   else if (term.k === 'ite') [term.c, term.a, term.b].forEach((a) => ufAppsOf(a, out));
+  else if (term.k === 'toreal') ufAppsOf(term.a, out);
   return out;
 }
 
@@ -364,7 +395,11 @@ function caseLines(c) {
     );
   }
   const expectedSort =
-    typeof c.expected === 'boolean' ? 'Bool' : typeof c.expected === 'string' ? 'String' : numSort;
+    typeof c.expected === 'boolean'
+      ? 'Bool'
+      : typeof c.expected === 'string'
+        ? 'String'
+        : c.expectedSort || numSort;
   lines.push(`(assert (not (= ${termToSmt(c.term)} ${valueToSmt(c.expected, expectedSort)})))`);
   return lines;
 }
@@ -529,6 +564,36 @@ test('evalTerm: core semantics, laziness and undef discipline', () => {
   assert.throws(() => evalTerm(T.unsupported('why', 'at'), env), /unsupported/);
 });
 
+test('evalTerm: to_real is exact on the value and STRICT about the sort', () => {
+  const env = new Map([
+    ['i', ratFromInt(7n)],
+    ['r', ratFromDecimal('2.5')],
+  ]);
+  // Numerically the identity: an Int value IS a rational with denominator 1,
+  // so the coercion changes the sort and nothing else.
+  assert.ok(ratEq(evalTerm(T.toReal(T.varRef('i', 'Int')), env), ratFromInt(7n)));
+  assert.ok(
+    ratEq(
+      evalTerm(T.app('+', [T.toReal(T.varRef('i', 'Int')), T.num('0.5', 'Real')]), env),
+      ratFromDecimal('7.5')
+    )
+  );
+  assert.ok(ratEq(evalTerm(T.toReal(T.int('-13')), env), ratFromInt(-13n)));
+
+  // The SORT is what this case is really for. `to_real`'s argument is
+  // Int-sorted by construction, so a non-integer there means the emitter and
+  // this evaluator disagree about a term's sort - the exact failure a second
+  // arithmetic sort introduces. It THROWS rather than returning UNDEF,
+  // because the differential layer SKIPS undef and a silent skip is how such a
+  // disagreement would go unnoticed.
+  assert.throws(() => evalTerm(T.toReal(T.varRef('r', 'Real')), env), /non-integer/);
+
+  // undef still propagates, and an unsupported node under a coercion is still
+  // ill-formed rather than quietly a value.
+  assert.ok(isUndef(evalTerm(T.toReal(T.app('div', [T.int('1'), T.int('0')])), env)));
+  assert.throws(() => evalTerm(T.toReal(T.unsupported('why', 'at')), env), /unsupported/);
+});
+
 // chainable comparisons: (< a b c) is (and (< a b) (< b c)) per SMT-LIB
 test('evalTerm: chainable comparison follows SMT-LIB adjacent-pair semantics', () => {
   const env = new Map([['x', ratFromDecimal('7')], ['y', ratFromDecimal('-2.5')]]);
@@ -565,6 +630,34 @@ test('cvc5 accepts our exact-rational literal forms', { skip: !SOLVER && NO_SOLV
       env: new Map([['x', ratFromInt(0)]]),
       varSorts: new Map([['x', 'Real']]),
       expected: true,
+    },
+    // The Int/Real boundary, pinned as a ground fact: an Int-sorted symbol
+    // lifted into Real arithmetic by `to_real`, which is exactly the shape
+    // INT64_TO_NUMERIC (`intToDecimal`) produces. The emitter must write the
+    // coercion, declare the symbol `Int`, and keep the surrounding Real
+    // literals as Real literals.
+    {
+      term: T.app('+', [T.toReal(T.varRef('i', 'Int')), T.num('0.5', 'Real')]),
+      mode: 'Real',
+      env: new Map([['i', ratFromInt(7n)]]),
+      varSorts: new Map([['i', 'Int']]),
+      expected: ratFromDecimal('7.5'),
+    },
+    // ...and the Int side keeps INTEGER numerals: `(* i 10) + 1` is odd for
+    // every integer i, which is the fact the whole Int sort exists to make
+    // available to the solver.
+    {
+      term: T.app('=', [
+        { k: 'app', op: '+', args: [
+          { k: 'app', op: '*', args: [T.varRef('i', 'Int'), T.int('10')], ns: 'Int' },
+          T.int('1'),
+        ], ns: 'Int' },
+        T.num('0'),
+      ]),
+      mode: 'Int',
+      env: new Map([['i', ratFromInt(-3n)]]),
+      varSorts: new Map([['i', 'Int']]),
+      expected: false,
     },
   ];
   const failures = differential(cases);
@@ -629,19 +722,29 @@ test('differential: evalTerm agrees with termToSmt through cvc5 on 500+ generate
     const numSort = mode === 'Int' ? 'Int' : 'Real';
     const varSorts = new Map();
     for (const n of NUM_VARS) varSorts.set(n, numSort);
+    for (const c of COERCED_INT_VARS) varSorts.set(c, 'Int');
     for (const b of BOOL_VARS) varSorts.set(b, 'Bool');
     cases.push({ term, env, varSorts, expected, mode });
   }
 
   const withUf = cases.filter((c) => ufAppsOf(c.term).length > 0).length;
+  const withCoercion = cases.filter((c) => containsCoercion(c.term)).length;
   t.diagnostic(
     `generated ${attempts} term/env pairs; checked ${cases.length}; ` +
-      `skipped ${skippedUndef} undef (div0); ${withUf} apply an uninterpreted symbol`
+      `skipped ${skippedUndef} undef (div0); ${withUf} apply an uninterpreted symbol; ` +
+      `${withCoercion} carry an Int -> Real coercion`
   );
   assert.ok(cases.length >= 500, `only ${cases.length} checkable cases generated (skip rate too high)`);
   // Without this the uf arm could silently stop being generated and the whole
   // uninterpreted-application path would go untested while the test passed.
   assert.ok(withUf >= 50, `only ${withUf} cases exercise an uninterpreted application`);
+  // Same guard for the coercion arm: without it the Int/Real boundary - the
+  // one place the two arithmetic sorts meet - could silently stop being
+  // generated while the test still passed.
+  assert.ok(
+    withCoercion >= 25,
+    `only ${withCoercion} cases carry an Int -> Real coercion`
+  );
 
   const failures = differential(cases);
   assert.equal(
@@ -681,6 +784,9 @@ function termIsClean(term) {
       );
     case 'ite':
       return [term.c, term.a, term.b].every(termIsClean);
+    case 'toreal':
+      // The Int -> Real coercion: both sides model it exactly.
+      return termIsClean(term.a);
     default:
       return false; // record, unsupported, anything unknown
   }
@@ -716,10 +822,20 @@ function darInterpretation(ufSorts) {
   return interp;
 }
 
+/** Does the term contain an Int -> Real coercion anywhere? */
+function containsCoercion(term) {
+  if (!term || typeof term !== 'object') return false;
+  if (term.k === 'toreal') return true;
+  if (term.k === 'app' || term.k === 'uf') return term.args.some(containsCoercion);
+  if (term.k === 'ite') return [term.c, term.a, term.b].some(containsCoercion);
+  return false;
+}
+
 function containsOp(term, ops) {
   if (!term || typeof term !== 'object') return false;
   if (term.k === 'app') return ops.includes(term.op) || term.args.some((a) => containsOp(a, ops));
   if (term.k === 'ite') return [term.c, term.a, term.b].some((a) => containsOp(a, ops));
+  if (term.k === 'toreal') return containsOp(term.a, ops);
   return false;
 }
 
@@ -741,31 +857,41 @@ test(
     for (const tr of transitions) {
       for (const g of tr.guards) candidates.push({ term: g, rootSort: 'Bool' });
       for (const c of tr.creates) {
-        for (const f of Object.values(c.fields)) if (f) candidates.push({ term: f, rootSort: 'Real' });
+        // The root sort is INFERRED, not asserted: a created field or a
+        // denominator may be Int-sorted (a declared `Int` field, an INT64
+        // arithmetic chain, a `div`), and forcing Real on it would turn a
+        // perfectly well-sorted real term into a skipped sort conflict - which
+        // is coverage silently lost rather than a check.
+        for (const f of Object.values(c.fields)) if (f) candidates.push({ term: f, rootSort: null });
       }
-      for (const d of tr.divisions) candidates.push({ term: d.denominator, rootSort: 'Real' });
+      for (const d of tr.divisions) candidates.push({ term: d.denominator, rootSort: null });
     }
 
     const rnd = mulberry32(SEED ^ 0xda5);
     const cases = [];
     let eligible = 0;
+    let intRooted = 0;
     let skippedDirty = 0;
     let skippedSort = 0;
     let skippedUndef = 0;
     let withUf = 0;
+    // A probe variable unified with the term's own class, so the ROOT's
+    // resolved sort can be read back off `sorts`. It occurs in no term, so it
+    // is never declared or bound and cannot perturb the query.
+    const ROOT_PROBE = '$root';
     for (const { term, rootSort } of candidates) {
       if (hasUnsupported(term) || !termIsClean(term)) {
         skippedDirty++;
         continue;
       }
-      // div/mod force Int-sorted variables; a term mixing them with real
-      // division or fractional literals is not well-sorted for this check
-      const intMode = containsOp(term, ['div', 'mod']);
-      if (intMode && containsOp(term, ['/'])) {
-        skippedSort++;
-        continue;
-      }
-      const { sorts, conflicts, ufs } = inferSorts([{ term, sort: rootSort }]);
+      const rootClass = rootSort || 'root$class';
+      const { sorts, conflicts, ufs } = inferSorts([
+        { term, sort: rootClass },
+        { term: T.varRef(ROOT_PROBE, null), sort: rootClass },
+      ]);
+      // A genuine sort conflict - a term mixing `div` with real division, an
+      // Int-declared field in a Numeric arithmetic chain - is not a case: the
+      // emitter refuses such a query too, so there is nothing to agree about.
       if (conflicts.length) {
         skippedSort++;
         continue;
@@ -773,13 +899,16 @@ test(
       eligible++;
       if (ufs.size) withUf++;
       const interp = darInterpretation(ufs);
-      const numSort = intMode ? 'Int' : 'Real';
       for (let i = 0; i < 3; i++) {
         const env = new Map();
         const varSorts = new Map();
+        // Every variable is bound AT ITS INFERRED SORT, which is what keeps an
+        // Int-sorted symbol integral on both sides: the evaluator refuses a
+        // non-integer under `to_real` and valueToSmt refuses to render one as
+        // an Int literal, so a mismatch here fails loudly instead of being
+        // papered over.
         for (const name of varsOf(term)) {
-          const inferred = sorts.get(name);
-          const sort = inferred === 'Bool' || inferred === 'String' ? inferred : numSort;
+          const sort = sorts.get(name) || 'Real';
           varSorts.set(name, sort);
           env.set(
             name,
@@ -787,7 +916,7 @@ test(
               ? chance(rnd, 0.5)
               : sort === 'String'
                 ? `t${Math.floor(rnd() * 5)}`
-                : intMode
+                : sort === 'Int'
                   ? randomInt(rnd)
                   : randomRat(rnd)
           );
@@ -796,7 +925,7 @@ test(
         try {
           expected = evalTerm(term, env, interp);
         } catch (e) {
-          skippedSort++; // e.g. a fractional literal feeding div in Int mode
+          skippedSort++; // e.g. a fractional literal feeding div
           continue;
         }
         if (isUndef(expected)) {
@@ -805,15 +934,19 @@ test(
         }
         cases.push({
           term, env, varSorts, expected, interp, ufSorts: ufs,
-          mode: intMode ? 'Int' : 'Real',
+          expectedSort: sorts.get(ROOT_PROBE) || 'Real',
+          mode: 'Real',
         });
       }
     }
 
+    intRooted = cases.filter((c) => c.expectedSort === 'Int').length;
+    const coerced = cases.filter((c) => containsCoercion(c.term)).length;
     t.diagnostic(
       `DAR terms: ${candidates.length} candidates, ${eligible} eligible ` +
         `(${withUf} applying an uninterpreted symbol), ${skippedDirty} outside the fragment, ` +
-        `${skippedSort} sort-skipped, ${skippedUndef} undef; ${cases.length} differential cases`
+        `${skippedSort} sort-skipped, ${skippedUndef} undef; ${cases.length} differential cases ` +
+        `(${intRooted} Int-rooted, ${coerced} carrying an Int -> Real coercion)`
     );
     assert.ok(eligible > 0, 'no eligible terms in the DAR: the smoke test checked nothing');
     // The DAR does abstract text operations; if that stopped happening, this

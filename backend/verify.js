@@ -52,16 +52,29 @@
 //
 // What a PROVED here does NOT mean, stated where it cannot be missed:
 //   * Numeric 10 is modelled as exact Real (see smt.js) - rounding-dependent
-//     equalities are refused rather than proved wrongly. Daml's `Int` (Int64)
-//     is modelled as exact Real TOO, and that one cuts the other way: the
-//     emitter has no rule that yields the SMT `Int` sort, so an integer field
-//     is declared `Real` and carries no integrality constraint. Sound for
-//     PROVED (the solver quantifies over a superset of the reachable values),
-//     but it means a DISPROVED whose counterexample gives an INTEGER-declared
-//     field a fractional value - `x = (/ (- 1) 10)` for a field the package
-//     declares `Int` - is an artifact of this abstraction and not a behaviour
-//     of the code. Check a counterexample's values against the declared field
-//     types before treating it as a finding.
+//     equalities are refused rather than proved wrongly.
+//   * Daml's `Int` (Int64) is modelled as the SMT `Int` sort, WITH its
+//     integrality. This is the one modelling decision here that SHRINKS the
+//     model class rather than enlarging it, so it needs its own justification
+//     and it has exactly one: a Daml Int really is an integer, so no reachable
+//     state is excluded. It is a faithful refinement, not an assumption about
+//     the code - which is why it is the only place a constraint is added at
+//     all, and why Int-ness is taken from the DECLARED LF type and from
+//     nothing else (never a field's name, never how the code uses it, never a
+//     literal that looks integral). Where the declared type cannot be read the
+//     symbol stays `Real` and carries no integrality, which is the
+//     conservative side: it can only cost a proof, never fabricate one.
+//     The failure direction to keep in mind when reading a PROVED is a
+//     `Decimal` field wrongly typed `Int`: that would be a FALSE constraint,
+//     and a false constraint can make an unsat - and therefore a PROVED -
+//     spurious. dalf.js answers `int` only from the Int64 builtin in a
+//     `DefDataType` the archive actually carries.
+//   * The two numeric sorts are never mixed silently. An Int-sorted term
+//     reaching a Real position is either an explicit `to_real` coercion (the
+//     translation of Daml's `intToDecimal`) or a SORT CONFLICT that refuses
+//     the query with NOT-MODELLABLE. Daml permits no implicit Int/Decimal
+//     mixing, so a conflict means the translation got something wrong, and
+//     saying so is better than coercing a guess.
 //   * Guards that leave the fragment are dropped, which is sound for proving
 //     (superset of reachable states) but each drop is listed in the report.
 //   * Opaque Text operations are modelled as UNINTERPRETED FUNCTIONS (see the

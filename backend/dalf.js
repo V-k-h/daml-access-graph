@@ -1038,11 +1038,35 @@ function typeConName(tycon, ctx) {
 /**
  * BuiltinType -> the COARSE sort a property reasons about.
  *
- * Coarse on purpose. Nothing downstream needs to know that a field is
- * `Numeric 10` rather than `Int64`; what it needs to know is whether `>= 0` is
- * a question about that field at all. So the classification answers exactly
- * that much, and everything it does not recognise stays `unknown` - which
- * behaves as "no information", never as "not numeric".
+ * Coarse on purpose. What a property needs to know is whether `>= 0` is a
+ * question about the field at all, and everything this table does not
+ * recognise stays `unknown` - which behaves as "no information", never as
+ * "not numeric".
+ *
+ * `int` AND `numeric` ARE TWO SORTS, and the split is not cosmetic.
+ *
+ * Both are numbers and both carry the same obligations, so every consumer that
+ * treats `numeric` as "this is a number" treats `int` the same way. What
+ * differs is the SMT sort the symbol is declared at: `numeric` becomes `Real`,
+ * `int` becomes `Int`, and an `Int`-sorted symbol carries INTEGRALITY - the
+ * solver may not give it the value -1/10.
+ *
+ * The direction of that constraint is the thing to keep straight. Adding
+ * integrality SHRINKS the model class, which is the opposite direction from
+ * every other approximation in this pipeline (dropped guards, uninterpreted
+ * functions, symbolic list elements all ENLARGE it). It is nevertheless sound,
+ * and for one reason only: a Daml `Int` really is an integer, so no reachable
+ * state is excluded. It is a faithful refinement of the model, not an
+ * assumption about the code.
+ *
+ * The consequence is that a MIS-CLASSIFICATION here is unsound in the one
+ * direction this pipeline must never fail: typing a `Decimal` field as `int`
+ * would assert something false about the code and could make an unsat -- a
+ * PROVED -- spurious. So `int` is answered from the DECLARED LF type and from
+ * nothing else. Never from a field's name, never from its position, never from
+ * a literal that happens to look integral. Where the declared type is not
+ * available the field is `unknown` and the symbol keeps the `Real` treatment
+ * it had before this split existed, which is the conservative side.
  *
  * BIGNUMERIC is deliberately absent. It is a number, but it is also a type the
  * translator does not arithmetically model, and admitting it here would create
@@ -1053,7 +1077,7 @@ function typeConName(tycon, ctx) {
 const BT = S.ENUMS.BuiltinType;
 const BUILTIN_SORT = new Map([
   [BT.NUMERIC, 'numeric'],
-  [BT.INT64, 'numeric'],
+  [BT.INT64, 'int'],
   [BT.BOOL, 'bool'],
   [BT.TEXT, 'text'],
   [BT.PARTY, 'party'],
@@ -1061,6 +1085,23 @@ const BUILTIN_SORT = new Map([
   [BT.TIMESTAMP, 'time'],
   [BT.CONTRACT_ID, 'cid'],
 ]);
+
+/**
+ * The coarse sorts that make `>= 0` a question about a field: the two numeric
+ * ones and nothing else.
+ *
+ * One place, because every consumer of the classification has to agree about
+ * it: a consumer that checked for `numeric` alone would silently revert an
+ * `Int` field to the unknown class the moment the split above happened, and an
+ * unknown field is an unchecked obligation rather than a wrong answer - quiet,
+ * and exactly the kind of quiet this pipeline is built to avoid.
+ */
+export const NUMERIC_SORTS = new Set(['numeric', 'int']);
+
+/** Is this coarse sort one of the numeric ones (`numeric` or `int`)? */
+export function isNumericSort(sort) {
+  return NUMERIC_SORTS.has(sort);
+}
 
 /**
  * Classify a Type into `{sort, ref?}`.
@@ -1174,14 +1215,21 @@ function optionalOf(elem) {
  *                        is a number.
  *   `<path>.$some`   ->  `bool`. A fact about the encoding, not about T, so it
  *                        is answered whatever T is.
- *   `<path>.$value`  ->  T's sort, and ONLY when T is NUMERIC. A non-numeric
- *                        or unknown T answers null: the payload symbol is the
- *                        one that reaches arithmetic positions and seeds the
- *                        sort inference, and the numeric case is the one whose
- *                        consequences have been worked through. Nothing is
- *                        lost by the restriction - a property that needs to
- *                        know the field is not a number reads the `optional:`
- *                        sort of the path itself.
+ *   `<path>.$value`  ->  T's sort, and ONLY when T is NUMERIC (`numeric` or
+ *                        `int`). A non-numeric or unknown T answers null: the
+ *                        payload symbol is the one that reaches arithmetic
+ *                        positions and seeds the sort inference, and the
+ *                        numeric case is the one whose consequences have been
+ *                        worked through. Nothing is lost by the restriction -
+ *                        a property that needs to know the field is not a
+ *                        number reads the `optional:` sort of the path itself.
+ *
+ *                        The ELEMENT SORT is carried through unchanged rather
+ *                        than collapsed to `numeric`: an `Optional Int`'s
+ *                        payload is an Int, and answering `numeric` here would
+ *                        throw away the integrality of exactly the symbol that
+ *                        reaches the arithmetic - which is where it is worth
+ *                        something.
  *
  * Nothing is walked THROUGH `$value`: `<path>.$value.<field>` answers null
  * rather than descending into the payload's record, because the payload is a
@@ -1207,7 +1255,7 @@ export function resolveFieldSort(ctx, start, segments) {
       const rest = segments.length - (i + 1);
       if (rest === 0) return elem === 'unknown' ? null : `optional:${elem}`;
       if (rest === 1 && segments[i + 1] === '$some') return 'bool';
-      if (rest === 1 && segments[i + 1] === '$value') return elem === 'numeric' ? 'numeric' : null;
+      if (rest === 1 && segments[i + 1] === '$value') return isNumericSort(elem) ? elem : null;
       return null;
     }
 

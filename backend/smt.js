@@ -24,6 +24,26 @@
 // exact-value equalities on paths that round. Transitions carrying rounding
 // builtins are refused for equality properties rather than proved wrongly.
 //
+// Daml Int64 is a SEPARATE sort, the SMT integers, and it is the one thing
+// here that SHRINKS the model class instead of enlarging it. Every other
+// approximation in this file (dropped guards, uninterpreted functions,
+// symbolic list elements) is justified by "we quantified over a superset";
+// integrality cannot be, and is justified instead by being TRUE: a Daml Int is
+// an integer, so no reachable state is excluded and the model is refined
+// rather than assumed about. The consequence is that the failure direction
+// reverses for this one decision - a Decimal field wrongly given the Int sort
+// is a FALSE constraint and can make an unsat, and so a PROVED, spurious - so
+// Int-ness is read off the declared LF type alone (dalf.js) and off the INT64
+// arithmetic builtins (lfir.js), never inferred from a position.
+//
+// The two arithmetic sorts NEVER MIX SILENTLY. `intToDecimal` becomes an
+// explicit `to_real` coercion; anything else that unifies an Int class with a
+// Real one is a CONFLICT and refuses the query. Daml permits no implicit
+// Int/Decimal mixing, so a well-typed program cannot produce a mixed term and
+// a conflict says the translation attributed something wrongly - which makes
+// the conflict a useful check rather than a nuisance. Coercing instead would
+// be unsound in one of the two directions and lossy in the other.
+//
 // ---------------------------------------------------------------------------
 // UNINTERPRETED FUNCTIONS, and exactly what they cost. This one is asymmetric,
 // unlike the dropped-guard argument above, so it is spelled out in full.
@@ -107,6 +127,7 @@
 // rather than guessed at.
 // ---------------------------------------------------------------------------
 
+import { isNumericSort } from './dalf.js';
 import {
   T,
   hasUnsupported,
@@ -125,28 +146,117 @@ const sym = (name) => `|${name.replace(/[|\\]/g, '_')}|`;
 const OPS = new Set(['+', '-', '*', '/', 'div', 'mod', '<', '<=', '>', '>=', '=', 'not', 'and', 'or']);
 
 /**
+ * The two SMT arithmetic sorts a term can inhabit, decided from the term
+ * itself plus the sorts inferSorts resolved for its variables.
+ *
+ * Answers ONLY `true` (this term is Int-sorted) or `false` (it is not known to
+ * be). The asymmetry is deliberate and it is what keeps the change safe: every
+ * literal-rendering decision below is driven by POSITIVE evidence of Int-ness,
+ * so a term nothing types as an Int renders exactly the way it rendered before
+ * an Int sort existed.
+ *
+ * Evidence is the same three sources Int-ness has anywhere in this pipeline,
+ * all of them reads of the compiled package:
+ *   * a variable inferSorts resolved to `Int` (declared Int64, see dalf.js);
+ *   * a literal the LF decoder read out of an `int64` field;
+ *   * an arithmetic node tagged by an INT64 builtin, plus `div`/`mod`, which
+ *     no other builtin produces.
+ * A `toreal` node is the one place that answers `false` about an Int input,
+ * which is the entire point of it.
+ *
+ * `sorts` (from inferSorts) is authoritative for variables when it is
+ * supplied; without it the term's own `sort` field is used, which is what a
+ * caller rendering a hand-built term has (tests/differential.test.js).
+ */
+function termIsInt(t, sorts) {
+  if (!t || typeof t !== 'object') return false;
+  switch (t.k) {
+    case 'var':
+      return sorts ? sorts.get(t.name) === 'Int' : t.sort === 'Int';
+    case 'num':
+      return t.ns === 'Int';
+    case 'uf':
+      return t.sort === 'Int';
+    case 'toreal':
+      return false;
+    case 'ite':
+      return termIsInt(t.a, sorts) || termIsInt(t.b, sorts);
+    case 'app':
+      if (t.op === 'div' || t.op === 'mod') return true;
+      if (t.op === '/') return false;
+      if (t.op === '+' || t.op === '-' || t.op === '*') {
+        return t.ns === 'Int' || t.args.some((a) => termIsInt(a, sorts));
+      }
+      return false;
+    default:
+      return false;
+  }
+}
+
+/**
  * Render a term. Throws on `unsupported` - callers must have checked
  * modellability first, so reaching one here is a bug, not a report.
  *
- * `realNumerals` renders an integer-looking numeric literal as a REAL literal
- * (`0` -> `0.0`). SMT-LIB types a bare numeral as Int, and cvc5 coerces it in
- * arithmetic and equality contexts but NOT as an `ite` branch against a Real:
- * `(ite c |x.$value| 0)` - the shape the Optional encoding produces for
- * `fromOptional 0 x` - is rejected outright as "branches must have comparable
- * type". buildQuery passes true because every numeric position it emits is
- * Real (inferSorts has no rule that yields Int), and it is the only caller
- * that owns a whole script. The default stays off so that a caller rendering a
- * genuinely Int-sorted term - tests/differential.test.js generates div/mod
- * terms over Int variables - still gets numerals.
+ * Options (a bare boolean is accepted as `{realNumerals}`, which is how this
+ * was called before there were two of them):
+ *
+ *   `realNumerals`  render an integer-looking numeric literal in a REAL
+ *     position as a REAL literal (`0` -> `0.0`). SMT-LIB types a bare numeral
+ *     as Int, and cvc5 coerces it in arithmetic and equality contexts but NOT
+ *     as an `ite` branch against a Real: `(ite c |x.$value| 0)` - the shape
+ *     the Optional encoding produces for `fromOptional 0 x` - is rejected
+ *     outright as "branches must have comparable type". buildQuery passes true
+ *     because it owns a whole script.
+ *
+ *   `sorts`  the variable sorts inferSorts resolved, which is what makes the
+ *     numeral decision SORT-DIRECTED rather than global. An INT-sorted
+ *     position takes an integer numeral (`0`, `(- 1)`); a Real position keeps
+ *     the `0.0` rendering above. Getting this backwards is precisely the cvc5
+ *     rejection `realNumerals` was introduced for, so the rule is: a numeral
+ *     is written as an Int ONLY where something positively types the position
+ *     Int, and otherwise nothing about the old behaviour changes.
+ *
+ * A Real literal reaching an Int position throws rather than being emitted.
+ * inferSorts refuses such a query first (a Real-tagged literal unified into an
+ * Int class is a conflict), so this is a backstop against a future rule that
+ * forgets to; silently writing `10.0000000000` where an integer belongs is the
+ * failure mode this whole change has to make impossible.
  */
-export function termToSmt(t, realNumerals = false) {
-  const rec = (x) => termToSmt(x, realNumerals);
+export function termToSmt(t, opts = false) {
+  const o = typeof opts === 'boolean' ? { realNumerals: opts } : opts || {};
+  const realNumerals = !!o.realNumerals;
+  const sorts = o.sorts instanceof Map ? o.sorts : null;
+  // `intCtx` is true where the enclosing position is Int-sorted, and null
+  // where nothing says so - never false, because "not known to be Int" and
+  // "known to be Real" call for the same rendering and conflating them keeps
+  // the rule to one direction.
+  const emit = (x, intCtx) => termToSmtAt(x, intCtx, realNumerals, sorts);
+  return emit(t, termIsInt(t, sorts) ? true : null);
+}
+
+function termToSmtAt(t, intCtx, realNumerals, sorts) {
+  const isInt = (x) => termIsInt(x, sorts);
+  const emit = (x, ctx) => termToSmtAt(x, ctx, realNumerals, sorts);
+  /** The numeric context shared by the operands of a comparison or equality. */
+  const operandCtx = (args) => (args.some(isInt) ? true : null);
+  const rec = (x) => emit(x, intCtx);
   switch (t.k) {
     case 'num': {
       // LF numeric literals arrive as decimal strings ("0.0000000000"),
       // which SMT-LIB accepts as Real literals. Negatives need wrapping.
       let v = String(t.v);
-      if (realNumerals && !v.includes('.')) v = `${v}.0`;
+      const asInt = t.ns === 'Int' || intCtx === true;
+      if (asInt) {
+        if (v.includes('.')) {
+          throw new Error(
+            `smt: the Real literal ${v} reached an Int-sorted position; a numeric literal is ` +
+              `typed by the LF field it was read out of and the two sorts are never mixed ` +
+              `silently`
+          );
+        }
+      } else if (realNumerals && !v.includes('.')) {
+        v = `${v}.0`;
+      }
       return v.startsWith('-') ? `(- ${v.slice(1)})` : v;
     }
     case 'str': {
@@ -173,16 +283,44 @@ export function termToSmt(t, realNumerals = false) {
       return sym(dconSymbol(t));
     case 'app': {
       if (!OPS.has(t.op)) throw new Error(`smt: unknown operator ${t.op}`);
-      return `(${t.op} ${t.args.map(rec).join(' ')})`;
+      // Each operator says what its OPERANDS' numeric context is. `and`/`or`/
+      // `not` take Bools (no numeral to place); `div`/`mod` are Int-only and
+      // `/` Real-only in SMT-LIB; `+`/`-`/`*` pass the node's own sort down;
+      // and the comparisons and `=` are polymorphic, so their operands share
+      // whatever sort the operands themselves establish.
+      let argCtx;
+      if (t.op === 'and' || t.op === 'or' || t.op === 'not') argCtx = null;
+      else if (t.op === 'div' || t.op === 'mod') argCtx = true;
+      else if (t.op === '/') argCtx = null;
+      else if (t.op === '+' || t.op === '-' || t.op === '*') argCtx = isInt(t) ? true : null;
+      else argCtx = operandCtx(t.args);
+      return `(${t.op} ${t.args.map((a) => emit(a, argCtx)).join(' ')})`;
     }
+    case 'toreal':
+      // The exact injection of the integers into the reals. Its argument is an
+      // Int position by construction (see lfir.js EXACT_CONVERSION).
+      return `(to_real ${emit(t.a, true)})`;
     case 'uf':
       // An uninterpreted application. A nullary one is applied as a bare
       // symbol, which is what SMT-LIB does with a 0-arity declare-fun.
+      // A DECLARED parameter sort types its argument's position.
       return t.args.length
-        ? `(${sym(t.name)} ${t.args.map(rec).join(' ')})`
+        ? `(${sym(t.name)} ${t.args
+            .map((a, i) => {
+              // A DECLARED parameter sort is authoritative; otherwise the
+              // argument types its own position.
+              const declared = t.argSorts && t.argSorts[i];
+              if (declared) return emit(a, declared === 'Int' ? true : null);
+              return emit(a, isInt(a) ? true : null);
+            })
+            .join(' ')})`
         : sym(t.name);
-    case 'ite':
-      return `(ite ${rec(t.c)} ${rec(t.a)} ${rec(t.b)})`;
+    case 'ite': {
+      // The branches share the ite's own sort, which the branches themselves
+      // may establish even when the enclosing position says nothing.
+      const branchCtx = isInt(t) ? true : intCtx;
+      return `(ite ${emit(t.c, null)} ${emit(t.a, branchCtx)} ${emit(t.b, branchCtx)})`;
+    }
     case 'record':
       throw new Error('smt: a whole record reached the emitter');
     case 'fold':
@@ -264,6 +402,13 @@ export function inferSorts(terms, seeds = []) {
   // adding it here cannot move any position that used to resolve to Real.
   const CONCRETE = new Set(['Bool', 'Real', 'Int', 'String', 'Party']);
   /**
+   * The two ARITHMETIC sorts. A position that requires "a number" without
+   * saying which - a comparison operand, an untagged literal, an untagged
+   * `+` - is satisfied by either, so such a position is recorded as a hint
+   * rather than pinned. See `numericPositions`.
+   */
+  const NUMERIC = new Set(['Real', 'Int']);
+  /**
    * DATATYPE SORTS discovered in the terms: sort name -> its constructor list.
    *
    * A Daml enum (and a variant's discriminant) becomes an SMT algebraic
@@ -284,6 +429,25 @@ export function inferSorts(terms, seeds = []) {
   /** union-find parent pointers; a concrete sort name is its own root */
   const parent = new Map();
   const conflicts = [];
+  /**
+   * Class ids used in a position that requires A NUMBER but does not say which
+   * of the two arithmetic sorts.
+   *
+   * Before there was an Int sort, such a position simply pinned Real, because
+   * Real was the only number there was. Pinning it now would be wrong in both
+   * directions at once: it would make `x >= 0` on a declared-Int field a sort
+   * CONFLICT (a refused query where a proof was available), and it would still
+   * be pretending that a position which merely requires arithmetic has decided
+   * between the sorts. SMT-LIB's comparisons are genuinely polymorphic over
+   * Int and Real, so the honest encoding is a hint: it rules out Bool, String,
+   * Party and the datatype sorts - a conflict, exactly as before - and lets
+   * whichever arithmetic sort the term itself establishes win.
+   *
+   * Resolved AFTER every union, so the root each id lands in is final.
+   * A hinted class that nothing else types still resolves to Real, which is
+   * the default it has always had.
+   */
+  const numericPositions = [];
   /** var names in encounter order, so the declaration list is stable */
   const varNames = [];
   const seenVar = new Set();
@@ -313,15 +477,62 @@ export function inferSorts(terms, seeds = []) {
     const ca = CONCRETE.has(ra);
     const cb = CONCRETE.has(rb);
     if (ca && cb) {
-      conflicts.push(`${describe(a)} used as both ${ra} and ${rb}`);
+      conflicts.push(describeConflict(a, ra, b, rb));
       return;
     }
     // a concrete sort always becomes the root, so a class carries its sort
     if (ca) parent.set(rb, ra);
     else parent.set(ra, rb);
   };
-  const describe = (id) =>
-    id.startsWith('v:') ? id.slice(2) : id.startsWith('u:') ? `\`${id.slice(2)}\`` : id;
+  const describe = (id) => {
+    if (id.startsWith('v:')) return id.slice(2);
+    if (id.startsWith('u:')) return `\`${id.slice(2)}\``;
+    // The synthetic classes the walker introduces for a polymorphic position.
+    // Rendering them as `=3` told a reader nothing; naming the position does.
+    if (/^=\d+$/.test(id)) return 'the shared sort of an equality\'s operands';
+    if (/^cmp\d+$/.test(id)) return "the shared sort of a comparison's operands";
+    return id;
+  };
+  /**
+   * A conflict message that NAMES the two positions.
+   *
+   * The old form reported only the id the unification was attempted from,
+   * which for an equality or comparison group is a synthetic name (`=3`) that
+   * says nothing at all. Both sides are reported now, because the side that
+   * identifies the problem is usually the other one.
+   *
+   * The Int/Real case gets its own sentence. Daml has no implicit Int/Decimal
+   * mixing - every conversion between them is an explicit builtin - so a
+   * well-typed program cannot put the two sorts in one arithmetic term, and
+   * meeting one means either a declared type was attributed to the wrong
+   * projection path or a conversion was not translated. It is REFUSED rather
+   * than reconciled: coercing one way would drop the integrality of an Int
+   * field (losing proofs, which is merely a shame), and coercing the other
+   * would assert integrality of a Decimal field, which is a false constraint
+   * and makes any resulting PROVED unsound.
+   */
+  const describeConflict = (a, ra, b, rb) => {
+    const left = describe(a);
+    const right = describe(b);
+    const mixesNumerics = (ra === 'Int' && rb === 'Real') || (ra === 'Real' && rb === 'Int');
+    if (mixesNumerics) {
+      return (
+        `${left} (${ra}) and ${right} (${rb}) meet in one arithmetic term at two different ` +
+        `numeric sorts. Daml permits no implicit Int/Decimal mixing - every conversion between ` +
+        `them is an explicit builtin, translated as a \`to_real\` coercion - so a well-typed ` +
+        `program cannot produce this term: either a declared field type was attributed to the ` +
+        `wrong projection path, or a conversion was not translated. Refused rather than coerced, ` +
+        `because asserting integrality of a value that is not an integer would make a PROVED ` +
+        `unsound`
+      );
+    }
+    return `${left} used as ${ra} and ${right} as ${rb}`;
+  };
+  /** Record that this position requires a number, without choosing a sort. */
+  const numeric = (id) => {
+    node(id);
+    numericPositions.push(id);
+  };
 
   let fresh = 0;
   const walk = (t, id) => {
@@ -332,6 +543,14 @@ export function inferSorts(terms, seeds = []) {
           seenVar.add(t.name);
           varNames.push(t.name);
         }
+        // A DECLARED Int sort PINS the class, the way a party constant does.
+        // `Real` deliberately does not: Real is the emitter's default for
+        // every class nothing typed, so a term carrying `sort: 'Real'` is
+        // saying "no information", not "this is a Real". `Int` is only ever
+        // set from the package's own Int64 declaration (lfir.js: symbol, via
+        // dalf.js fieldSort), so it IS information, and pinning it here is
+        // what carries integrality into the query.
+        if (t.sort === 'Int') union(`v:${t.name}`, 'Int');
         union(id, `v:${t.name}`);
         return;
       case 'party':
@@ -376,7 +595,24 @@ export function inferSorts(terms, seeds = []) {
         if (t.value) walk(t.value, id);
         return;
       case 'num':
+        // A literal the LF decoder read out of a package carries the sort of
+        // the field it came from and PINS it, so a Numeric literal meeting an
+        // Int-sorted term is a conflict rather than a silent coercion - which
+        // is a useful check on the translation, since Daml does not permit
+        // implicit Int/Decimal mixing and a well-typed program cannot produce
+        // one. A literal a PROPERTY wrote (the `0` in `x >= 0`) carries no
+        // tag: its sort is whatever the term it is stated about turns out to
+        // be, so it only hints.
+        if (t.ns === 'Int' || t.ns === 'Real') union(id, t.ns);
+        else numeric(id);
+        return;
+      case 'toreal':
+        // `to_real` is Int -> Real: its result is a Real position and its
+        // argument an Int one, both pinned. This is the ONE place an Int
+        // -sorted term is allowed to reach a Real position, and it is allowed
+        // because the coercion is written down in the script.
         union(id, 'Real');
+        walk(t.a, 'Int');
         return;
       case 'str':
         union(id, 'String');
@@ -418,11 +654,31 @@ export function inferSorts(terms, seeds = []) {
           const group = `=${fresh++}`;
           t.args.forEach((a) => walk(a, group));
         } else if (['<', '<=', '>', '>='].includes(t.op)) {
+          // Polymorphic over the arithmetic sorts, exactly like `=` is over
+          // every sort: the operands share ONE class, which the operands
+          // themselves type. Unpinned it defaults to Real, as it always did.
           union(id, 'Bool');
-          t.args.forEach((a) => walk(a, 'Real'));
-        } else {
+          const group = `cmp${fresh++}`;
+          numeric(group);
+          t.args.forEach((a) => walk(a, group));
+        } else if (t.op === 'div' || t.op === 'mod') {
+          // SMT-LIB types `div`/`mod` at Int only, and they are produced by
+          // DIV_INT64/MOD_INT64 and nothing else.
+          union(id, 'Int');
+          t.args.forEach((a) => walk(a, 'Int'));
+        } else if (t.op === '/') {
+          // SMT-LIB `/` is real division, and DIV_NUMERIC is its only source.
           union(id, 'Real');
           t.args.forEach((a) => walk(a, 'Real'));
+        } else {
+          // `+`, `-`, `*`: one sort shared by the result and every operand.
+          // WHICH sort comes from the builtin that produced the node
+          // (BINOP_NUM_SORT in lfir.js) when there was one; a hand-built term
+          // carries no tag and the class is merely numeric, defaulting to
+          // Real as before.
+          if (t.ns === 'Int' || t.ns === 'Real') union(id, t.ns);
+          else numeric(id);
+          t.args.forEach((a) => walk(a, id));
         }
         return;
       }
@@ -445,6 +701,20 @@ export function inferSorts(terms, seeds = []) {
     union(`v:${name}`, sort);
   }
 
+  // The numeric HINTS, resolved once every union (positions and seeds alike)
+  // is in. A hinted class that landed on a concrete NON-arithmetic sort is a
+  // conflict - the same refusal `(< x "a")` always produced, now stated in
+  // terms of the position rather than of a Real that was never really there.
+  const numericRoots = new Set();
+  for (const id of numericPositions) {
+    const r = node(id);
+    if (!CONCRETE.has(r)) {
+      numericRoots.add(r);
+    } else if (!NUMERIC.has(r)) {
+      conflicts.push(`${describe(id)} is used in a numeric position but is ${r}`);
+    }
+  }
+
   const resolve = (id) => {
     const r = node(id);
     return CONCRETE.has(r) ? r : 'Real';
@@ -462,8 +732,14 @@ export function inferSorts(terms, seeds = []) {
    */
   const pinned = new Set();
   for (const name of varNames) {
-    sorts.set(name, resolve(`v:${name}`));
-    if (CONCRETE.has(node(`v:${name}`))) pinned.add(name);
+    const root = node(`v:${name}`);
+    sorts.set(name, CONCRETE.has(root) ? root : 'Real');
+    // A class a NUMERIC POSITION reached is pinned in the sense this set
+    // means - its sort came from the terms and not from the default - even
+    // though the position left the choice between Int and Real open. That is
+    // the same evidence `<`/`+` used to give by pinning Real outright, so
+    // numericEvidence sees exactly what it saw before.
+    if (CONCRETE.has(root) || numericRoots.has(root)) pinned.add(name);
   }
   const ufs = new Map();
   for (const name of ufNames) {
@@ -500,6 +776,13 @@ export function buildQuery(guards, goal) {
   lines.push('(set-option :produce-models true)');
   // The uninterpreted sort, declared only when the query actually uses it, so
   // every script this pipeline used to emit is byte-for-byte what it was.
+  // `Int` needs no declaration of any kind - it is a built-in SMT-LIB sort, so
+  // a symbol simply comes out `(declare-const |x| Int)` below, and with it the
+  // INTEGRALITY the package's `Int64` declaration asserts. That constraint
+  // SHRINKS the model class, unlike every other approximation here, and it is
+  // sound only because a Daml Int really is an integer: no reachable state is
+  // excluded, so it is a faithful refinement rather than an assumption. Which
+  // symbols get it is decided in dalf.js, from the declared LF type alone.
   if ([...sorts.values()].includes('Party')) lines.push('(declare-sort Party 0)');
   // Daml enums (and variant discriminants) as SMT ALGEBRAIC DATATYPES,
   // declared on demand for the same reason. The declaration carries the
@@ -521,8 +804,13 @@ export function buildQuery(guards, goal) {
       `(declare-fun ${sym(name)} (${sig.args.map(sortText).join(' ')}) ${sortText(sig.ret)})`
     );
   }
-  for (const g of guards) lines.push(`(assert ${termToSmt(g, true)})`);
-  lines.push(`(assert (not ${termToSmt(goal, true)}))`);
+  // Numerals are rendered SORT-DIRECTED: `sorts` is what tells termToSmt that
+  // `|x|` is an `Int` and its `0` must therefore be the numeral `0` rather
+  // than `0.0`. Passing it is not optional - a Real literal in an Int position
+  // (or the reverse) is a script cvc5 rejects outright.
+  const opts = { realNumerals: true, sorts };
+  for (const g of guards) lines.push(`(assert ${termToSmt(g, opts)})`);
+  lines.push(`(assert (not ${termToSmt(goal, opts)}))`);
   lines.push('(check-sat)');
   lines.push('(get-model)');
   return {
@@ -799,14 +1087,32 @@ export function divisionSafety(transition) {
   // prove the ones we can and name the ones we cannot. `coverage` carries
   // that split to the report, which never prints a bare PROVED when some
   // denominator went unchecked.
+  const { used, dropped } = usableGuards(transition);
+
   const checkable = [];
   const skipped = [];
   for (const d of transition.divisions) {
     if (hasUnsupported(d.denominator)) {
       skipped.push(unsupportedReasons(d.denominator).map((u) => u.why).join('; '));
-    } else {
-      checkable.push(d);
+      continue;
     }
+    // A denominator that cannot be SORTED alongside the guards is exactly as
+    // unadjudicable as one carrying an unsupported node, and it is skipped the
+    // same way rather than refusing the whole transition. That is the reason
+    // this check is per-denominator at all: one term the emitter cannot place
+    // must not take the ones it can down with it. The conflict that actually
+    // occurs is an Int-declared symbol meeting Numeric arithmetic, which says
+    // the translation attributed a declared type to the wrong projection path
+    // - a real gap, named on the verdict, never coerced away.
+    const { conflicts } = inferSorts([
+      ...used.map((g) => ({ term: g, sort: 'Bool' })),
+      { term: d.denominator, sort: 'denominator' },
+    ]);
+    if (conflicts.length) {
+      skipped.push(`the denominator is not well sorted: ${conflicts.join('; ')}`);
+      continue;
+    }
+    checkable.push(d);
   }
 
   if (checkable.length === 0) {
@@ -828,7 +1134,6 @@ export function divisionSafety(transition) {
       args: [{ k: 'app', op: '=', args: [d.denominator, { k: 'num', v: '0' }] }],
     })),
   };
-  const { used, dropped } = usableGuards(transition);
 
   // Denominators recovered from an unrolled fold step exist only for the
   // element indices the unrolling reached. Proving those says nothing about
@@ -979,7 +1284,11 @@ function numericEvidence(term, isRealVar) {
     case 'var':
       return isRealVar(term.name);
     case 'uf':
-      return term.sort === 'Real';
+      return term.sort === 'Real' || term.sort === 'Int';
+    case 'toreal':
+      // An explicit Int -> Real coercion. Its result is a number by
+      // construction, exactly as an arithmetic operator's is.
+      return true;
     case 'ite':
       // Both branches share one sort, so evidence from either types the whole.
       return numericEvidence(term.a, isRealVar) || numericEvidence(term.b, isRealVar);
@@ -1021,12 +1330,47 @@ const NON_NUMERIC_SORTS = new Set(['party', 'text', 'time', 'cid', 'bool', 'reco
  * one place the answer is written down.
  *
  * `optional:numeric` is deliberately NOT excluded: it IS a question, just a
- * guarded one (`$some => $value >= 0`), and it is adjudicated below.
+ * guarded one (`$some => $value >= 0`), and it is adjudicated below. Neither
+ * is `int` or `optional:int`: an Int field is a number, so `>= 0` is exactly
+ * as much a question about it as about a Decimal. The two coarse sorts differ
+ * in the SMT sort their symbol is declared at, never in whether they carry
+ * this property's obligations - a consumer that split them here would silently
+ * drop every obligation on every integer field in the corpus.
  */
 function notNumericQuestion(sort) {
   if (!sort) return false;
   if (NON_NUMERIC_SORTS.has(sort)) return true;
   return sort.startsWith('optional:') && NON_NUMERIC_SORTS.has(sort.slice('optional:'.length));
+}
+
+/**
+ * Is this the declared sort of an OPTIONAL number - `optional:numeric` or
+ * `optional:int`?
+ *
+ * One predicate for both, in one place, because every site that asks the
+ * question wants the same answer for the two: the guarded obligation
+ * `$some => $value >= 0` is the statement in either case, and only the sort
+ * the payload symbol is declared at differs.
+ */
+function isOptionalNumericSort(sort) {
+  return typeof sort === 'string' && sort.startsWith('optional:') &&
+    isNumericSort(sort.slice('optional:'.length));
+}
+
+/** How a numeric declared sort is named in a coverage message. */
+function describeNumericSort(sort) {
+  switch (sort) {
+    case 'numeric':
+      return 'numeric';
+    case 'int':
+      return '`Int`';
+    case 'optional:numeric':
+      return '`Optional Numeric`';
+    case 'optional:int':
+      return '`Optional Int`';
+    default:
+      return String(sort);
+  }
 }
 
 /**
@@ -1058,10 +1402,18 @@ function optionalParts(term, declared, sort) {
       return { some: term.some, value: term.value || null };
     case 'var': {
       const s = sort || (declared && declared.get(term.name));
-      if (s !== 'optional:numeric') return null;
+      // The ELEMENT SORT decides what the payload symbol is declared at: an
+      // `Optional Int`'s `$value` is an Int and carries integrality, an
+      // `Optional Decimal`'s is a Real and does not. Collapsing the two would
+      // throw away exactly the fact that is worth having, since `$value` is
+      // the half of the pair that reaches arithmetic. lfir.js gives the very
+      // same symbol the very same sort when it registers it, from the same
+      // declaration, so the two agree by construction rather than by luck.
+      const elem = typeof s === 'string' && s.startsWith('optional:') ? s.slice('optional:'.length) : null;
+      if (!isNumericSort(elem)) return null;
       return {
         some: { k: 'var', name: `${term.name}.$some`, sort: 'Bool' },
-        value: { k: 'var', name: `${term.name}.$value`, sort: 'Real' },
+        value: { k: 'var', name: `${term.name}.$value`, sort: elem === 'int' ? 'Int' : 'Real' },
       };
     }
     case 'ite': {
@@ -1090,9 +1442,18 @@ const NESTED_RECORD_CAVEAT =
   'fields a create assigns and does not descend into them, so numeric fields INSIDE those ' +
   'records are not examined here and this verdict says nothing about them';
 
-/** Declared coarse sort -> the SMT sort it seeds inferSorts with. */
+/**
+ * Declared coarse sort -> the SMT sort it seeds inferSorts with.
+ *
+ * `int` seeds `Int`, which is the second route integrality reaches a query by
+ * (the first being the symbol's own sort, set in lfir.js from the same
+ * declaration). Seeds are applied after every position has been walked and
+ * only to symbols the terms mention, so this cannot move a sort a position
+ * already decided - see the seeds note on inferSorts.
+ */
 const DECLARED_SMT_SORT = new Map([
   ['numeric', 'Real'],
+  ['int', 'Int'],
   ['text', 'String'],
   ['bool', 'Bool'],
   ['party', 'Party'],
@@ -1291,7 +1652,7 @@ export function nonNegativeFields(transition) {
       const parts = optionalParts(term, declared, sort);
       if (parts && !hasUnsupported(parts.some)) {
         const numeric =
-          sort === 'optional:numeric' ||
+          isOptionalNumericSort(sort) ||
           (parts.value && !hasUnsupported(parts.value) && numericEvidence(parts.value, isRealVar));
         if (numeric) {
           if (!parts.value) {
@@ -1325,10 +1686,10 @@ export function nonNegativeFields(transition) {
         // NOT assumed non-negative: an unreadable field is an unanswered
         // question, and it is reported as one.
         const why = unsupportedReasons(term).map((u) => u.why).join('; ');
-        if (sort === 'numeric' || sort === 'optional:numeric') {
+        if (isNumericSort(sort) || isOptionalNumericSort(sort)) {
           skippedNumeric++;
           skipped.push(
-            `${at} is declared ${sort === 'numeric' ? 'numeric' : '`Optional Numeric`'} by the ` +
+            `${at} is declared ${describeNumericSort(sort)} by the ` +
               `package but its value is outside the fragment: ${why}`
           );
         } else {
@@ -1337,18 +1698,18 @@ export function nonNegativeFields(transition) {
         }
         continue;
       }
-      if (sort === 'optional:numeric') {
+      if (isOptionalNumericSort(sort)) {
         // Readable, declared an Optional number, but not a shape whose pair
         // the translation can name. A real gap, not an unknown.
         skippedNumeric++;
         skipped.push(
-          `${at} is declared \`Optional Numeric\` by the package but the value assigned is not a ` +
+          `${at} is declared ${describeNumericSort(sort)} by the package but the value assigned is not a ` +
             `shape whose \`$some\`/\`$value\` pair the translation can name, so the guarded ` +
             `obligation \`$some => $value >= 0\` cannot be stated`
         );
         continue;
       }
-      if (sort === 'numeric' || numericEvidence(term, isRealVar)) {
+      if (isNumericSort(sort) || numericEvidence(term, isRealVar)) {
         checkable.push({ at, term, path: usablePath, droppedPath });
         continue;
       }

@@ -294,6 +294,7 @@ import {
   makeCtx,
   extractTransitions,
   BF,
+  ROUNDING as ROUNDING_SET,
 } from '../backend/lfir.js';
 
 // protobuf encoding helpers (test-only), same style as dalf.test.js
@@ -404,6 +405,15 @@ const exprProj = (recordExpr, fieldSi) =>
     )
   );
 const exprInt = (n) => msg(bf(S.Expr.builtinLit, msg(vf(S.BuiltinLit.int64, n))));
+/**
+ * A NUMERIC literal, by interned-string index. Distinct from exprInt because
+ * the two are different LF fields and therefore different SMT sorts: an
+ * `int64` literal is typed at Int and a `numeric` one at Real, and a fixture
+ * that uses the wrong one is not well typed Daml and is refused as a sort
+ * conflict rather than silently coerced.
+ */
+const exprNumeric = (si) =>
+  msg(bf(S.Expr.builtinLit, msg(vf(S.BuiltinLit.numericInternedStr, si))));
 const APP = S.message('Expr.App');
 const exprApp = (funExpr, argExprs) =>
   msg(bf(S.Expr.app, msg(bf(APP.fun, funExpr), ...argExprs.map((a) => bf(APP.args, a)))));
@@ -1186,7 +1196,12 @@ test('division-safety is bounded when a denominator comes from an unrolled fold 
  *   template Tok, consuming choice Merge with arg:
  *     [viaMapA] tokens <- DA.Internal.Prelude:mapA fetch arg.holdings
  *     _        <- DA.Foldable:mapA_ (\cid -> exercise @Holding Archive cid) arg.holdings
- *     create this with amount = this.amount + FOLDL (\acc t -> acc + t.amount) 0 <list>
+ *     create this with amount = this.amount + FOLDL (\acc t -> acc + t.amount) 0.0 <list>
+ *
+ * The fold's zero is a NUMERIC literal, matching the ADD_NUMERIC steps above
+ * it: Daml has no implicit Int/Decimal mixing, so a `Decimal` fold's zero
+ * compiles to a numeric literal and an int64 one there would be ill typed -
+ * and is reported as a sort conflict rather than coerced.
  *
  * `<list>` is `arg.holdings` directly, or `tokens` when viaMapA - which is the
  * shape a real merge compiles to, and the one that breaks if element symbols
@@ -1205,6 +1220,7 @@ function buildMergeFixtureDalf({
     'this', 'self', 'arg', 'amount', 'holdings', 'others', 'acc', 't', 'cid', 'h',
     'tokens', 'ignored', 'Archive', 'Merge', 'pkg', '1.0.0',
     'Mod', 'Tok', 'Holding', 'DA', 'Foldable', 'mapA_', 'Internal', 'Prelude', 'mapA',
+    '0.0000000000',
   ];
   const SI = Object.fromEntries(strings.map((s, i) => [s, i]));
 
@@ -1284,7 +1300,11 @@ function buildMergeFixtureDalf({
     ? exprAbs(SI.t, exprAbs(SI.acc, exprApp(exprBuiltin(BF.ADD_NUMERIC), [contribution, exprVar(SI.acc)])))
     : exprAbs(SI.acc, exprAbs(SI.t, exprApp(exprBuiltin(BF.ADD_NUMERIC), [exprVar(SI.acc), contribution])));
   const foldedList = viaMapA ? exprVar(SI.tokens) : holdingsExpr;
-  const foldExpr = exprApp(exprBuiltin(foldr ? BF.FOLDR : BF.FOLDL), [step, exprInt(0), foldedList]);
+  const foldExpr = exprApp(exprBuiltin(foldr ? BF.FOLDR : BF.FOLDL), [
+    step,
+    exprNumeric(SI['0.0000000000']),
+    foldedList,
+  ]);
 
   const CREATE = S.message('Update.Create');
   const createTok = msg(
@@ -1370,7 +1390,7 @@ test('a compiled FOLDL is unrolled, keyed to the list it ranges over', () => {
   assert.deepEqual([...foldLists(amount)], ['arg.holdings']);
   assert.equal(
     termToSmt(instantiateFolds(amount, 2)),
-    '(+ |this.amount| (+ (+ 0 |arg.holdings$0.amount|) |arg.holdings$1.amount|))'
+    '(+ |this.amount| (+ (+ 0.0000000000 |arg.holdings$0.amount|) |arg.holdings$1.amount|))'
   );
   assert.deepEqual(
     t.listElements,
@@ -1388,7 +1408,7 @@ test('a compiled FOLDR unrolls from the right, element first', () => {
   const t = mergeFixture({ foldr: true });
   assert.equal(
     termToSmt(instantiateFolds(t.creates[0].fields.amount, 2)),
-    '(+ |this.amount| (+ |arg.holdings$0.amount| (+ |arg.holdings$1.amount| 0)))'
+    '(+ |this.amount| (+ |arg.holdings$0.amount| (+ |arg.holdings$1.amount| 0.0000000000)))'
   );
 });
 
@@ -1962,17 +1982,26 @@ test('non-negative-fields: an inherited field is disclosed, not counted as check
  * builds can be walked back to a declared sort:
  *
  *   data TokenData = TokenData with rate : Numeric 10; name : Text
- *   data SetArg    = SetArg    with newAmount : Numeric 10; memo : Text
+ *   data SetArg    = SetArg    with newAmount : Numeric 10; newCount : Int64;
+ *                                  memo : Text
  *   template Token with owner : Party; amount : Numeric 10; fee : Numeric 10;
- *                       info : TokenData
+ *                       count : Int64; info : TokenData
  *     choice Set : SetArg
  *       do create Token with owner = this.owner, amount = arg.newAmount,
- *                            fee = this.info.rate, info = this.info
+ *                            fee = this.info.rate, count = arg.newCount,
+ *                            info = this.info
+ *
+ * The record carries BOTH numeric types on purpose: `Decimal` (Numeric 10) and
+ * `Int` (Int64) are two coarse sorts and two SMT sorts, and only the second
+ * carries integrality. Having both in one fixture is what lets a test pin the
+ * split AND pin that the Decimal side did not acquire an integrality
+ * constraint it has no right to.
  */
 function buildTypedTemplateDalf() {
   const strings = [
     'Mod', 'Token', 'TokenData', 'SetArg', 'Set', 'this', 'arg',
     'owner', 'amount', 'fee', 'info', 'rate', 'name', 'newAmount', 'memo',
+    'count', 'newCount',
     'pkg', '1.0.0',
   ];
   const SI = Object.fromEntries(strings.map((x, i) => [x, i]));
@@ -2038,6 +2067,7 @@ function buildTypedTemplateDalf() {
                 recField(SI.owner, proj(thisVar, SI.owner)),
                 recField(SI.amount, proj(argVar, SI.newAmount)),
                 recField(SI.fee, proj(proj(thisVar, SI.info), SI.rate)),
+                recField(SI.count, proj(argVar, SI.newCount)),
                 recField(SI.info, proj(thisVar, SI.info))
               )
             )
@@ -2060,12 +2090,18 @@ function buildTypedTemplateDalf() {
   const module = msg(
     vf(S.Module.nameInternedDname, DN.Mod),
     record(DN.TokenData, field(SI.rate, numericType), field(SI.name, builtinType(BT.TEXT))),
-    record(DN.SetArg, field(SI.newAmount, numericType), field(SI.memo, builtinType(BT.TEXT))),
+    record(
+      DN.SetArg,
+      field(SI.newAmount, numericType),
+      field(SI.newCount, builtinType(BT.INT64)),
+      field(SI.memo, builtinType(BT.TEXT))
+    ),
     record(
       DN.Token,
       field(SI.owner, builtinType(BT.PARTY)),
       field(SI.amount, numericType),
       field(SI.fee, numericType),
+      field(SI.count, builtinType(BT.INT64)),
       field(SI.info, conType(DN.TokenData))
     ),
     bf(
@@ -2101,6 +2137,9 @@ test('field types reach the IR: symbols carry the sort the package declares', ()
     'this.owner': 'party',
     // rooted at the choice ARGUMENT's own record, via the binder's type
     'arg.newAmount': 'numeric',
+    // an Int64 field is `int`, NOT `numeric`: the same obligations, a
+    // different SMT sort, and only this one carries integrality
+    'arg.newCount': 'int',
     // a NESTED path, walked one hop through the declared record field
     'this.info.rate': 'numeric',
     'this.info': 'record',
@@ -2116,6 +2155,7 @@ test('the CREATED record\'s own declared field sorts are attached to each create
     owner: 'party',
     amount: 'numeric',
     fee: 'numeric',
+    count: 'int',
     info: 'record',
   });
 });
@@ -2129,12 +2169,17 @@ test('field types reach the property: the party field is excluded, the numerics 
   assert.equal(inst.applicable, true);
   assert.deepEqual(
     { checked: inst.coverage.checked, total: inst.coverage.total, excluded: inst.coverage.excluded },
-    { checked: 2, total: 2, excluded: 2 }
+    { checked: 3, total: 3, excluded: 2 }
   );
   assert.deepEqual(inst.coverage.excludedFields.sort(), ['Token.info (record)', 'Token.owner (party)']);
   const smt = termToSmt(inst.goal);
   assert.match(smt, /\(>= \|arg\.newAmount\| 0\)/);
   assert.match(smt, /\(>= \|this\.info\.rate\| 0\)/);
+  // An Int field is an obligation of this property exactly like a Decimal one.
+  // Splitting the coarse sort without teaching this consumer about `int` would
+  // have dropped it silently into the unknown class - an unchecked obligation,
+  // quiet and wrong.
+  assert.match(smt, /\(>= \|arg\.newCount\| 0\)/);
   assert.doesNotMatch(smt, /owner/, 'a Party must never reach a `>= 0`');
 });
 
@@ -3282,7 +3327,8 @@ test('enum case: a literal constructor scrutinee decides the case exactly', () =
   );
   // Evaluation, not abstraction: no test is emitted and the branches not taken
   // are never translated.
-  assert.deepEqual(term, { k: 'num', v: '2' });
+  // An `int64` literal, so the term carries the Int arithmetic sort.
+  assert.deepEqual(term, { k: 'num', v: '2', ns: 'Int' });
   // ...and a constructor that matches nothing aborts rather than falling out.
   const none = translateExpr(
     decodeMessage(caseOf(exprEnumCon(2, 5), enumAlt(2, 3, exprInt(1)))),
@@ -3343,7 +3389,7 @@ test('variant case: only the DISCRIMINANT is modelled, and the payload says so',
   assert.equal(term.a.k, 'unsupported');
   assert.match(term.a.why, /payload of variant constructor `Ok` of `M:Result`/);
   assert.match(term.a.why, /only the discriminant is modelled/);
-  assert.deepEqual(term.b, { k: 'num', v: '0' });
+  assert.deepEqual(term.b, { k: 'num', v: '0', ns: 'Int' });
   // The tag is a registered symbol, so a second case on the same path shares
   // it rather than inventing a second one.
   assert.ok(ctx.params.has('this.status.$tag'));
@@ -3464,3 +3510,180 @@ test(
     }
   }
 );
+
+// ===========================================================================
+// THE Int SORT
+//
+// Daml `Int` (Int64) and `Decimal` (Numeric 10) used to be one coarse sort
+// here, and every numeric symbol was declared SMT `Real` with no integrality
+// constraint. That produced a FALSE FINDING: a division-safety counterexample
+// giving a field the package declares `Optional Int` the value -1/10, making
+// `x * 10 + 1` zero. For any integer x that expression is odd.
+//
+// Integrality is the ONE constraint this pipeline adds, so it is also the one
+// whose failure direction is reversed. Everything else here - dropped guards,
+// uninterpreted functions, symbolic list elements - ENLARGES the model class,
+// which is why an unsat still proves. Integrality SHRINKS it, and is sound
+// only because it is TRUE: a Daml Int is an integer, so no reachable state is
+// excluded. The corollary is that a Decimal field wrongly given the Int sort
+// would be a FALSE constraint and could make a PROVED spurious, which is why
+// Int-ness comes from the declared LF type and the INT64 builtins alone, and
+// why the last test below exists.
+// ===========================================================================
+
+test('the Int sort is declared on demand, and only where something types it', () => {
+  // The Party and datatype precedent: a query that mentions no Int is
+  // byte-for-byte the script it was before the sort existed.
+  const plain = buildQuery([T.app('>', [v('x'), T.num('0')])], T.app('>', [v('x'), T.num('1')]));
+  assert.match(plain.script, /\(declare-const \|x\| Real\)/);
+  assert.doesNotMatch(plain.script, / Int\)/);
+
+  // A symbol the package declares Int64 carries `sort: 'Int'` (lfir.js gives
+  // it from the declaration) and PINS its class.
+  const i = T.varRef('this.count', 'Int');
+  const q = buildQuery([T.app('>', [i, T.num('0')])], T.app('>=', [i, T.num('1')]));
+  assert.match(q.script, /\(declare-const \|this\.count\| Int\)/);
+  // ...and the numerals in those Int positions are Int numerals. A bare `0.0`
+  // against an Int is not well sorted, which is the mirror image of the reason
+  // buildQuery renders Real numerals with a decimal point in the first place.
+  assert.match(q.script, /\(assert \(> \|this\.count\| 0\)\)/);
+  assert.match(q.script, /\(assert \(not \(>= \|this\.count\| 1\)\)\)/);
+
+  // `sort: 'Real'` is NOT evidence and pins nothing: Real is the emitter's
+  // default for every class it cannot place, so a Real-tagged variable must
+  // still be free to unify with whatever a position decides.
+  const { sorts } = inferSorts([{ term: eq(v('t'), T.str('a')), sort: 'Bool' }]);
+  assert.equal(sorts.get('t'), 'String', 'a Real-tagged var is still unifiable');
+});
+
+test('an Int and a Real in one arithmetic term is a CONFLICT, never a coercion', () => {
+  // Daml permits no implicit Int/Decimal mixing - every conversion is an
+  // explicit builtin - so a well-typed program cannot produce this term, and
+  // meeting one means the translation attributed something wrongly. Refusing
+  // is the only honest answer: coercing to Real would drop an Int field's
+  // integrality (losing proofs), and coercing to Int would ASSERT integrality
+  // of a value that may not be one, which makes a PROVED unsound.
+  const mixed = T.app('=', [
+    { k: 'app', op: '*', args: [T.varRef('x', 'Int'), T.num('10.0000000000', 'Real')], ns: 'Real' },
+    T.num('0'),
+  ]);
+  const { conflicts } = inferSorts([{ term: mixed, sort: 'Bool' }]);
+  assert.equal(conflicts.length, 1);
+  assert.match(conflicts[0], /two different\s+numeric sorts/);
+  assert.match(conflicts[0], /x/, 'the conflict names the symbol, not a synthetic class id');
+  assert.throws(() => buildQuery([], mixed), /sort conflicts/);
+
+  // The same refusal for an Int variable used where a Real one already is.
+  const both = [
+    { term: T.app('>', [T.varRef('y', 'Int'), T.num('0', 'Int')]), sort: 'Bool' },
+    { term: T.app('>', [T.varRef('y', 'Real'), T.num('0.5', 'Real')]), sort: 'Bool' },
+  ];
+  assert.ok(inferSorts(both).conflicts.length > 0);
+
+  // ...and a numeric position occupied by a non-number is still a conflict,
+  // exactly as it was when `<` pinned Real outright.
+  assert.ok(inferSorts([{ term: T.app('<', [v('s'), T.str('a')]), sort: 'Bool' }]).conflicts.length > 0);
+});
+
+test('INT64_TO_NUMERIC becomes an explicit to_real coercion, not the identity', () => {
+  // `intToDecimal` is EXACT, which is why it is not in ROUNDING - but exact on
+  // the VALUE is not the same as transparent on the SORT. With Int64 and
+  // Numeric at one sort the identity was right; with two it would put an
+  // Int-sorted term in a Real position with nothing saying so.
+  const strings = ['this', 'count'];
+  const ctx = makeCtx(fakePkg(strings), { selfParam: 'this', argParam: null, label: 't' });
+  const e = exprApp(exprBuiltin(BF.INT64_TO_NUMERIC), [exprProj(exprVar(0), 1)]);
+  const term = translateExpr(decodeMessage(e), ctx);
+  assert.equal(term.k, 'toreal', 'a term kind of its own, not a pass-through');
+  assert.equal(termToSmt(term), '(to_real |this.count|)');
+
+  // The coercion pins its ARGUMENT to Int and its RESULT to Real: that is the
+  // one place the two arithmetic sorts are allowed to meet, and it is written
+  // down in the script rather than assumed.
+  const goal = T.app('=', [term, T.num('0')]);
+  const { sorts, conflicts } = inferSorts([{ term: goal, sort: 'Bool' }]);
+  assert.deepEqual(conflicts, []);
+  assert.equal(sorts.get('this.count'), 'Int');
+  const { script } = buildQuery([], goal);
+  assert.match(script, /\(declare-const \|this\.count\| Int\)/);
+  // the literal on the other side of the equality is in a REAL position
+  assert.match(script, /\(to_real \|this\.count\|\) 0\.0\)/);
+
+  // It is still EXACT on the value, so it is still not a rounding builtin.
+  assert.equal(ROUNDING_SET.has(BF.INT64_TO_NUMERIC), false);
+});
+
+test('a coercion is transparent to every walker that looks inside a term', () => {
+  // A distinct term kind is only safe if nothing silently treats it as a leaf:
+  // an `unsupported` node hidden under one would otherwise reach the emitter.
+  const dirty = T.toReal(T.app('+', [v('a'), T.unsupported('nope', 'here')]));
+  assert.equal(hasUnsupported(dirty), true);
+  assert.deepEqual(unsupportedReasons(dirty).map((u) => u.why), ['nope']);
+  assert.deepEqual([...foldLists(T.toReal(v('a')))], []);
+  assert.deepEqual(
+    divisors(T.toReal(T.app('div', [v('a'), v('b')]))).map((d) => d.name),
+    ['b'],
+    'a division inside a coercion is still a denominator'
+  );
+  assert.equal(
+    termToSmt(instantiateFolds(T.toReal(v('a')), 0)),
+    '(to_real |a|)',
+    'instantiation descends through it'
+  );
+});
+
+test('an INTEGER denominator is proved nonzero where the Real modelling could not',
+  { skip: !SOLVER },
+  () => {
+    // THE FALSE FINDING, reduced to its core. `x * 10 + 1` is odd for every
+    // integer x, so it is never zero - but over the reals x = -1/10 makes it
+    // zero, and that was reported as a division-safety counterexample against
+    // a field the package declares `Optional Int`.
+    const denom = (x) => ({
+      k: 'app',
+      op: '+',
+      args: [{ k: 'app', op: '*', args: [x, T.num('10', 'Int')], ns: 'Int' }, T.num('1', 'Int')],
+      ns: 'Int',
+    });
+    const goalOf = (x) => T.app('not', [T.app('=', [denom(x), T.num('0')])]);
+
+    const intQ = buildQuery([], goalOf(T.varRef('x', 'Int')));
+    assert.match(intQ.script, /\(declare-const \|x\| Int\)/);
+    assert.match(runSolver(intQ.script), /^unsat/m, 'integrality proves it');
+
+    // The same statement over a Real symbol is NOT provable, which is exactly
+    // what the old modelling was answering - and the witness it finds is the
+    // -1/10 the report used to print.
+    const realGoal = T.app('not', [
+      T.app('=', [
+        T.app('+', [T.app('*', [v('x'), T.num('10.0', 'Real')]), T.num('1.0', 'Real')]),
+        T.num('0'),
+      ]),
+    ]);
+    const realQ = buildQuery([], realGoal);
+    assert.match(realQ.script, /\(declare-const \|x\| Real\)/);
+    assert.match(runSolver(realQ.script), /^sat/m, 'over the reals the counterexample exists');
+  }
+);
+
+test('a DECLARED Decimal field is never given integrality', () => {
+  // THE SECURITY-CRITICAL DIRECTION, pinned. Integrality is a constraint, so a
+  // Decimal field wrongly typed Int would be a FALSE constraint - and a false
+  // constraint can turn a satisfiable query unsat, which is a spurious PROVED.
+  // A Decimal field must therefore reach the solver as an unconstrained Real
+  // however it is used, and the `Optional` payload must follow its element's
+  // declared type rather than being lumped in with the integers.
+  const [t] = extractTransitions(decodeDalfRaw(buildTypedTemplateDalf()));
+  assert.equal(t.symbolTypes.get('arg.newAmount'), 'numeric');
+  assert.equal(t.symbolTypes.get('arg.newCount'), 'int');
+
+  const inst = nonNegativeFields(t);
+  const { script } = buildQuery(inst.guards, inst.goal);
+  assert.match(script, /\(declare-const \|arg\.newAmount\| Real\)/, 'Decimal stays Real');
+  assert.match(script, /\(declare-const \|this\.info\.rate\| Real\)/, 'nested Decimal stays Real');
+  assert.match(script, /\(declare-const \|arg\.newCount\| Int\)/, 'Int64 gets the Int sort');
+  // A Decimal obligation is stated against a Real literal and an Int one
+  // against an integer numeral; neither borrows the other's sort.
+  assert.match(script, /\(>= \|arg\.newAmount\| 0\.0\)/);
+  assert.match(script, /\(>= \|arg\.newCount\| 0\)/);
+});

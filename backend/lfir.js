@@ -24,12 +24,27 @@
 // a refusal in the report rather than as a pass.
 //
 // SEMANTIC CAVEAT, stated once and carried through to every result: Daml's
-// `Decimal` is `Numeric 10`, a fixed-point type. This IR models numerics as
-// exact rationals. That abstraction is SOUND for properties that do not depend
-// on rounding (division-by-zero safety, sign, ordering) and UNSOUND for exact
+// `Decimal` is `Numeric 10`, a fixed-point type. This IR models it as an exact
+// rational. That abstraction is SOUND for properties that do not depend on
+// rounding (division-by-zero safety, sign, ordering) and UNSOUND for exact
 // value equalities in the presence of rounding. Every rounding or truncating
 // builtin is therefore recorded on the transition (`rounding`), and the SMT
 // layer refuses conservation-style equalities on transitions that carry it.
+//
+// Daml's `Int` (Int64) is a DIFFERENT sort here, modelled as the SMT integers,
+// and it is the one place this pipeline ADDS a constraint rather than dropping
+// one. Sound because an Int really is an integer - no reachable state is
+// excluded - so it refines the model rather than assuming anything. Two rules
+// keep it that way, and both are enforced here:
+//   * Int-ness comes ONLY from the compiled package's declared types: the
+//     Int64 builtin in a field's `DefDataType` (dalf.js), and the INT64 family
+//     of arithmetic builtins (BINOP_NUM_SORT). Never from a name, a position,
+//     or a literal that reads integral.
+//   * The two sorts never mix silently. `intToDecimal` (INT64_TO_NUMERIC) is
+//     translated as an explicit `toReal` coercion, and anything else that puts
+//     an Int-sorted term in a Real position is a sort conflict the emitter
+//     refuses (smt.js: inferSorts). Daml has no implicit Int/Decimal mixing,
+//     so a conflict is a fact about the translation, not about the code.
 
 // FRAGMENT NOTES beyond the arithmetic core:
 //   * Value references are followed ACROSS PACKAGES (an ensure calling a
@@ -63,6 +78,34 @@ const BINOP = new Map([
 ]);
 
 /**
+ * The SMT arithmetic sort each ARITHMETIC builtin above is typed at.
+ *
+ * Read straight off the builtin's identity: Daml-LF has a separate builtin per
+ * numeric type (`ADD_INT64` and `ADD_NUMERIC` are different builtins), so this
+ * is a fact about the compiled code, not an inference from what the operands
+ * look like. That is the whole point - it is the ONLY source of Int-ness for
+ * an arithmetic node, and Int-ness may never be guessed, because an Int sort
+ * carries integrality and a wrongly-added constraint is unsound for PROVED
+ * (see the direction argument in dalf.js BUILTIN_SORT).
+ *
+ * The COMPARISONS and `EQUAL` are deliberately absent. In LF 2 they are
+ * generic builtins over any ordered/equatable type, so the builtin says
+ * nothing about the sort of its operands; smt.js unifies such a position with
+ * the operands instead of pinning it, and the class falls back to Real when
+ * nothing else types it - exactly what it did before Int existed.
+ *
+ * `div`/`mod`/`/` are listed for completeness only: those three operators are
+ * produced by one builtin each, so their sort is already implied by the
+ * operator. Nothing downstream has to know that.
+ */
+const BINOP_NUM_SORT = new Map([
+  [BF.ADD_INT64, 'Int'], [BF.SUB_INT64, 'Int'], [BF.MUL_INT64, 'Int'],
+  [BF.DIV_INT64, 'Int'], [BF.MOD_INT64, 'Int'],
+  [BF.ADD_NUMERIC, 'Real'], [BF.SUB_NUMERIC, 'Real'], [BF.MUL_NUMERIC, 'Real'],
+  [BF.DIV_NUMERIC, 'Real'],
+]);
+
+/**
  * Builtins that round, truncate or change scale. Their presence does not stop
  * translation, but it is recorded, because the exact-rational abstraction stops
  * being sound for value equalities once one of them is on the path.
@@ -87,8 +130,25 @@ const ROUNDING = new Set([
 ]);
 
 /**
- * Builtins translated as the identity on the underlying rational value.
+ * Builtins translated as an EXPLICIT, exact COERCION between the two numeric
+ * sorts, rather than as a value-changing operation.
+ *
  * Exact conversions only: see the INT64_TO_NUMERIC argument above.
+ *
+ * This used to be the IDENTITY - the builtin's argument was passed straight
+ * through - and that was right when Int64 and Numeric were both modelled as
+ * SMT `Real`: there was one sort, so there was nothing to convert. With Int64
+ * modelled as SMT `Int` there are two, and an Int-sorted term in a Real
+ * position is not a value question but a SORT question. Passing it through
+ * would emit an ill-sorted script (or, worse, let inferSorts unify a Real
+ * literal into an Int class and render `10.0000000000` where an integer
+ * numeral belongs). So the conversion becomes a `toReal` node, which the
+ * emitter writes as SMT-LIB `to_real`.
+ *
+ * `to_real` is the exact injection of the integers into the reals - it is
+ * total, it loses nothing, and it is not an abstraction of any kind. The
+ * abstraction argument above (overflow aborts, and an aborted transaction is
+ * not a reachable post-state) is unchanged by making the coercion explicit.
  */
 const EXACT_CONVERSION = new Set([BF.INT64_TO_NUMERIC]);
 
@@ -138,8 +198,19 @@ const TEXT_UF_BUILTIN = new Map([
   [BF.SHA256_HEX, { arity: 1, argSorts: ['String'], sort: 'String' }],
   [BF.HEX_TO_TEXT, { arity: 1, argSorts: ['String'], sort: 'String' }],
   [BF.TEXT_TO_HEX, { arity: 1, argSorts: ['String'], sort: 'String' }],
-  [BF.INT64_TO_TEXT, { arity: 1, argSorts: ['Real'], sort: 'String' }],
+  // INT64_TO_TEXT takes an Int64, so its parameter is the SMT `Int` sort. Read
+  // off the builtin's fixed LF type like every other entry here - and load
+  // bearing now that Int is a sort of its own: declaring this parameter `Real`
+  // would make every application to a declared-Int field a sort conflict and
+  // refuse the whole query.
+  [BF.INT64_TO_TEXT, { arity: 1, argSorts: ['Int'], sort: 'String' }],
   [BF.NUMERIC_TO_TEXT, { arity: 1, argSorts: ['Real'], sort: 'String' }],
+  // Timestamp and Date are Int64-backed in LF, but this IR does not model them
+  // as integers: a Date field classifies as the coarse sort `time`, which
+  // seeds no SMT sort at all, so its symbol reaches here as an unpinned class
+  // that defaults to Real. Declaring these parameters Real is therefore what
+  // agrees with the rest of the pipeline; declaring them Int would pin a class
+  // from a position, which is the one thing an Int must never come from.
   [BF.TIMESTAMP_TO_TEXT, { arity: 1, argSorts: ['Real'], sort: 'String' }],
   [BF.DATE_TO_TEXT, { arity: 1, argSorts: ['Real'], sort: 'String' }],
 ]);
@@ -214,7 +285,38 @@ const ARCHIVING_CHOICE = 'Archive';
 // --------------------------------------------------------------------- terms
 
 export const T = {
-  num: (v) => ({ k: 'num', v }),
+  /**
+   * A NUMERIC LITERAL, as the decimal string LF carries it.
+   *
+   * `ns` is the arithmetic sort the literal is typed at, when the source says
+   * so: `'Int'` for an LF `int64` literal, `'Real'` for an LF `numeric` one.
+   * It is read off the `BuiltinLit` field the literal arrived in, so - like
+   * every other source of Int-ness - it is a fact about the compiled code and
+   * never an inference from the digits (a `numeric` literal that happens to
+   * read `10.0000000000` is still a Real).
+   *
+   * `ns` is OMITTED by callers that build a literal for an obligation rather
+   * than reading one out of a package: smt.js writes the `0` in `x >= 0` and
+   * in `denominator /= 0`, and that literal is polymorphic - its sort is
+   * whatever the term it is compared against turns out to be. An untagged
+   * literal therefore does not PIN its class, it only marks it numeric, and it
+   * renders as `0` or as `0.0` according to the sort the class resolved to.
+   */
+  num: (v, ns = null) => (ns ? { k: 'num', v, ns } : { k: 'num', v }),
+  /** An INT64 literal: a numeral typed at the SMT `Int` sort. */
+  int: (v) => ({ k: 'num', v, ns: 'Int' }),
+  /**
+   * The EXACT COERCION of an Int-sorted term into a Real position, emitted as
+   * SMT-LIB `to_real` (see EXACT_CONVERSION).
+   *
+   * Its own kind rather than an `app` operator because it is not an operation
+   * on numbers at all: it changes the SORT of a term and nothing else. Every
+   * term walker in this file handles it explicitly, and the emitter and the
+   * reference evaluator both refuse to let an Int-sorted term reach a Real
+   * position without it - silent mixing is the failure mode a separate Int
+   * sort introduces, and the whole design here is that it cannot be silent.
+   */
+  toReal: (a) => ({ k: 'toreal', a }),
   /** A Text literal. Rendered as an SMT-LIB String literal (see smt.js). */
   str: (v) => ({ k: 'str', v }),
   /**
@@ -349,6 +451,8 @@ export function hasUnsupported(term) {
   if (term.k === 'opt') return true;
   if (term.k === 'app' || term.k === 'uf') return term.args.some(hasUnsupported);
   if (term.k === 'ite') return [term.c, term.a, term.b].some(hasUnsupported);
+  // A coercion is transparent to every question about what is INSIDE it.
+  if (term.k === 'toreal') return hasUnsupported(term.a);
   return false;
 }
 
@@ -376,6 +480,8 @@ export function unsupportedReasons(term, out = []) {
     term.args.forEach((a) => unsupportedReasons(a, out));
   } else if (term.k === 'ite') {
     [term.c, term.a, term.b].forEach((a) => unsupportedReasons(a, out));
+  } else if (term.k === 'toreal') {
+    unsupportedReasons(term.a, out);
   }
   return out;
 }
@@ -420,6 +526,7 @@ export function instantiateFolds(term, k) {
       value: term.value ? instantiateFolds(term.value, k) : null,
     };
   }
+  if (term.k === 'toreal') return { ...term, a: instantiateFolds(term.a, k) };
   return term;
 }
 
@@ -435,6 +542,8 @@ export function foldLists(term, out = new Set()) {
     [term.c, term.a, term.b].forEach((a) => foldLists(a, out));
   } else if (term.k === 'opt') {
     [term.some, term.value].forEach((a) => a && foldLists(a, out));
+  } else if (term.k === 'toreal') {
+    foldLists(term.a, out);
   }
   return out;
 }
@@ -497,6 +606,7 @@ function scrubAborts(t) {
   if (t.k === 'opt') {
     return { ...t, some: scrubAborts(t.some), value: t.value ? scrubAborts(t.value) : null };
   }
+  if (t.k === 'toreal') return { ...t, a: scrubAborts(t.a) };
   return t;
 }
 
@@ -516,6 +626,8 @@ export function divisors(term, out = []) {
     term.unrolled.forEach((u) => divisors(u, out));
   } else if (term.k === 'opt') {
     [term.some, term.value].forEach((a) => a && divisors(a, out));
+  } else if (term.k === 'toreal') {
+    divisors(term.a, out);
   }
   return out;
 }
@@ -693,12 +805,29 @@ function ufName(qualified, pkgCtx) {
   return pid ? `${qualified}@${String(pid).slice(0, 8)}` : qualified;
 }
 
-/** Register (or reuse) a symbolic input for a projection path. */
+/**
+ * Register (or reuse) a symbolic input for a projection path.
+ *
+ * `sort` is the EMITTER's sort the caller expects, and for a scalar projection
+ * that is `'Real'` - the emitter's default for everything it cannot place. The
+ * one thing that overrides it is the DECLARED type: a field the package
+ * declares `Int64` gets the SMT `Int` sort, so that the symbol carries
+ * integrality into the query.
+ *
+ * The override is one-directional on purpose. `'Int'` is only ever reached
+ * through `recordSymbolType`, which walks declared record fields and records
+ * NOTHING when the walk cannot be completed - so an Int sort here is always a
+ * read of the compiled package's `DefDataType`, never a guess from the field's
+ * name or from how the code uses it. Everything else keeps the `Real` it had,
+ * which is the conservative side: Real carries no integrality, so it can only
+ * make a property harder to prove.
+ */
 function symbol(ctx, root, path, sort) {
   const name = `${root}.${path}`;
   if (!ctx.params.has(name)) ctx.params.set(name, { name, root, path, sort });
   recordSymbolType(ctx, name, root, path);
-  return T.varRef(name, sort);
+  const declared = ctx.symbolTypes && ctx.symbolTypes.get(name);
+  return T.varRef(name, declared === 'int' ? 'Int' : sort);
 }
 
 /**
@@ -785,9 +914,15 @@ function translateInner(expr, ctx) {
   // literals
   const lit = sub(expr, S.Expr.builtinLit);
   if (lit) {
-    if (has(lit, S.BuiltinLit.int64)) return T.num(String(int(lit, S.BuiltinLit.int64)));
+    // The LITERAL'S OWN FIELD decides its sort. An `int64` literal is typed
+    // at the SMT Int sort and a `numeric` one at Real, and neither is inferred
+    // from how the digits read: a Numeric literal spelled `10.0000000000` is a
+    // Real, and an Int64 literal spelled `10` is an Int, whatever they are
+    // next to. Mixing the two in one arithmetic term is not well typed in
+    // Daml, and smt.js reports it as a sort conflict rather than coercing.
+    if (has(lit, S.BuiltinLit.int64)) return T.int(String(int(lit, S.BuiltinLit.int64)));
     if (has(lit, S.BuiltinLit.numericInternedStr)) {
-      return T.num(pkg.str(int(lit, S.BuiltinLit.numericInternedStr)));
+      return T.num(pkg.str(int(lit, S.BuiltinLit.numericInternedStr)), 'Real');
     }
     if (has(lit, S.BuiltinLit.textInternedStr)) {
       return T.str(pkg.str(int(lit, S.BuiltinLit.textInternedStr)));
@@ -1156,6 +1291,7 @@ function containsAbort(t) {
   if (t.k === 'ite') return [t.c, t.a, t.b].some(containsAbort);
   if (t.k === 'fold') return t.unrolled.some(containsAbort);
   if (t.k === 'opt') return [t.some, t.value].some((x) => x && containsAbort(x));
+  if (t.k === 'toreal') return containsAbort(t.a);
   return false;
 }
 
@@ -2144,15 +2280,23 @@ function translateBuiltinApp(builtin, args, ctx) {
     }
   };
 
-  // An exact conversion is the identity on the rational value: translate the
-  // single value argument and pass it through. Like the numeric binops, it
-  // carries scale/dictionary arguments ahead of the value, so take the last.
+  // An exact conversion changes the SORT of its argument and nothing else, so
+  // it becomes an explicit `to_real` coercion around the translated value.
+  // Like the numeric binops it carries scale/dictionary arguments ahead of the
+  // value, so take the last.
+  //
+  // It used to return the argument unchanged, which was correct while Int64
+  // and Numeric were both SMT Real. With two sorts, passing an Int-sorted term
+  // into a Real position unchanged is exactly the silent mixing a separate Int
+  // sort exists to prevent, so the coercion is written down. An `unsupported`
+  // argument is wrapped like any other: the coercion is transparent to
+  // hasUnsupported, so the enclosing property still refuses with the reason.
   if (EXACT_CONVERSION.has(builtin)) {
     const converted = args.length ? translateArg(args[args.length - 1]) : null;
     if (!converted) {
       return refuse(ctx, 'builtin', `${builtinName(builtin)} applied to no value`, { builtin });
     }
-    return converted;
+    return T.toReal(converted);
   }
 
   // COERCE_CONTRACT_ID is the identity on the contract id it carries (only the
@@ -2204,7 +2348,11 @@ function translateBuiltinApp(builtin, args, ctx) {
       builtin,
     });
   }
-  const term = T.app(op, valueArgs);
+  // The OPERATION's numeric sort, read off the builtin (ADD_INT64 vs
+  // ADD_NUMERIC). Absent for the polymorphic comparisons and EQUAL, whose
+  // operand sort comes from the operands. See BINOP_NUM_SORT.
+  const numSort = BINOP_NUM_SORT.get(builtin);
+  const term = numSort ? { k: 'app', op, args: valueArgs, ns: numSort } : T.app(op, valueArgs);
   if (DIVISION.has(builtin)) {
     // A denominator discovered while unrolling a fold step is an obligation
     // about ONE element of a bounded instantiation, not about the whole list.
@@ -2735,6 +2883,7 @@ export function rewriteVars(term, fn) {
       value: term.value ? rewriteVars(term.value, fn) : null,
     };
   }
+  if (term.k === 'toreal') return { ...term, a: rewriteVars(term.a, fn) };
   return term;
 }
 

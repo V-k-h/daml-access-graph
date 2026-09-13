@@ -599,9 +599,14 @@ test('dalf: DefDataType records decode to coarse field sorts', () => {
     {
       issuer: 'party',
       owner: 'party',
+      // `Decimal` (Numeric 10) and `Int` (Int64) are TWO sorts. Both are
+      // numbers and both carry a property's obligations; they differ in the
+      // SMT sort their symbol is declared at, and only `int` carries
+      // integrality. Collapsing them here is what let a division-safety
+      // counterexample give an `Int` field the value -1/10.
       amount: 'numeric',
       label: 'text',
-      count: 'numeric',
+      count: 'int',
       when: 'time',
       ref: 'cid',
       flag: 'bool',
@@ -617,7 +622,20 @@ test('dalf: DefDataType records decode to coarse field sorts', () => {
       data_: 'record',
     }
   );
-  assert.equal(token.fields.get('opt').elem.sort, 'numeric');
+  assert.equal(token.fields.get('opt').elem.sort, 'int');
+  // The nested record's Int64 field splits the same way.
+  assert.equal(raw.dataTypes.get('Tok:Deep').fields.get('bps').sort, 'int');
+  // REGRESSION GUARD, and the security-critical direction: a `Decimal` field
+  // must NOT be classified `int`. An Int sort adds an integrality constraint,
+  // which shrinks the model class - so a Decimal wrongly typed Int is a FALSE
+  // constraint, and a false constraint can make an unsat, and therefore a
+  // PROVED, spurious. This is the one mis-classification here that is unsound.
+  assert.equal(token.fields.get('amount').sort, 'numeric', 'Decimal is never int');
+  assert.equal(
+    raw.dataTypes.get('Tok:TokenData').fields.get('rate').sort,
+    'numeric',
+    'a nested Decimal is never int either'
+  );
   // A nested record carries the qualified name the path walk continues at.
   assert.deepEqual(
     { module: token.fields.get('data_').ref.module, name: token.fields.get('data_').ref.name },
@@ -638,7 +656,7 @@ test('dalf: the interned and APPLIED Type shapes both classify', () => {
   assert.equal(resolveFieldSort(raw.ctx, start, ['amount']), 'numeric', 'interned + applied');
   assert.equal(resolveFieldSort(raw.ctx, start, ['owner']), 'party', 'inline builtin');
   assert.equal(resolveFieldSort(raw.ctx, start, ['issuer']), 'party', 'interned builtin');
-  assert.equal(resolveFieldSort(raw.ctx, start, ['count']), 'numeric', 'Int64 is numeric');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['count']), 'int', 'Int64 is its own sort');
   // ...and the bound form on the context agrees with the exported function.
   assert.equal(raw.ctx.fieldSort(start, ['amount']), 'numeric');
 });
@@ -647,7 +665,7 @@ test('dalf: a nested record path is followed; an unfollowable one yields null', 
   const raw = decodeDalfRaw(buildTypedRecordDalf());
   const start = { module: 'Tok', name: 'Token' };
   assert.equal(resolveFieldSort(raw.ctx, start, ['data_', 'rate']), 'numeric', 'one hop');
-  assert.equal(resolveFieldSort(raw.ctx, start, ['data_', 'deep', 'bps']), 'numeric', 'two hops');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['data_', 'deep', 'bps']), 'int', 'two hops');
   assert.equal(resolveFieldSort(raw.ctx, start, ['data_', 'name']), 'text');
 
   // Every way the walk can fail answers NULL - "nothing is known" - and never
@@ -672,13 +690,16 @@ test('dalf: the Optional encoding\'s synthetic segments resolve from the declara
   // `opt` is `Optional Int64`. The path itself denotes NEITHER half of the
   // pair, so it answers `optional:<element>` and never `numeric` - answering
   // `numeric` would tell a property that an unreadable field is a number.
-  assert.equal(resolveFieldSort(raw.ctx, start, ['opt']), 'optional:numeric');
+  assert.equal(resolveFieldSort(raw.ctx, start, ['opt']), 'optional:int');
   // The presence flag is a Bool whatever the element is: a fact about the
   // encoding, not about T.
   assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$some']), 'bool');
-  // The payload is answered only for a NUMERIC element, which is the case
-  // whose consequences are worked through; see the note on resolveFieldSort.
-  assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$value']), 'numeric');
+  // The payload is answered only for a NUMERIC element (`numeric` or `int`),
+  // which is the case whose consequences are worked through; see the note on
+  // resolveFieldSort. The ELEMENT SORT is carried through rather than
+  // collapsed: `$value` is the half of the pair that reaches arithmetic, so it
+  // is exactly where the integrality of an `Optional Int` is worth having.
+  assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$value']), 'int');
   // Nothing is walked THROUGH the payload, and no other synthetic segment is
   // invented.
   assert.equal(resolveFieldSort(raw.ctx, start, ['opt', '$value', 'x']), null);
