@@ -1,0 +1,113 @@
+name: CI
+
+# Three independent gates. They are separate jobs so a failure names itself:
+# "the schema drifted" and "a proof was lost" are different problems with
+# different owners, and a single red X that could mean either is worth less.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # No install step: the project has zero runtime and zero dev
+      # dependencies, which is also what makes this job fast and offline.
+      - name: Unit and integration tests
+        run: npm test
+
+      # The Daml-LF field numbers are GENERATED from the vendored protos. A
+      # proto updated without regenerating, or a hand-edited generated file,
+      # is a silent-wrong-answer bug rather than a crash, so it gets its own
+      # gate. (tests/codegen.test.js also covers this; the explicit step makes
+      # the failure legible in the job list.)
+      - name: Generated schema is in sync with the vendored protos
+        run: |
+          npm run codegen
+          git diff --exit-code backend/lf2-schema.generated.js
+
+  proofs:
+    name: Lean proofs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan
+        run: |
+          curl -sSfL https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xz
+          ./elan-init -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # The toolchain is pinned in formal/lean-toolchain and the development
+      # uses core Lean only, so this needs no package fetch.
+      - name: Build the formal development
+        working-directory: formal
+        run: lake build
+
+      # `lake build` succeeding is not by itself evidence: a `sorry` compiles.
+      # Fail if one appears, or if a theorem starts depending on an axiom
+      # beyond Lean's kernel.
+      - name: No sorry, no user axioms
+        working-directory: formal
+        run: |
+          if grep -rn '\bsorry\b' Formal/*.lean | grep -viE 'no sorry|sorry-free|without sorry'; then
+            echo "::error::a sorry is present in the formal development"
+            exit 1
+          fi
+          if lake build 2>&1 | grep -i 'depends on axioms' | grep -viE 'propext|Quot\.sound'; then
+            echo "::error::a theorem depends on an axiom beyond propext/Quot.sound"
+            exit 1
+          fi
+
+  verdicts:
+    name: Verdict regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install cvc5
+        run: |
+          curl -sSfL -o cvc5 https://github.com/cvc5/cvc5/releases/latest/download/cvc5-Linux-x86_64-static
+          chmod +x cvc5
+          sudo mv cvc5 /usr/local/bin/cvc5
+          cvc5 --version | head -1
+
+      # The DARs this gate checks are build artifacts of a separate
+      # repository and are NOT vendored here: they are large, and they are
+      # someone else's compiled code. So the gate runs only where they have
+      # been made available, and SAYS SO when they have not, rather than
+      # passing silently and looking like coverage that does not exist.
+      - name: Verdict baseline
+        env:
+          DAR_DIR: ${{ vars.DAML_DAR_DIR }}
+        run: |
+          if [ -z "$DAR_DIR" ] || [ ! -d "$DAR_DIR" ]; then
+            echo "::notice::no DAR directory configured (repository variable DAML_DAR_DIR); verdict regression NOT checked in this run"
+            exit 0
+          fi
+          status=0
+          for dar in "$DAR_DIR"/*.dar; do
+            name=$(basename "$dar" .dar)
+            base="ci/verdicts/$name.json"
+            if [ ! -f "$base" ]; then
+              echo "::warning::no baseline for $name; run --update-baseline and commit ci/verdicts/$name.json"
+              continue
+            fi
+            echo "--- $name"
+            node backend/verify.js "$dar" --baseline "$base" || status=1
+          done
+          exit $status

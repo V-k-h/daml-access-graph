@@ -75,13 +75,18 @@
 //     authorisation gap.
 
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { readDarRaw } from './dalf.js';
 import { extractTransitions, DEFAULT_BOUND } from './lfir.js';
 import { PROPERTIES, buildQuery } from './smt.js';
+import {
+  createVerdictBaseline,
+  compareVerdicts,
+  describeDiff,
+} from '../src/verdict-baseline.js';
 
 function parseArgs(argv) {
   const args = {
@@ -94,6 +99,8 @@ function parseArgs(argv) {
     json: false,
     help: false,
     bound: DEFAULT_BOUND,
+    baseline: null,
+    updateBaseline: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -104,6 +111,8 @@ function parseArgs(argv) {
     else if (a === '--solver') args.solver = argv[++i];
     else if (a === '--keep') args.keep = argv[++i];
     else if (a === '--json') args.json = true;
+    else if (a === '--baseline') args.baseline = argv[++i];
+    else if (a === '--update-baseline') args.updateBaseline = true;
     else if (a === '-h' || a === '--help') args.help = true;
     else args.dar = a;
   }
@@ -122,7 +131,10 @@ const USAGE = `Usage: node backend/verify.js <package.dar> [options]
   --bound N         list length folds/archive loops are unrolled to (default ${DEFAULT_BOUND})
   --solver BIN      solver binary (default: cvc5)
   --keep DIR        keep generated .smt2 files
-  --json            machine-readable report`;
+  --json            machine-readable report
+  --baseline FILE   compare verdicts against a committed baseline and exit
+                    nonzero on a regression (a lost proof or a new finding)
+  --update-baseline write the current verdicts to --baseline and exit 0`;
 
 /** Run one query through the solver. */
 function solve(script, solver, keepPath) {
@@ -409,6 +421,44 @@ function main() {
     }
     const na = results.filter((r) => r.status === 'NOT-APPLICABLE').length;
     if (na) process.stdout.write(`\n(${na} not-applicable transition/property pairs omitted; --json lists them)\n`);
+  }
+
+  // ------------------------------------------------------------- CI gate
+  // A baseline turns "are there findings?" (useless: a real package has
+  // correct DISPROVEDs from day one) into "did a proof stop holding, or did
+  // a finding appear that nobody has triaged?".
+  if (args.baseline) {
+    const report = { package: raw.name || args.dar, dar: args.dar, results };
+    if (args.updateBaseline) {
+      const baseline = createVerdictBaseline([report], { note: `from ${args.dar}` });
+      writeFileSync(args.baseline, `${JSON.stringify(baseline, null, 2)}\n`);
+      process.stderr.write(
+        `wrote ${args.baseline}: ${results.length} verdict(s) for ${report.package}\n`
+      );
+      process.exitCode = 0;
+      return;
+    }
+    if (!existsSync(args.baseline)) {
+      process.stderr.write(
+        `error: baseline ${args.baseline} does not exist.\n` +
+          `Create it with:  node backend/verify.js ${args.dar} --baseline ${args.baseline} --update-baseline\n`
+      );
+      process.exitCode = 2;
+      return;
+    }
+    const baseline = JSON.parse(readFileSync(args.baseline, 'utf8'));
+    const cmp = compareVerdicts(baseline, [report]);
+    process.stdout.write(
+      `\nbaseline: ${cmp.unchanged} unchanged, ${cmp.improvements.length} improvement(s), ` +
+        `${cmp.regressions.length} regression(s)\n`
+    );
+    for (const d of cmp.regressions) process.stdout.write(`  REGRESSION ${describeDiff(d)}\n`);
+    for (const d of cmp.improvements) process.stdout.write(`  improved   ${describeDiff(d)}\n`);
+    if (cmp.improvements.length && cmp.ok) {
+      process.stdout.write('\nRerun with --update-baseline to accept the improvements.\n');
+    }
+    process.exitCode = cmp.ok ? 0 : 1;
+    return;
   }
 
   // `process.exitCode`, NOT `process.exit`: when stdout is a PIPE the write

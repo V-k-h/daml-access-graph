@@ -6,7 +6,9 @@
   "scripts": {
     "test": "node --test",
     "serve": "python3 -m http.server 8000",
-    "codegen": "node tools/codegen.js"
+    "codegen": "node tools/codegen.js",
+    "verify": "node backend/verify.js",
+    "gate": "node backend/check.js"
   },
   "license": "MIT"
 }

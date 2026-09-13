@@ -320,3 +320,96 @@ test('baseline: one without nodeMeta does not invent metadata changes', () => {
   );
   assert.equal(result.ok, true);
 });
+
+// ---------------------------------------------------------------------------
+// Verdict baseline (the CI gate for proofs)
+// ---------------------------------------------------------------------------
+
+test('verdict baseline: a round-trip against the same report is clean', async () => {
+  const { createVerdictBaseline, compareVerdicts } = await import('../src/verdict-baseline.js');
+  const report = {
+    package: 'pkg',
+    results: [
+      { property: 'amount-conservation', transition: 'T.A', status: 'PROVED' },
+      { property: 'amount-conservation', transition: 'T.B', status: 'DISPROVED' },
+      { property: 'division-safety', transition: 'T.C', status: 'NOT-APPLICABLE' },
+    ],
+  };
+  const b = createVerdictBaseline([report]);
+  const cmp = compareVerdicts(b, [report]);
+  assert.equal(cmp.regressions.length, 0);
+  assert.equal(cmp.improvements.length, 0);
+  assert.equal(cmp.unchanged, 3);
+  assert.equal(cmp.ok, true);
+});
+
+test('verdict baseline: losing a proof is a regression, gaining one is not', async () => {
+  const { createVerdictBaseline, compareVerdicts } = await import('../src/verdict-baseline.js');
+  const before = {
+    package: 'pkg',
+    results: [
+      { property: 'p', transition: 'T.Lost', status: 'PROVED' },
+      { property: 'p', transition: 'T.Gained', status: 'NOT-APPLICABLE' },
+    ],
+  };
+  const after = {
+    package: 'pkg',
+    results: [
+      { property: 'p', transition: 'T.Lost', status: 'NOT-MODELLABLE' },
+      { property: 'p', transition: 'T.Gained', status: 'PROVED' },
+    ],
+  };
+  const cmp = compareVerdicts(createVerdictBaseline([before]), [after]);
+  assert.equal(cmp.ok, false);
+  assert.equal(cmp.regressions.length, 1);
+  assert.equal(cmp.regressions[0].kind, 'proof-lost');
+  assert.equal(cmp.improvements.length, 1, 'the gain must not be a regression');
+});
+
+test('verdict baseline: a bound change is not a regression, a family change is', async () => {
+  const { createVerdictBaseline, compareVerdicts, statusFamily } = await import(
+    '../src/verdict-baseline.js'
+  );
+  // the bound is a property of the RUN, not of the code
+  assert.equal(statusFamily('PROVED-BOUNDED (lists up to length 3)'), 'PROVED-BOUNDED');
+  const b = createVerdictBaseline([
+    { package: 'pkg', results: [{ property: 'p', transition: 'T.M', status: 'PROVED-BOUNDED (lists up to length 3)' }] },
+  ]);
+  const sameFamily = compareVerdicts(b, [
+    { package: 'pkg', results: [{ property: 'p', transition: 'T.M', status: 'PROVED-BOUNDED (lists up to length 7)' }] },
+  ]);
+  assert.equal(sameFamily.ok, true, 'a different bound is the same claim family');
+
+  const lost = compareVerdicts(b, [
+    { package: 'pkg', results: [{ property: 'p', transition: 'T.M', status: 'DISPROVED' }] },
+  ]);
+  assert.equal(lost.ok, false);
+});
+
+test('verdict baseline: an untriaged new finding fails the gate', async () => {
+  const { createVerdictBaseline, compareVerdicts } = await import('../src/verdict-baseline.js');
+  const b = createVerdictBaseline([{ package: 'pkg', results: [] }]);
+  const cmp = compareVerdicts(b, [
+    { package: 'pkg', results: [{ property: 'p', transition: 'T.New', status: 'DISPROVED' }] },
+  ]);
+  assert.equal(cmp.ok, false);
+  assert.equal(cmp.regressions[0].kind, 'new-finding');
+});
+
+test('verdict baseline: a proof that vanishes entirely is caught', async () => {
+  // Easy to miss by diffing only what is present: the obligation is gone, so
+  // there is no verdict to compare against.
+  const { createVerdictBaseline, compareVerdicts } = await import('../src/verdict-baseline.js');
+  const b = createVerdictBaseline([
+    { package: 'pkg', results: [{ property: 'p', transition: 'T.Gone', status: 'PROVED' }] },
+  ]);
+  const cmp = compareVerdicts(b, [{ package: 'pkg', results: [] }]);
+  assert.equal(cmp.ok, false);
+  assert.equal(cmp.regressions[0].kind, 'proof-disappeared');
+});
+
+test('verdict baseline: an unsupported version is rejected, not half-read', async () => {
+  const { createVerdictBaseline, compareVerdicts } = await import('../src/verdict-baseline.js');
+  const b = { ...createVerdictBaseline([{ package: 'p', results: [] }]), version: 99 };
+  assert.throws(() => compareVerdicts(b, []), /Unsupported verdict baseline version/);
+});
