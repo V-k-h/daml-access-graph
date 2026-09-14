@@ -1,14 +1,15 @@
 {
   "name": "daml-access-graph",
   "version": "0.1.0",
-  "description": "Prototype visualizer of the access structure of Daml templates.",
+  "description": "Access-structure analysis and SMT verification of compiled Daml packages, with a Lean 4 soundness development.",
   "type": "module",
   "scripts": {
     "test": "node --test",
     "serve": "python3 -m http.server 8000",
     "codegen": "node tools/codegen.js",
     "verify": "node backend/verify.js",
-    "gate": "node backend/check.js"
+    "gate": "node backend/check.js",
+    "docs": "tectonic docs/verification.tex"
   },
   "license": "MIT"
 }

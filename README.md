@@ -5,7 +5,7 @@ Two tools over compiled Daml packages, sharing one decoder:
 1. **An access-structure visualizer.** It extracts templates, interfaces,
    `Party` fields, signatories, observers, contract keys and their maintainers,
    choices (consuming vs. nonconsuming), controllers, and the ledger operations
-   each choice performs (`create`, `exercise`, `fetch`, …), then renders them as
+   each choice performs (`create`, `exercise`, `fetch`, and so on), then renders them as
    an interactive graph, and diffs two revisions to say whether a change
    *widened* who can see or do what.
 2. **An SMT verification pipeline** (`backend/verify.js`) that proves properties
@@ -19,6 +19,7 @@ A suggested reading path, shortest useful route first:
 
 | If you want | Read |
 |---|---|
+| An introduction to the verification, with a worked example | [`docs/verification.pdf`](docs/verification.pdf) |
 | What the verification proves, in mathematics | [`formal/SPECIFICATION.md`](formal/SPECIFICATION.md) |
 | What is proved vs. tested vs. trusted, arrow by arrow | [`formal/Correspondence.md`](formal/Correspondence.md) |
 | To run it on a DAR | [Verification](#verification) below |
@@ -49,7 +50,7 @@ targets, interfaces declared in sibling modules, and ledger operations
 performed by shared helper functions only resolve when every module is in hand
 at once. See [Project mode](#project-mode).
 
-> ⚠️ **The browser parser is a prototype, not a sound Daml frontend.** It uses
+> **Note: the browser parser is a prototype, not a sound Daml frontend.** It uses
 > regexes and indentation heuristics. It will miss or misread some valid Daml.
 > Everywhere it gives up or guesses, it emits a **diagnostic** so the UI can be
 > honest about what it does and doesn't understand. For anything load-bearing,
@@ -74,7 +75,7 @@ python3 -m http.server 8000
 Then open <http://localhost:8000>.
 
 Pick a built-in example from the dropdown, or paste your own Daml into the
-left pane and click **Analyze ▶**. The graph, diagnostics, and the normalized
+left pane and click **Analyze**. The graph, diagnostics, and the normalized
 graph JSON update together.
 
 ## Tests
@@ -164,23 +165,23 @@ daml-access-graph/
 
 | Feature | Support |
 | --- | --- |
-| `module` name | ✅ |
-| templates | ✅ |
-| `Party` fields (incl. `[Party]`, `Optional Party`) | ✅ |
-| signatories / observers | ✅ (resolved to party fields) |
-| `choice` / `nonconsuming choice` | ✅ |
-| consuming vs. nonconsuming | ✅ |
-| controllers (`choice … controller …` form) | ✅ |
-| `create`, `createAndExercise` | ✅ + target inference |
-| `exercise`, `exerciseByKey` | ✅ (`@Template` / `ByKey` inferable) |
-| `fetch`, `fetchByKey`, `lookupByKey` | ✅ (target inferable via `@`) |
-| `archive` | ✅ (target usually not inferable) |
-| referenced target templates | ✅ (best-effort) |
-| legacy `controller … can` blocks | ⚠️ flagged, partial |
-| interfaces | ⚠️ flagged, not modeled |
+| `module` name | Yes |
+| templates | Yes |
+| `Party` fields (incl. `[Party]`, `Optional Party`) | Yes |
+| signatories / observers | Yes (resolved to party fields) |
+| `choice` / `nonconsuming choice` | Yes |
+| consuming vs. nonconsuming | Yes |
+| controllers (`choice ... controller ...` form) | Yes |
+| `create`, `createAndExercise` | Yes, with target inference |
+| `exercise`, `exerciseByKey` | Yes (`@Template` / `ByKey` inferable) |
+| `fetch`, `fetchByKey`, `lookupByKey` | Yes (target inferable via `@`) |
+| `archive` | Yes (target usually not inferable) |
+| referenced target templates | Yes (best effort) |
+| legacy `controller ... can` blocks | Partial, flagged |
+| interfaces | Not modelled, flagged |
 | generic instances / advanced type-level code | ❌ ignored |
 
-Target-template inference is heuristic: `create Foo with …` resolves to `Foo`,
+Target-template inference is heuristic: `create Foo with ...` resolves to `Foo`,
 `fetch @Foo cid` resolves to `Foo`, but `exercise cid SomeChoice` sees only a
 value-level contract id and is reported as ambiguous rather than guessed.
 
@@ -502,8 +503,9 @@ panel.
 
 ## Verification
 
-> The mathematics behind this section (syntax, semantics, the VC generator and
-> the soundness theorems) is specified in
+> New to this? Read [`docs/verification.pdf`](docs/verification.pdf) first: it
+> carries one example from a Daml choice to a solver verdict before
+> generalising. The terse reference is
 > [`formal/SPECIFICATION.md`](formal/SPECIFICATION.md).
 
 `backend/verify.js` proves properties of a compiled package with an SMT solver
@@ -713,31 +715,31 @@ finding says which case it hit rather than asserting a party.
 
 ## Roadmap
 
-1. ✅ Browser parser - fast, offline, no-toolchain preview.
-2. ✅ Daml-LF extraction backend (`backend/`) - reads a compiled DAR, emits the
+1. **Done.** Browser parser - fast, offline, no-toolchain preview.
+2. **Done.** Daml-LF extraction backend (`backend/`) - reads a compiled DAR, emits the
    same normalized graph JSON with sound target inference.
-3. ✅ Static analyses on the graph IR - authorization, visibility,
+3. **Done.** Static analyses on the graph IR - authorization, visibility,
    information-flow.
-4. ✅ Interfaces, contract keys, and `lookupAllByKey` in the model and schema,
+4. **Done.** Interfaces, contract keys, and `lookupAllByKey` in the model and schema,
    with dedicated analysis families.
-5. ✅ Project mode - whole-repository ingest, cross-module target resolution,
+5. **Done.** Project mode - whole-repository ingest, cross-module target resolution,
    name-collision handling, and helper-function attribution via a call graph.
-6. ✅ Finding precision - severity filtering, explicit reported suppression,
+6. **Done.** Finding precision - severity filtering, explicit reported suppression,
    and removal of the choice-argument / `this.field` false positives.
-7. ✅ Decode the DALF **protobuf** directly (no SDK, no reliance on the
+7. **Done.** Decode the DALF **protobuf** directly (no SDK, no reliance on the
    `damlc inspect` text format), covering interfaces, contract keys and
    `implements` the way the source parser does.
-8. ⏳ Party-identity / dataflow analysis to turn heuristic cross-template
+8. **Planned.** Party-identity / dataflow analysis to turn heuristic cross-template
    authority findings into sound ones; add privilege-escalation checks.
-9. ✅ Resolve view-projected interface controllers (`(view this).admin`) to the
+9. **Done.** Resolve view-projected interface controllers (`(view this).admin`) to the
    implementing template's fields by reading each `interface instance`'s `view`
    record, and check the resolved party against the template's stakeholders.
-10. ✅ Read a package's bundled DARs so interfaces declared in an imported
-   package (Splice `Holding`, `TransferFactory`, …) stop being reported as
+10. **Done.** Read a package's bundled DARs so interfaces declared in an imported
+   package (Splice `Holding`, `TransferFactory`, and others) stop being reported as
    unknown externals.
-11. ✅ Graph diff mode plus a CI gate with a baseline, so a PR that widens the
+11. **Done.** Graph diff mode plus a CI gate with a baseline, so a PR that widens the
    access structure fails the build.
-12. ⏳ Recover `interface instance` view bindings and key maintainers from
+12. **Planned.** Recover `interface instance` view bindings and key maintainers from
    compiled form, and follow let-bindings so every projection root is
    attributable.
 

@@ -3,3 +3,10 @@ node_modules/
 dist/
 *.log
 .daml/
+
+# LaTeX intermediates (the built PDF is committed deliberately)
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.synctex.gz
