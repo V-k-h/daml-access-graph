@@ -55,16 +55,16 @@ const SOLVER = hasSolver();
 // A real compiled package, used by the end-to-end tests below. Declared here
 // rather than next to them because `skip` options are evaluated when a test is
 // REGISTERED, which happens before any later `const` is initialized.
-const TOKENS_DAR =
-  '/private/tmp/claude-501/-Users-vijay-Downloads-carbon-core/713989a1-4f06-45ac-823b-b4ec40f8b2b8/scratchpad/canton/dlt-canton-main/daml/canton-tokens.dar';
-const HAVE_TOKENS_DAR = existsSync(TOKENS_DAR);
+// Path comes from the environment: these tests exercise a real compiled
+// package, which is not in this repository. They skip when it is absent.
+const TOKENS_DAR = process.env.TOKENS_DAR || '';
+const HAVE_TOKENS_DAR = TOKENS_DAR !== '' && existsSync(TOKENS_DAR);
 
 // A second compiled package, the one whose `ensure` clauses match on
 // `DA.Validation.Types:Validation` - the only VARIANT shape the corpus has,
 // and one that is only reachable after a cross-package beta reduction.
-const VARIANT_DAR =
-  '/private/tmp/claude-501/-Users-vijay-Downloads-carbon-core/713989a1-4f06-45ac-823b-b4ec40f8b2b8/scratchpad/calc-build/repo/daml/fees/fee-record/v1/.daml/dist/fee-record-v021-1.0.0.dar';
-const HAVE_VARIANT_DAR = existsSync(VARIANT_DAR);
+const VARIANT_DAR = process.env.VARIANT_DAR || '';
+const HAVE_VARIANT_DAR = VARIANT_DAR !== '' && existsSync(VARIANT_DAR);
 
 // ------------------------------------------------------------------ helpers
 

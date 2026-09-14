@@ -756,9 +756,9 @@ test('differential: evalTerm agrees with termToSmt through cvc5 on 500+ generate
 
 // ================================================== live-DAR smoke test
 
-const DAR_PATH =
-  '/private/tmp/claude-501/-Users-vijay-Downloads-carbon-core/713989a1-4f06-45ac-823b-b4ec40f8b2b8/scratchpad/canton/dlt-canton-main/daml/canton-tokens.dar';
-const HAVE_DAR = existsSync(DAR_PATH);
+// Supplied via the environment; the test skips when absent.
+const DAR_PATH = process.env.TOKENS_DAR || '';
+const HAVE_DAR = DAR_PATH !== '' && existsSync(DAR_PATH);
 
 /** Is every node of a term something both the evaluator and emitter model? */
 function termIsClean(term) {
