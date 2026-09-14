@@ -1,11 +1,35 @@
 # Daml Access Graph
 
-A small, framework-free visualizer for the **access structure** of Daml
-templates. Paste Daml source and it extracts templates, interfaces, `Party`
-fields, signatories, observers, contract keys and their maintainers, choices
-(consuming vs. nonconsuming), controllers, and the ledger operations each
-choice performs (`create`, `exercise`, `fetch`, …), then renders them as an
-interactive graph.
+Two tools over compiled Daml packages, sharing one decoder:
+
+1. **An access-structure visualizer.** It extracts templates, interfaces,
+   `Party` fields, signatories, observers, contract keys and their maintainers,
+   choices (consuming vs. nonconsuming), controllers, and the ledger operations
+   each choice performs (`create`, `exercise`, `fetch`, …), then renders them as
+   an interactive graph, and diffs two revisions to say whether a change
+   *widened* who can see or do what.
+2. **An SMT verification pipeline** (`backend/verify.js`) that proves properties
+   of a compiled package, with a Lean 4 development establishing that a solver
+   `unsat` really does entail the property. See
+   [`formal/SPECIFICATION.md`](formal/SPECIFICATION.md).
+
+## Understanding this repo
+
+A suggested reading path, shortest useful route first:
+
+| If you want | Read |
+|---|---|
+| What the verification proves, in mathematics | [`formal/SPECIFICATION.md`](formal/SPECIFICATION.md) |
+| What is proved vs. tested vs. trusted, arrow by arrow | [`formal/Correspondence.md`](formal/Correspondence.md) |
+| To run it on a DAR | [Verification](#verification) below |
+| How the access graph is built and diffed | [Architecture](#architecture), [Diffing and the CI gate](#diffing-and-the-ci-gate) |
+| The machine-checked theorems themselves | `formal/Formal/*.lean` (`lake build`) |
+
+The single most important thing to understand before reading any verdict: the
+pipeline is **asymmetric**. A `PROVED` is a theorem about the translated
+fragment; a `DISPROVED` is a finding to triage, because a dropped guard or an
+uninterpreted function may have produced a counterexample the real code cannot
+reach. Every verdict discloses which of those applies to it.
 
 Three ingest modes, one output schema:
 
@@ -477,6 +501,10 @@ file was produced with `--analyze`, its findings show in the Static analysis
 panel.
 
 ## Verification
+
+> The mathematics behind this section (syntax, semantics, the VC generator and
+> the soundness theorems) is specified in
+> [`formal/SPECIFICATION.md`](formal/SPECIFICATION.md).
 
 `backend/verify.js` proves properties of a compiled package with an SMT solver
 (cvc5 by default; z3 works too):

@@ -1,5 +1,9 @@
 # Correspondence and trust boundaries
 
+> For the definitions and theorems themselves, stated in mathematics, see
+> [`SPECIFICATION.md`](SPECIFICATION.md). This document is the trust audit:
+> which arrows are machine-checked, which are tested, and which are trusted.
+
 This document states, arrow by arrow, what in the pipeline
 
     DAR -> protobuf -> IR (guarded transitions) -> SMT-LIB -> cvc5 verdict
